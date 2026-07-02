@@ -11,17 +11,6 @@ Both binaries use the same input format, DNA feature extraction code, canonical
 direct comparison target for Zindex when evaluating size, build time, and query
 throughput.
 
-## Status
-
-The implementation targets high-throughput experiments on large bacterial
-collections. It is intentionally approximate:
-
-- Zindex uses 8-bit or 16-bit fingerprints. A query hit is reported when the
-  XOR of the selected cells equals the key fingerprint.
-- Bindex uses a configurable Bloom false-positive rate and hash count.
-- Zindex may abandon keys when a pure ZOR layer reaches an unpeelable core.
-  Build output reports abandoned keys per color.
-
 The source tree is organized as:
 
 ```text
@@ -33,17 +22,7 @@ src/bin/bloomindex.rs   Bindex CLI and interleaved Bloom stack implementation
 ## Requirements
 
 - Rust stable toolchain
-- x86_64 or a platform supported by the selected compression crates
 - Enough RAM to hold the parsed feature sets during construction
-
-The release profile is tuned for local benchmark binaries:
-
-- `opt-level = 3`
-- `lto = "fat"`
-- `codegen-units = 1`
-- stripped symbols
-- `panic = "abort"`
-- `.cargo/config.toml` sets `-C target-cpu=native`
 
 ## Build
 
@@ -89,8 +68,6 @@ Supported sequence input:
 - FASTQ
 - gzip-compressed FASTA/FASTQ
 - zstd-compressed FASTA/FASTQ
-
-Parsing uses `helicase`. Compressed files are decompressed through `deko`.
 
 ## Feature Modes
 
@@ -156,34 +133,6 @@ Important options:
 - `--segment-length`: explicit power-of-two segment length.
 - `--cycle-break`: heuristic used when the peel reaches a core.
 - `--union-graph`: optional union ZOR filter used as a query prefilter.
-- `--stack-compression`: row codec for the slot-major stack.
-
-### Stack Compression
-
-Available modes:
-
-```text
-none
-svb32-0124
-lz4
-lz4-lib
-snappy
-fastpfor256
-lz4-hc
-fastpfor-pack
-```
-
-Compression is applied to complete slot rows. Querying compressed indexes keeps
-the stack compressed and decodes only the rows touched by each feature. Use
-`query --decode-stack` to decode to the plain layout before querying when that
-is useful for a specific benchmark.
-
-Repack an existing index:
-
-```bash
-zorindex repack --index samples.zoridx --output samples.lz4hc.zoridx \
-  --stack-compression lz4-hc
-```
 
 ### Append
 
@@ -275,6 +224,37 @@ The optimal Bloom hash count depends on the target `p`, memory budget, and
 throughput target. For comparable experiments, fix the target false-positive
 rate and sweep `--hashes`; the automatic sizing will adjust the bit count.
 
+## Serialization
+
+`build`, `append`, and `repack` always serialize an index to disk. Both Zindex
+and Bindex write the serialized index stream through zstd by default. The
+loaders detect zstd streams automatically and can still read raw legacy streams.
+
+## Experimental Stack Compression
+
+Zindex also has experimental per-row stack codecs behind `--stack-compression`.
+This is separate from whole-index zstd serialization. The default stack mode is
+`none`.
+
+Available experimental modes:
+
+```text
+svb32-0124
+lz4
+lz4-lib
+snappy
+fastpfor256
+lz4-hc
+fastpfor-pack
+```
+
+Repack an existing index with an experimental stack codec:
+
+```bash
+zorindex repack --index samples.zoridx --output samples.lz4hc.zoridx \
+  --stack-compression lz4-hc
+```
+
 ## Testing
 
 Run all unit tests:
@@ -290,8 +270,8 @@ cargo test --release -- --list
 ```
 
 The suite covers canonical encoding, reverse-complement equivalence, feature
-modes, FOF parsing helpers, ZOR layouts, compressed-stack round trips, 8-bit
-and 16-bit query paths, Bloom sizing, and Bloom query behavior.
+modes, FOF parsing helpers, ZOR layouts, stack storage round trips, 8-bit and
+16-bit query paths, Bloom sizing, and Bloom query behavior.
 
 ## Citation
 

@@ -1,7 +1,7 @@
 use std::cmp::{self, Reverse};
 use std::collections::{BinaryHeap, HashSet, VecDeque};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -14,9 +14,10 @@ use helicase::input::{FromMmap, FromSlice};
 use helicase::{FastxParser, HelicaseParser};
 use rayon::prelude::*;
 use zorindex::{
-    is_compressed_path, mixsplit, parse_features_from_file, read_fof, scan_index_features,
-    splitmix64, ColorInput, FastxStats, FeatureConfig, IndexMode, DEFAULT_MINIMIZER_SIZE,
-    DEFAULT_MODIMIZER_SAMPLING, MAX_HASHES, PARSER_CONFIG,
+    create_index_writer, finish_index_writer, is_compressed_path, mixsplit, open_index_reader,
+    parse_features_from_file, read_fof, scan_index_features, splitmix64, ColorInput, FastxStats,
+    FeatureConfig, IndexMode, DEFAULT_MINIMIZER_SIZE, DEFAULT_MODIMIZER_SAMPLING, MAX_HASHES,
+    PARSER_CONFIG,
 };
 
 const MAGIC: &[u8; 8] = b"ZORIDX1\0";
@@ -3151,7 +3152,7 @@ impl ZorIndex {
     }
 
     fn save(&self, path: &Path) -> Result<()> {
-        let mut writer = BufWriter::new(File::create(path)?);
+        let mut writer = create_index_writer(path)?;
         writer.write_all(MAGIC)?;
         write_u32(&mut writer, FORMAT_VERSION)?;
         write_u8(&mut writer, self.k as u8)?;
@@ -3186,12 +3187,11 @@ impl ZorIndex {
             write_u64(&mut writer, union.cells.len() as u64)?;
             writer.write_all(&union.cells)?;
         }
-        writer.flush()?;
-        Ok(())
+        finish_index_writer(writer)
     }
 
     fn load(path: &Path) -> Result<Self> {
-        let mut reader = BufReader::new(File::open(path)?);
+        let mut reader = open_index_reader(path)?;
         let mut magic = [0u8; 8];
         reader.read_exact(&mut magic)?;
         ensure!(&magic == MAGIC, "not a ZORINDEX file");
@@ -3584,7 +3584,15 @@ fn percent(part: u64, total: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zorindex::scan_canonical_kmers;
+    use zorindex::{scan_canonical_kmers, ZSTD_FRAME_MAGIC};
+
+    fn temp_index_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "zorindex_{name}_{}_{}.zoridx",
+            std::process::id(),
+            splitmix64(name.len() as u64)
+        ))
+    }
 
     #[test]
     fn canonical_encoding_matches_reverse_complement() {
@@ -3950,6 +3958,59 @@ mod tests {
                 assert_eq!(optimized, scalar, "codec={codec:?}");
             }
         }
+    }
+
+    #[test]
+    fn saved_zor_index_is_zstd_serialized_and_loadable() {
+        let path = temp_index_path("saved_zor");
+        let layout = calculate_layout(32, 3, None).unwrap();
+        let colors = vec![
+            ColorMeta {
+                name: "a".into(),
+                path: "a.fa".into(),
+                occurrences: 7,
+                unique_kmers: 5,
+                abandoned: 0,
+            },
+            ColorMeta {
+                name: "b".into(),
+                path: "b.fa".into(),
+                occurrences: 9,
+                unique_kmers: 6,
+                abandoned: 1,
+            },
+        ];
+        let stack = StackStorage::Plain(vec![0x5au8; layout.array_length * colors.len()]);
+        let index = ZorIndex {
+            k: 5,
+            hashes: 3,
+            fingerprint_bits: 8,
+            seed: 99,
+            feature_config: FeatureConfig::legacy_kmers(),
+            layout,
+            colors,
+            stack,
+            union_graph: None,
+        };
+        index.save(&path).unwrap();
+
+        let mut file = File::open(&path).unwrap();
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic).unwrap();
+        assert_eq!(magic, ZSTD_FRAME_MAGIC);
+
+        let loaded = ZorIndex::load(&path).unwrap();
+        assert_eq!(loaded.k, index.k);
+        assert_eq!(loaded.hashes, index.hashes);
+        assert_eq!(loaded.fingerprint_bits, index.fingerprint_bits);
+        assert_eq!(loaded.seed, index.seed);
+        assert_eq!(loaded.layout, index.layout);
+        assert_eq!(loaded.colors.len(), index.colors.len());
+        assert_eq!(
+            loaded.stack.to_plain_vec().unwrap(),
+            index.stack.to_plain_vec().unwrap()
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     fn query_kmer_into_scalar_reference(index: &ZorIndex, key: u64, scores: &mut [u64]) {

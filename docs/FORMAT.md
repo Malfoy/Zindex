@@ -3,6 +3,10 @@
 This document summarizes the binary formats used by the two command-line
 indexes. The exact reader and writer implementations are the source of truth.
 
+Both formats are written as zstd streams by default. The magic bytes described
+below are the first bytes of the decompressed payload. Readers detect zstd frame
+magic automatically and also accept raw legacy payloads.
+
 ## Zindex (`.zoridx`)
 
 Magic:
@@ -41,9 +45,9 @@ The query path computes row positions once per feature. In plain mode it XORs
 directly from the interleaved rows. In compressed mode it decodes the selected
 rows into scratch buffers and XORs those rows.
 
-## Zindex Stack Codecs
+## Experimental Zindex Stack Codecs
 
-The stored codec byte maps to:
+The experimental stored stack-codec byte maps to:
 
 ```text
 0  none

@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
@@ -12,6 +12,8 @@ use simd_minimizers::packed_seq::{PackedSeqVec, SeqVec};
 pub const MAX_HASHES: usize = 32;
 pub const DEFAULT_MINIMIZER_SIZE: usize = 21;
 pub const DEFAULT_MODIMIZER_SAMPLING: u64 = 16;
+pub const DEFAULT_INDEX_ZSTD_LEVEL: i32 = 0;
+pub const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 
 pub const PARSER_CONFIG: Config = ParserOptions::default()
     .ignore_headers()
@@ -151,6 +153,39 @@ pub fn color_name_from_path(path: &Path) -> String {
         "color".to_string()
     } else {
         name
+    }
+}
+
+pub fn create_index_writer(
+    path: &Path,
+) -> Result<zstd::stream::write::Encoder<'static, BufWriter<File>>> {
+    let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    zstd::stream::Encoder::new(BufWriter::new(file), DEFAULT_INDEX_ZSTD_LEVEL)
+        .with_context(|| format!("creating zstd encoder for {}", path.display()))
+}
+
+pub fn finish_index_writer(
+    writer: zstd::stream::write::Encoder<'static, BufWriter<File>>,
+) -> Result<()> {
+    let mut inner = writer.finish().context("finishing zstd index stream")?;
+    inner.flush().context("flushing index file")?;
+    Ok(())
+}
+
+pub fn open_index_reader(path: &Path) -> Result<Box<dyn Read>> {
+    let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut magic = [0u8; 4];
+    let bytes = file
+        .read(&mut magic)
+        .with_context(|| format!("reading {}", path.display()))?;
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("seeking {}", path.display()))?;
+    if bytes == magic.len() && magic == ZSTD_FRAME_MAGIC {
+        let decoder = zstd::stream::Decoder::new(BufReader::new(file))
+            .with_context(|| format!("opening zstd-compressed index {}", path.display()))?;
+        Ok(Box::new(decoder))
+    } else {
+        Ok(Box::new(BufReader::new(file)))
     }
 }
 
@@ -381,6 +416,14 @@ mod tests {
                 _ => *base,
             })
             .collect()
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "zorindex_{name}_{}_{}",
+            std::process::id(),
+            splitmix64(name.len() as u64)
+        ))
     }
 
     macro_rules! base_case {
@@ -669,4 +712,35 @@ mod tests {
     mixsplit_relation_case!(mixsplit_relation_06, 0xfeed_face_cafe_beef, 69);
     mixsplit_relation_case!(mixsplit_relation_07, 42, u64::MAX);
     mixsplit_relation_case!(mixsplit_relation_08, 123_456_789, 987_654_321);
+
+    #[test]
+    fn index_writer_writes_zstd_stream() {
+        let path = temp_path("zstd_stream");
+        {
+            let mut writer = create_index_writer(&path).unwrap();
+            writer.write_all(b"index-payload").unwrap();
+            finish_index_writer(writer).unwrap();
+        }
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.starts_with(&ZSTD_FRAME_MAGIC));
+
+        let mut reader = open_index_reader(&path).unwrap();
+        let mut decoded = Vec::new();
+        reader.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, b"index-payload");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn index_reader_accepts_raw_stream() {
+        let path = temp_path("raw_stream");
+        std::fs::write(&path, b"raw-index-payload").unwrap();
+
+        let mut reader = open_index_reader(&path).unwrap();
+        let mut decoded = Vec::new();
+        reader.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, b"raw-index-payload");
+        let _ = std::fs::remove_file(path);
+    }
 }

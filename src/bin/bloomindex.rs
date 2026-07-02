@@ -1,6 +1,5 @@
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -9,7 +8,8 @@ use anyhow::{ensure, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use rayon::prelude::*;
 use zorindex::{
-    mixsplit, parse_features_from_file, read_fof, splitmix64, ColorInput, FeatureConfig, IndexMode,
+    create_index_writer, finish_index_writer, mixsplit, open_index_reader,
+    parse_features_from_file, read_fof, splitmix64, ColorInput, FeatureConfig, IndexMode,
     DEFAULT_MINIMIZER_SIZE, DEFAULT_MODIMIZER_SAMPLING, MAX_HASHES,
 };
 
@@ -742,7 +742,7 @@ impl BloomIndex {
     }
 
     fn save(&self, path: &Path) -> Result<()> {
-        let mut writer = BufWriter::new(File::create(path)?);
+        let mut writer = create_index_writer(path)?;
         writer.write_all(MAGIC)?;
         write_u32(&mut writer, FORMAT_VERSION)?;
         write_u8(&mut writer, self.k as u8)?;
@@ -763,12 +763,11 @@ impl BloomIndex {
         }
         write_u64(&mut writer, self.bitstack.len() as u64)?;
         write_u64_slice(&mut writer, &self.bitstack)?;
-        writer.flush()?;
-        Ok(())
+        finish_index_writer(writer)
     }
 
     fn load(path: &Path) -> Result<Self> {
-        let mut reader = BufReader::new(File::open(path)?);
+        let mut reader = open_index_reader(path)?;
         let mut magic = [0u8; 8];
         reader.read_exact(&mut magic)?;
         ensure!(&magic == MAGIC, "not a BLOOMINDEX file");
@@ -942,7 +941,15 @@ fn read_u64_vec<R: Read>(reader: &mut R, len: usize) -> Result<Vec<u64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zorindex::scan_canonical_kmers;
+    use zorindex::{scan_canonical_kmers, ZSTD_FRAME_MAGIC};
+
+    fn temp_index_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "bloomindex_{name}_{}_{}.blmidx",
+            std::process::id(),
+            splitmix64(name.len() as u64)
+        ))
+    }
 
     #[test]
     fn bit_count_for_one_over_256_with_four_hashes_is_reasonable() {
@@ -1004,5 +1011,51 @@ mod tests {
         left.sort_unstable();
         right.sort_unstable();
         assert_eq!(left, right);
+    }
+
+    #[test]
+    fn saved_bloom_index_is_zstd_serialized_and_loadable() {
+        let path = temp_index_path("saved_bloom");
+        let bit_count = 128;
+        let colors = vec![
+            ColorMeta {
+                name: "a".into(),
+                path: "a.fa".into(),
+                occurrences: 7,
+                unique_kmers: 5,
+            },
+            ColorMeta {
+                name: "b".into(),
+                path: "b.fa".into(),
+                occurrences: 9,
+                unique_kmers: 6,
+            },
+        ];
+        let bitstack = vec![0x55aa_55aa_55aa_55aau64; bit_count * color_words(colors.len())];
+        let index = BloomIndex {
+            k: 5,
+            hashes: 3,
+            seed: 99,
+            target_fp_rate: DEFAULT_FALSE_POSITIVE_RATE,
+            feature_config: FeatureConfig::legacy_kmers(),
+            bit_count,
+            colors,
+            bitstack,
+        };
+        index.save(&path).unwrap();
+
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic).unwrap();
+        assert_eq!(magic, ZSTD_FRAME_MAGIC);
+
+        let loaded = BloomIndex::load(&path).unwrap();
+        assert_eq!(loaded.k, index.k);
+        assert_eq!(loaded.hashes, index.hashes);
+        assert_eq!(loaded.seed, index.seed);
+        assert_eq!(loaded.bit_count, index.bit_count);
+        assert_eq!(loaded.colors.len(), index.colors.len());
+        assert_eq!(loaded.bitstack, index.bitstack);
+        let _ = std::fs::remove_file(path);
     }
 }
