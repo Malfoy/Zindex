@@ -1,0 +1,35 @@
+/target/
+
+# Local data and generated indexes
+*.fa
+*.fna
+*.fas
+*.fasta
+*.fq
+*.fastq
+*.gz
+*.gzip
+*.zst
+*.zstd
+*.zoridx
+*.blmidx
+*.bf
+
+# Benchmark outputs
+/results/
+/tmp/
+/data/
+/logs/
+*.log
+*.tsv
+*.csv
+
+# Local reports and external papers
+*.pdf
+*.zip
+
+# Editor and OS files
+.DS_Store
+*.swp
+*.swo
+*~

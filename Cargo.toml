@@ -1,0 +1,32 @@
+[package]
+name = "zorindex"
+version = "0.1.0"
+edition = "2021"
+description = "Approximate colored k-mer indexes with ZOR and Bloom filter backends"
+license = "MIT"
+readme = "README.md"
+default-run = "zorindex"
+keywords = ["bioinformatics", "kmer", "debruijn", "bloom-filter"]
+categories = ["command-line-utilities", "science"]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+deko = { version = "0.6", default-features = false, features = ["flate2", "zstd"] }
+fastpfor = { version = "0.9", default-features = false, features = ["rust"] }
+helicase = { version = "0.1.1", default-features = false, features = ["gz", "zstd"] }
+bitpacking = "0.9"
+lz4_flex = "0.11"
+lzzzz = "2.0"
+rayon = "1.10"
+simd-minimizers = "2.3"
+snap = "1.1"
+svb = { version = "0.2", features = ["simd-auto"] }
+zstd = { version = "0.13", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
