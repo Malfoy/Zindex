@@ -430,7 +430,11 @@ fn query_command(args: QueryArgs) -> Result<()> {
             index.k,
             index.feature_config.findere_z,
             index.colors.len(),
-            |key, hits| index.query_kmer_into(key, hits),
+            || (),
+            |_, key, hits| {
+                index.query_kmer_into(key, hits);
+                true
+            },
         )
         .with_context(|| format!("querying {}", args.query.display()))?;
         total_features = result.total_kmers;

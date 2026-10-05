@@ -1831,14 +1831,13 @@ fn query_features_from_file_parallel(
     ignore_union: bool,
 ) -> Result<QueryRunResult> {
     if index.feature_config.mode == IndexMode::Findere {
-        let mut scratch = QueryScratch::default();
-        let mut stack_queries = 0;
         let result = zorindex::findere::query_file(
             path,
             index.k,
             index.feature_config.findere_z,
             index.colors.len(),
-            |key, hits| {
+            QueryScratch::default,
+            |scratch, key, hits| {
                 if !ignore_union {
                     if let Some(union) = &index.union_graph {
                         if !contains_raw(
@@ -1849,12 +1848,12 @@ fn query_features_from_file_parallel(
                             index.seed ^ UNION_SEED_XOR,
                             index.fingerprint_bits,
                         ) {
-                            return;
+                            return false;
                         }
                     }
                 }
-                stack_queries += 1;
-                index.query_kmer_into_with_scratch(key, hits, &mut scratch);
+                index.query_kmer_into_with_scratch(key, hits, scratch);
+                true
             },
         )?;
         return Ok(QueryRunResult {
@@ -1862,7 +1861,7 @@ fn query_features_from_file_parallel(
             accum: QueryAccum {
                 scores: result.scores,
                 total_features: result.total_kmers,
-                stack_queries,
+                stack_queries: result.backend_queries,
             },
         });
     }

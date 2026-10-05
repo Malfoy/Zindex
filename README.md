@@ -123,9 +123,15 @@ Query `matches`, `total_features`, and ratios count reconstructed **k-mer
 positions**, not shorter-feature hits. Probe counters count actual shorter-feature
 probes. Consecutive windows reuse those probes; reconstruction resets at each
 FASTA/FASTQ record or ambiguous base and ignores stretches shorter than `k`.
-The initial findere query path is streaming and single-threaded (construction
-retains its existing threading). It does not yet implement findere's additional
-negative-run skipping optimizations.
+Findere queries use the Rayon pool configured by `--threads` (all available
+hardware threads by default). Bounded batches distribute both short records and
+individual long sequences over workers, each with private decoding scratch and
+score counters. Long-sequence tasks own disjoint k-mer windows and include `k-1`
+trailing context bases: no matches are lost or duplicated at task boundaries.
+Those boundaries repeat up to `z` shorter-feature probes; probe counters include
+this work and are deterministic across thread counts. Parsing/decompression is
+still serial. The additional findere negative-run skipping optimization is not
+implemented.
 
 Findere reduces some approximate-membership false positives but is not exact:
 all constituent shorter features can exist without their full k-mer occurring.

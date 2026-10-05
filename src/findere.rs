@@ -6,9 +6,14 @@ use anyhow::{ensure, Context, Result};
 use deko::read::AnyDecoder;
 use helicase::input::{FromMmap, FromSlice};
 use helicase::{FastxParser, HelicaseParser};
-use std::{fs::File, io::Read, path::Path};
+use rayon::prelude::*;
+use std::{fs::File, io::Read, ops::Range, path::Path};
 
 pub const DEFAULT_Z: usize = 10;
+// Fixed partitioning makes matches AND actual probe counts independent of the
+// worker count. Each task owns these k-mer starts plus k-1 trailing bases.
+const TASK_KMERS: usize = 16_384;
+const BATCH_BASES: usize = 1_048_576;
 
 pub fn indexed_length(k: usize, z: usize) -> Result<usize> {
     ensure!((1..=255).contains(&k), "findere query k must be in 1..=255");
@@ -27,6 +32,8 @@ pub struct QueryResult {
     /// Number of valid query k-mer positions, not the number of s-mer probes.
     pub total_kmers: u64,
     pub smer_queries: u64,
+    /// Backend probes after optional union-filter rejection.
+    pub backend_queries: u64,
     pub scores: Vec<u64>,
 }
 
@@ -54,6 +61,7 @@ impl Scorer {
                 stats: FastxStats::default(),
                 total_kmers: 0,
                 smer_queries: 0,
+                backend_queries: 0,
                 scores: vec![0; colors],
             },
         })
@@ -92,37 +100,253 @@ impl Scorer {
     }
 }
 
-pub fn query_file(
+struct Batch {
+    bases: Vec<u8>,
+    ranges: Vec<Range<usize>>,
+}
+
+impl Batch {
+    fn new() -> Self {
+        Self {
+            bases: Vec::with_capacity(BATCH_BASES + TASK_KMERS + 254),
+            ranges: Vec::new(),
+        }
+    }
+}
+
+struct Worker<State> {
+    scorer: Scorer,
+    state: State,
+}
+
+fn flush_batch<State: Send>(
+    batch: &mut Batch,
+    workers: &mut Vec<Worker<State>>,
+    k: usize,
+    z: usize,
+    colors: usize,
+    init: &impl Fn() -> State,
+    lookup: &(impl Fn(&mut State, u64, &mut [u64]) -> bool + Sync),
+) {
+    if batch.ranges.is_empty() {
+        return;
+    }
+    let count = rayon::current_num_threads().min(batch.ranges.len());
+    while workers.len() < count {
+        workers.push(Worker {
+            scorer: Scorer::new(k, z, colors).expect("validated findere lengths"),
+            state: init(),
+        });
+    }
+    let per_worker = batch.ranges.len().div_ceil(count);
+    // Mutable state, decoding scratch, and counters belong to one worker. No
+    // shared score-vector updates or atomics occur in the lookup hot path.
+    workers[..count]
+        .par_iter_mut()
+        .zip(batch.ranges.par_chunks(per_worker))
+        .for_each(|(worker, ranges)| {
+            let mut backend_queries = 0;
+            for range in ranges {
+                worker
+                    .scorer
+                    .sequence(&batch.bases[range.clone()], &mut |key, hits| {
+                        backend_queries += u64::from(lookup(&mut worker.state, key, hits));
+                    });
+            }
+            worker.scorer.result.backend_queries += backend_queries;
+        });
+    batch.bases.clear();
+    batch.ranges.clear();
+}
+
+fn query_parser<State: Send>(
+    mut parser: FastxParser<'_, PARSER_CONFIG>,
+    k: usize,
+    z: usize,
+    colors: usize,
+    init: impl Fn() -> State,
+    lookup: impl Fn(&mut State, u64, &mut [u64]) -> bool + Sync,
+) -> Result<QueryResult> {
+    let mut result = Scorer::new(k, z, colors)?.result;
+    let mut workers = Vec::new();
+    let mut batch = Batch::new();
+    while parser.next().is_some() {
+        let seq = parser.get_dna_string();
+        result.stats.bases += seq.len() as u64;
+        result.stats.chunks += 1;
+        if seq.len() < k {
+            continue;
+        }
+        let windows = seq.len() - k + 1;
+        for start in (0..windows).step_by(TASK_KMERS) {
+            let owned = TASK_KMERS.min(windows - start);
+            let offset = batch.bases.len();
+            // Overlap supplies context only: this sequence has exactly `owned`
+            // k-mer windows, so no result is duplicated or omitted at a cut.
+            batch
+                .bases
+                .extend_from_slice(&seq[start..start + owned + k - 1]);
+            batch.ranges.push(offset..batch.bases.len());
+            if batch.bases.len() >= BATCH_BASES {
+                flush_batch(&mut batch, &mut workers, k, z, colors, &init, &lookup);
+            }
+        }
+    }
+    flush_batch(&mut batch, &mut workers, k, z, colors, &init, &lookup);
+    for worker in workers {
+        let local = worker.scorer.result;
+        result.total_kmers += local.total_kmers;
+        result.smer_queries += local.smer_queries;
+        result.backend_queries += local.backend_queries;
+        for (sum, value) in result.scores.iter_mut().zip(local.scores) {
+            *sum += value;
+        }
+    }
+    Ok(result)
+}
+
+/// Query on the caller's Rayon pool (the tools configure it with --threads).
+/// Parsing/decompression feeds bounded batches; both many short records and a
+/// single long record are distributed over workers. Scratch is reused across
+/// batches. A lookup returns true if it actually probed the backend, false if
+/// an optional prefilter rejected the key; hit entries start at zero either way.
+pub fn query_file<State: Send>(
     path: &Path,
     k: usize,
     z: usize,
     colors: usize,
-    mut lookup: impl FnMut(u64, &mut [u64]),
+    init: impl Fn() -> State,
+    lookup: impl Fn(&mut State, u64, &mut [u64]) -> bool + Sync,
 ) -> Result<QueryResult> {
-    let mut scorer = Scorer::new(k, z, colors)?;
+    indexed_length(k, z)?;
     if is_compressed_path(path) {
         let mut data = Vec::new();
         AnyDecoder::new(File::open(path)?).read_to_end(&mut data)?;
         ensure!(!data.is_empty(), "{} is empty", path.display());
-        let mut parser = FastxParser::<PARSER_CONFIG>::from_slice(&data)
+        let parser = FastxParser::<PARSER_CONFIG>::from_slice(&data)
             .with_context(|| format!("parsing {}", path.display()))?;
-        while parser.next().is_some() {
-            scorer.sequence(parser.get_dna_string(), &mut lookup);
-        }
+        query_parser(parser, k, z, colors, init, lookup)
     } else {
-        let mut parser = FastxParser::<PARSER_CONFIG>::from_file_mmap(path)
+        let parser = FastxParser::<PARSER_CONFIG>::from_file_mmap(path)
             .with_context(|| format!("parsing {}", path.display()))?;
-        while parser.next().is_some() {
-            scorer.sequence(parser.get_dna_string(), &mut lookup);
-        }
+        query_parser(parser, k, z, colors, init, lookup)
     }
-    Ok(scorer.result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn synthetic_hits(key: u64, hits: &mut [u64]) -> bool {
+        hits[0] = 1;
+        hits[1] = u64::from(key % 127 != 0);
+        hits[2] = u64::from(key % 7 != 0);
+        true
+    }
+
+    #[test]
+    fn parallel_long_sequence_matches_sequential_reference_across_batches() {
+        let mut seq: Vec<_> = (0..BATCH_BASES + 2 * TASK_KMERS + 503)
+            .map(|i| b"ACGT"[(crate::splitmix64(i as u64) & 3) as usize])
+            .collect();
+        // Breaks around task cuts must not carry consecutive-hit state across N.
+        seq[TASK_KMERS - 1] = b'N';
+        seq[TASK_KMERS + 1] = b'N';
+        seq[BATCH_BASES - 1] = b'N';
+        let mut fasta = b">long\n".to_vec();
+        fasta.extend_from_slice(&seq);
+        fasta.extend_from_slice(
+            b"\n>short\nACGT\n>second\nACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\n",
+        );
+        for (k, z) in [(31, 10), (41, 10), (31, 0), (255, 224)] {
+            let mut reference = Scorer::new(k, z, 3).unwrap();
+            let mut parser = FastxParser::<PARSER_CONFIG>::from_slice(&fasta).unwrap();
+            while parser.next().is_some() {
+                reference.sequence(parser.get_dna_string(), &mut |key, hits| {
+                    synthetic_hits(key, hits);
+                });
+            }
+            let mut expected_probes = None;
+            for threads in [1, 2, 4] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                let result = pool.install(|| {
+                    query_parser(
+                        FastxParser::<PARSER_CONFIG>::from_slice(&fasta).unwrap(),
+                        k,
+                        z,
+                        3,
+                        || (),
+                        |_, key, hits| synthetic_hits(key, hits),
+                    )
+                    .unwrap()
+                });
+                assert_eq!(
+                    result.scores, reference.result.scores,
+                    "k={k},z={z},threads={threads}"
+                );
+                assert_eq!(result.total_kmers, reference.result.total_kmers);
+                assert_eq!(result.stats.bases, reference.result.stats.bases);
+                assert_eq!(result.stats.chunks, reference.result.stats.chunks);
+                assert_eq!(result.backend_queries, result.smer_queries);
+                assert!(result.smer_queries >= reference.result.smer_queries);
+                if z == 0 {
+                    assert_eq!(result.smer_queries, reference.result.smer_queries);
+                }
+                assert_eq!(
+                    *expected_probes.get_or_insert(result.smer_queries),
+                    result.smer_queries
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn multiple_workers_execute_both_long_record_and_short_record_queries() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for fasta in [
+            format!(">long\n{}\n", "ACGT".repeat(TASK_KMERS * 4)),
+            format!(">short\n{}\n", "ACGT".repeat(32)).repeat(2000),
+        ] {
+            let seen = AtomicUsize::new(0);
+            let calls = AtomicUsize::new(0);
+            let result = pool.install(|| {
+                query_parser(
+                    FastxParser::<PARSER_CONFIG>::from_slice(fasta.as_bytes()).unwrap(),
+                    31,
+                    10,
+                    1,
+                    || 0usize,
+                    |local, _, hits| {
+                        *local += 1;
+                        seen.fetch_or(
+                            1 << rayon::current_thread_index().expect("Rayon worker"),
+                            Ordering::Relaxed,
+                        );
+                        calls.fetch_add(1, Ordering::Relaxed);
+                            let probed = *local % 2 == 0;
+                            hits[0] = u64::from(probed);
+                            probed
+                    },
+                )
+                .unwrap()
+            });
+            assert!(
+                seen.load(Ordering::Relaxed).count_ones() > 1,
+                "lookup ran on only one worker"
+            );
+            assert_eq!(result.scores[0], 0);
+            assert_eq!(result.smer_queries, calls.load(Ordering::Relaxed) as u64);
+            assert!(result.backend_queries > 0 && result.backend_queries < result.smer_queries);
+        }
+    }
 
     #[test]
     fn validates_lengths() {

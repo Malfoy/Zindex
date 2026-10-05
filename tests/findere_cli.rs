@@ -305,3 +305,68 @@ fn shorter_features_in_different_datasets_do_not_make_a_kmer_match() {
         }
     }
 }
+
+#[test]
+fn query_results_and_probe_counts_match_across_thread_counts() {
+    let f = Fixture::new();
+    let a = dna(500, 17);
+    let b = dna(450, 93);
+    let pa = f.write("a.fa", format!(">a\n{a}\n"));
+    let pb = f.write("b.fa", format!(">b\n{b}\n"));
+    let fof = f.write("input.fof", format!("a\t{pa}\nb\t{pb}\n"));
+    let long = format!(
+        ">long\n{}\n>broken\n{}N{}\n",
+        a.repeat(300),
+        &b[..17],
+        b.repeat(300)
+    );
+    let short = format!(">short_a\n{a}\n>short_b\n{b}\n>tiny\nACGT\n").repeat(400);
+    let plain = f.write("long.fa", long);
+    let compressed = f.write(
+        "short.fa.zst",
+        zstd::bulk::compress(short.as_bytes(), 1).unwrap(),
+    );
+    for bin in binaries() {
+        for z in ["0", "3", "10"] {
+            let index = f.path("test.idx");
+            let extra = if is_zor(bin) {
+                vec!["--union-graph", "--stack-compression", "lz4"]
+            } else {
+                vec![]
+            };
+            build(bin, &fof, &index, "31", Some(z), &extra);
+            for query in [&plain, &compressed] {
+                let mut expected = None;
+                for threads in ["1", "2", "4"] {
+                    let output = Command::new(bin)
+                        .args([
+                            "--threads",
+                            threads,
+                            "query",
+                            "--index",
+                            &index,
+                            "--query",
+                            query,
+                        ])
+                        .output()
+                        .unwrap();
+                    assert!(
+                        output.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    let text = String::from_utf8(output.stdout).unwrap();
+                    let normalized: Vec<_> = text
+                        .lines()
+                        .map(|line| line.split("\telapsed_s=").next().unwrap().to_owned())
+                        .collect();
+                    assert_eq!(
+                        expected.get_or_insert_with(|| normalized.clone()),
+                        &normalized,
+                        "thread-dependent output: {bin}, z={z}, threads={threads}"
+                    );
+                }
+            }
+        }
+    }
+}
