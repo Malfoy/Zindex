@@ -65,7 +65,7 @@ struct BuildArgs {
     fof: PathBuf,
 
     /// K-mer window length. Full k-mer/modimizer modes are limited to 1..=31;
-    /// minimizer mode may use larger windows because only the minimizer is encoded.
+    /// minimizer/findere modes may use larger windows because only shorter features are encoded.
     #[arg(short = 'k', long)]
     k: usize,
 
@@ -88,6 +88,10 @@ struct BuildArgs {
     /// Feature extraction mode stored in the index.
     #[arg(long, value_enum, default_value = "kmers")]
     index_mode: IndexMode,
+
+    /// Findere extension: index (k-z)-mers and require z+1 consecutive hits per dataset.
+    #[arg(long, alias = "z", default_value_t = zorindex::findere::DEFAULT_Z)]
+    findere_z: usize,
 
     /// Canonical minimizer length when --index-mode minimizers is used.
     #[arg(long, default_value_t = DEFAULT_MINIMIZER_SIZE)]
@@ -418,7 +422,8 @@ fn build_command(args: BuildArgs) -> Result<()> {
         args.index_mode,
         args.minimizer_size,
         args.modimizer_sampling,
-    );
+    )
+    .with_findere_z(args.findere_z);
     let inputs = read_fof(&args.fof).with_context(|| format!("reading {}", args.fof.display()))?;
     ensure!(
         !inputs.is_empty(),
@@ -804,6 +809,10 @@ fn info_command(args: IndexArg) -> Result<()> {
     println!("fingerprint_bits\t{}", index.fingerprint_bits);
     println!("seed\t{}", index.seed);
     println!("index_mode\t{}", index.feature_config.mode.label());
+    if index.feature_config.mode == IndexMode::Findere {
+        println!("findere_z\t{}", index.feature_config.findere_z);
+        println!("indexed_k\t{}", index.k - index.feature_config.findere_z);
+    }
     println!("minimizer_size\t{}", index.feature_config.minimizer_size);
     println!(
         "modimizer_sampling\t{}",
@@ -861,7 +870,8 @@ fn validate_build_args(args: &BuildArgs) -> Result<()> {
             args.index_mode,
             args.minimizer_size,
             args.modimizer_sampling,
-        ),
+        )
+        .with_findere_z(args.findere_z),
     )?;
     fingerprint_bytes(args.fingerprint_bits)
         .with_context(|| "--fingerprint-bits must be 8 or 16")?;
@@ -893,6 +903,9 @@ fn validate_feature_config(k: usize, config: FeatureConfig) -> Result<()> {
         "--modimizer-sampling must be greater than 0"
     );
     match config.mode {
+        IndexMode::Findere => {
+            zorindex::findere::indexed_length(k, config.findere_z)?;
+        }
         IndexMode::Kmers => {
             ensure!(
                 (1..=31).contains(&k),
@@ -1817,6 +1830,42 @@ fn query_features_from_file_parallel(
     path: &Path,
     ignore_union: bool,
 ) -> Result<QueryRunResult> {
+    if index.feature_config.mode == IndexMode::Findere {
+        let mut scratch = QueryScratch::default();
+        let mut stack_queries = 0;
+        let result = zorindex::findere::query_file(
+            path,
+            index.k,
+            index.feature_config.findere_z,
+            index.colors.len(),
+            |key, hits| {
+                if !ignore_union {
+                    if let Some(union) = &index.union_graph {
+                        if !contains_raw(
+                            key,
+                            &union.cells,
+                            union.layout,
+                            index.hashes,
+                            index.seed ^ UNION_SEED_XOR,
+                            index.fingerprint_bits,
+                        ) {
+                            return;
+                        }
+                    }
+                }
+                stack_queries += 1;
+                index.query_kmer_into_with_scratch(key, hits, &mut scratch);
+            },
+        )?;
+        return Ok(QueryRunResult {
+            _stats: result.stats,
+            accum: QueryAccum {
+                scores: result.scores,
+                total_features: result.total_kmers,
+                stack_queries,
+            },
+        });
+    }
     if is_compressed_path(path) {
         let file =
             File::open(path).with_context(|| format!("unable to open {}", path.display()))?;
@@ -3170,6 +3219,11 @@ impl ZorIndex {
         write_u8(&mut writer, self.feature_config.mode.as_u8())?;
         write_u8(&mut writer, self.feature_config.minimizer_size as u8)?;
         write_u64(&mut writer, self.feature_config.modimizer_sampling)?;
+        // Mode-specific extension: legacy modes keep their original byte layout.
+        // Old readers reject mode 3 rather than misinterpreting a findere index.
+        if self.feature_config.mode == IndexMode::Findere {
+            write_u8(&mut writer, self.feature_config.findere_z as u8)?;
+        }
         write_layout(&mut writer, self.layout)?;
         write_u64(&mut writer, self.colors.len() as u64)?;
         for color in &self.colors {
@@ -3215,10 +3269,16 @@ impl ZorIndex {
             let mode = IndexMode::from_u8(read_u8(&mut reader)?)?;
             let minimizer_size = read_u8(&mut reader)? as usize;
             let modimizer_sampling = read_u64(&mut reader)?;
+            let findere_z = if mode == IndexMode::Findere {
+                read_u8(&mut reader)? as usize
+            } else {
+                zorindex::findere::DEFAULT_Z
+            };
             FeatureConfig {
                 mode,
                 minimizer_size,
                 modimizer_sampling,
+                findere_z,
             }
         } else {
             FeatureConfig::legacy_kmers()
@@ -3617,6 +3677,7 @@ mod tests {
             123,
             FeatureConfig {
                 mode: IndexMode::Modimizers,
+                findere_z: zorindex::findere::DEFAULT_Z,
                 minimizer_size: DEFAULT_MINIMIZER_SIZE,
                 modimizer_sampling: 1,
             },
@@ -3637,6 +3698,7 @@ mod tests {
             123,
             FeatureConfig {
                 mode: IndexMode::Minimizers,
+                findere_z: zorindex::findere::DEFAULT_Z,
                 minimizer_size: m,
                 modimizer_sampling: DEFAULT_MODIMIZER_SAMPLING,
             },

@@ -9,6 +9,8 @@ use helicase::input::{FromMmap, FromSlice};
 use helicase::{Config, FastxParser, HelicaseParser, ParserOptions};
 use simd_minimizers::packed_seq::{PackedSeqVec, SeqVec};
 
+pub mod findere;
+
 pub const MAX_HASHES: usize = 32;
 pub const DEFAULT_MINIMIZER_SIZE: usize = 21;
 pub const DEFAULT_MODIMIZER_SAMPLING: u64 = 16;
@@ -31,6 +33,8 @@ pub enum IndexMode {
     Minimizers,
     /// Index hash-sampled canonical k-mers using a FracMinHash-style rate.
     Modimizers,
+    /// Index all (k-z)-mers and reconstruct k-mer membership with findere.
+    Findere,
 }
 
 impl IndexMode {
@@ -39,6 +43,7 @@ impl IndexMode {
             Self::Kmers => 0,
             Self::Minimizers => 1,
             Self::Modimizers => 2,
+            Self::Findere => 3,
         }
     }
 
@@ -47,6 +52,7 @@ impl IndexMode {
             0 => Ok(Self::Kmers),
             1 => Ok(Self::Minimizers),
             2 => Ok(Self::Modimizers),
+            3 => Ok(Self::Findere),
             _ => anyhow::bail!("unsupported index mode {}", value),
         }
     }
@@ -56,6 +62,7 @@ impl IndexMode {
             Self::Kmers => "kmers",
             Self::Minimizers => "minimizers",
             Self::Modimizers => "modimizers",
+            Self::Findere => "findere",
         }
     }
 }
@@ -65,6 +72,7 @@ pub struct FeatureConfig {
     pub mode: IndexMode,
     pub minimizer_size: usize,
     pub modimizer_sampling: u64,
+    pub findere_z: usize,
 }
 
 impl FeatureConfig {
@@ -73,6 +81,7 @@ impl FeatureConfig {
             mode,
             minimizer_size,
             modimizer_sampling,
+            findere_z: findere::DEFAULT_Z,
         }
     }
 
@@ -81,7 +90,13 @@ impl FeatureConfig {
             mode: IndexMode::Kmers,
             minimizer_size: DEFAULT_MINIMIZER_SIZE,
             modimizer_sampling: DEFAULT_MODIMIZER_SAMPLING,
+            findere_z: findere::DEFAULT_Z,
         }
+    }
+
+    pub fn with_findere_z(mut self, z: usize) -> Self {
+        self.findere_z = z;
+        self
     }
 }
 
@@ -267,6 +282,15 @@ pub fn scan_index_features<F>(
         }
         IndexMode::Modimizers => {
             scan_modimizers(seq, k, seed, feature_config.modimizer_sampling, on_feature)
+        }
+        IndexMode::Findere => {
+            if let Ok(s) = findere::indexed_length(k, feature_config.findere_z) {
+                for run in seq.split(|&b| encode_base(b).is_none()) {
+                    if run.len() >= k {
+                        scan_canonical_kmers(run, s, on_feature);
+                    }
+                }
+            }
         }
     }
 }
@@ -601,6 +625,7 @@ mod tests {
     }
 
     mode_roundtrip_case!(mode_kmers_roundtrip, IndexMode::Kmers, 0, "kmers");
+    mode_roundtrip_case!(mode_findere_roundtrip, IndexMode::Findere, 3, "findere");
     mode_roundtrip_case!(
         mode_minimizers_roundtrip,
         IndexMode::Minimizers,

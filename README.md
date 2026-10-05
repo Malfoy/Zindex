@@ -77,6 +77,7 @@ Both indexes support the same indexed feature modes:
 kmers       every canonical k-mer
 minimizers  canonical minimizers from each k-window
 modimizers  hash-sampled canonical k-mers
+findere     all (k-z)-mers, with positional reconstruction of query k-mers
 ```
 
 Full k-mer and modimizer modes currently require `k <= 31`, because canonical
@@ -95,6 +96,49 @@ zorindex build --fof samples.fof --k 31 --index-mode modimizers \
 ```
 
 The feature mode is stored in the index and reused by `query` and `append`.
+
+### Findere
+
+Both tools accept `--index-mode findere`. Here `--k` is the **query** k-mer
+length; the index stores all canonical `(k-z)`-mers from valid reference
+stretches of at least `k` bases. `--findere-z` (alias `--z`) defaults to **10**.
+For example, `--k 31` indexes 21-mers and requires 11 consecutive 21-mer hits
+in the **same dataset** to report one 31-mer match.
+
+```bash
+zorindex build --fof samples.fof --k 31 --index-mode findere --output samples.findere.zoridx
+bloomindex build --fof samples.fof --k 31 --index-mode findere --output samples.findere.blmidx
+
+# Override z; query and append automatically reuse the stored setting.
+zorindex build --fof samples.fof --k 31 --index-mode findere --findere-z 3 --output samples.z3.zoridx
+zorindex query --index samples.findere.zoridx --query reads.fa
+bloomindex query --index samples.findere.blmidx --query reads.fa
+```
+
+Constraints are `0 <= z < k <= 255` and `1 <= k-z <= 31`. Setting `z=0`
+recovers ordinary k-mer membership. Findere is a separate mode, not combined
+with minimizer or modimizer sampling. `info` reports `findere_z` and `indexed_k`.
+
+Query `matches`, `total_features`, and ratios count reconstructed **k-mer
+positions**, not shorter-feature hits. Probe counters count actual shorter-feature
+probes. Consecutive windows reuse those probes; reconstruction resets at each
+FASTA/FASTQ record or ambiguous base and ignores stretches shorter than `k`.
+The initial findere query path is streaming and single-threaded (construction
+retains its existing threading). It does not yet implement findere's additional
+negative-run skipping optimizations.
+
+Findere reduces some approximate-membership false positives but is not exact:
+all constituent shorter features can exist without their full k-mer occurring.
+Bloom's reported `estimated_fp_rate` remains the underlying shorter-feature
+estimate, not the reconstructed k-mer false-positive rate. Pure ZOR can abandon
+constraints; findere does not repair those false negatives and can propagate
+one missing shorter feature to several query windows. Check `abandoned` when
+choosing ZOR construction settings.
+
+Existing feature modes keep their serialized layout. Findere uses feature-mode
+tag 3 followed by a mode-specific `z` byte after the common feature settings;
+older binaries reject this unknown mode. The stored mode and `z` survive append
+and ZOR repack operations.
 
 ## Zindex
 

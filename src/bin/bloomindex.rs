@@ -50,7 +50,7 @@ struct BuildArgs {
     #[arg(long)]
     fof: PathBuf,
 
-    /// K-mer length. Currently limited to 1..=31.
+    /// Query k-mer length. Findere stores shorter (k-z)-mers of length 1..=31.
     #[arg(short = 'k', long)]
     k: usize,
 
@@ -69,6 +69,10 @@ struct BuildArgs {
     /// Feature extraction mode stored in the index.
     #[arg(long, value_enum, default_value = "kmers")]
     index_mode: IndexMode,
+
+    /// Findere extension: index (k-z)-mers and require z+1 consecutive hits per dataset.
+    #[arg(long, alias = "z", default_value_t = zorindex::findere::DEFAULT_Z)]
+    findere_z: usize,
 
     /// Canonical minimizer length when --index-mode minimizers is used.
     #[arg(long, default_value_t = DEFAULT_MINIMIZER_SIZE)]
@@ -185,7 +189,8 @@ fn build_command(args: BuildArgs) -> Result<()> {
         args.index_mode,
         args.minimizer_size,
         args.modimizer_sampling,
-    );
+    )
+    .with_findere_z(args.findere_z);
     let inputs = read_fof(&args.fof).with_context(|| format!("reading {}", args.fof.display()))?;
     ensure!(
         !inputs.is_empty(),
@@ -417,18 +422,34 @@ fn query_command(args: QueryArgs) -> Result<()> {
     let start = Instant::now();
     let mut scores = vec![0u64; index.colors.len()];
     let mut total_features = 0u64;
+    let feature_queries;
 
-    parse_features_from_file(
-        &args.query,
-        index.k,
-        index.seed,
-        index.feature_config,
-        |kmer| {
-            total_features += 1;
-            index.query_kmer_into(kmer, &mut scores);
-        },
-    )
-    .with_context(|| format!("querying {}", args.query.display()))?;
+    if index.feature_config.mode == IndexMode::Findere {
+        let result = zorindex::findere::query_file(
+            &args.query,
+            index.k,
+            index.feature_config.findere_z,
+            index.colors.len(),
+            |key, hits| index.query_kmer_into(key, hits),
+        )
+        .with_context(|| format!("querying {}", args.query.display()))?;
+        total_features = result.total_kmers;
+        feature_queries = result.smer_queries;
+        scores = result.scores;
+    } else {
+        parse_features_from_file(
+            &args.query,
+            index.k,
+            index.seed,
+            index.feature_config,
+            |kmer| {
+                total_features += 1;
+                index.query_kmer_into(kmer, &mut scores);
+            },
+        )
+        .with_context(|| format!("querying {}", args.query.display()))?;
+        feature_queries = total_features;
+    }
 
     println!(
         "#query\t{}\tk={}\tindex_mode={}\ttotal_features={}\tbit_probes={}\telapsed_s={:.3}",
@@ -436,7 +457,7 @@ fn query_command(args: QueryArgs) -> Result<()> {
         index.k,
         index.feature_config.mode.label(),
         total_features,
-        total_features.saturating_mul(index.hashes as u64),
+        feature_queries.saturating_mul(index.hashes as u64),
         start.elapsed().as_secs_f64()
     );
     println!("color\tmatches\tratio\tunique_kmers\testimated_fp_rate");
@@ -475,6 +496,10 @@ fn info_command(args: IndexArg) -> Result<()> {
     println!("hashes\t{}", index.hashes);
     println!("seed\t{}", index.seed);
     println!("index_mode\t{}", index.feature_config.mode.label());
+    if index.feature_config.mode == IndexMode::Findere {
+        println!("findere_z\t{}", index.feature_config.findere_z);
+        println!("indexed_k\t{}", index.k - index.feature_config.findere_z);
+    }
     println!("minimizer_size\t{}", index.feature_config.minimizer_size);
     println!(
         "modimizer_sampling\t{}",
@@ -507,7 +532,9 @@ fn info_command(args: IndexArg) -> Result<()> {
 }
 
 fn validate_build_args(args: &BuildArgs) -> Result<()> {
-    ensure!((1..=31).contains(&args.k), "k must be in 1..=31");
+    if args.index_mode != IndexMode::Findere {
+        ensure!((1..=31).contains(&args.k), "k must be in 1..=31");
+    }
     ensure!(
         (1..=MAX_HASHES).contains(&args.hashes),
         "--hashes must be in 1..={}",
@@ -519,7 +546,8 @@ fn validate_build_args(args: &BuildArgs) -> Result<()> {
             args.index_mode,
             args.minimizer_size,
             args.modimizer_sampling,
-        ),
+        )
+        .with_findere_z(args.findere_z),
     )?;
     ensure!(
         args.false_positive_rate.is_finite()
@@ -549,6 +577,9 @@ fn validate_feature_config(k: usize, config: FeatureConfig) -> Result<()> {
         "--modimizer-sampling must be greater than 0"
     );
     match config.mode {
+        IndexMode::Findere => {
+            zorindex::findere::indexed_length(k, config.findere_z)?;
+        }
         IndexMode::Kmers => {}
         IndexMode::Minimizers => {
             ensure!(
@@ -752,6 +783,11 @@ impl BloomIndex {
         write_u8(&mut writer, self.feature_config.mode.as_u8())?;
         write_u8(&mut writer, self.feature_config.minimizer_size as u8)?;
         write_u64(&mut writer, self.feature_config.modimizer_sampling)?;
+        // Mode-specific extension: legacy modes keep their original byte layout.
+        // Old readers reject mode 3 rather than misinterpreting a findere index.
+        if self.feature_config.mode == IndexMode::Findere {
+            write_u8(&mut writer, self.feature_config.findere_z as u8)?;
+        }
         write_f64(&mut writer, self.target_fp_rate)?;
         write_u64(&mut writer, self.bit_count as u64)?;
         write_u64(&mut writer, self.colors.len() as u64)?;
@@ -784,10 +820,17 @@ impl BloomIndex {
         let mode = IndexMode::from_u8(read_u8(&mut reader)?)?;
         let minimizer_size = read_u8(&mut reader)? as usize;
         let modimizer_sampling = read_u64(&mut reader)?;
+        let findere_z = if mode == IndexMode::Findere {
+            read_u8(&mut reader)? as usize
+        } else {
+            zorindex::findere::DEFAULT_Z
+        };
         let target_fp_rate = read_f64(&mut reader)?;
         let bit_count = read_u64(&mut reader)? as usize;
         let color_count = read_u64(&mut reader)? as usize;
-        ensure!((1..=31).contains(&k), "invalid k in index");
+        if mode != IndexMode::Findere {
+            ensure!((1..=31).contains(&k), "invalid k in index");
+        }
         ensure!(
             (1..=MAX_HASHES).contains(&hashes),
             "invalid Bloom hash count in index"
@@ -796,6 +839,7 @@ impl BloomIndex {
             mode,
             minimizer_size,
             modimizer_sampling,
+            findere_z,
         };
         validate_feature_config(k, feature_config)?;
         ensure!(bit_count > 0, "invalid zero bit count in index");
@@ -981,6 +1025,7 @@ mod tests {
             target_fp_rate: DEFAULT_FALSE_POSITIVE_RATE,
             feature_config: FeatureConfig {
                 mode: IndexMode::Kmers,
+                findere_z: zorindex::findere::DEFAULT_Z,
                 minimizer_size: DEFAULT_MINIMIZER_SIZE,
                 modimizer_sampling: DEFAULT_MODIMIZER_SAMPLING,
             },
