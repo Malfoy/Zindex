@@ -15,7 +15,7 @@ Magic:
 ZORIDX1\0
 ```
 
-Current format version: `6`.
+Current format version: `7` (readers also accept legacy versions).
 
 Header fields:
 
@@ -30,6 +30,7 @@ Header fields:
 - modimizer sampling
 - ZOR segmented layout
 - color metadata
+- technical layout and technical-bin metadata (version 7)
 - slot-major stack
 - optional union graph
 
@@ -38,7 +39,7 @@ contiguous little-endian fingerprint bytes. Compressed stacks store row offsets
 and codec payload bytes. Each compressed row expands to:
 
 ```text
-color_count * fingerprint_bytes
+technical_bin_count * fingerprint_bytes
 ```
 
 The query path computes row positions once per feature. In plain mode it XORs
@@ -73,7 +74,7 @@ Magic:
 BLMIDX1\0
 ```
 
-Current format version: `1`.
+Current format version: `2` (version 1 remains readable).
 
 Header fields:
 
@@ -87,14 +88,44 @@ Header fields:
 - target false-positive rate
 - common bit count
 - color metadata
+- technical layout and technical-bin metadata (version 2)
 - bitstack words
 
 Bindex stores `bit_count * color_words` little-endian `u64` words, where:
 
 ```text
-color_words = ceil(color_count / 64)
+color_words = ceil(technical_bin_count / 64)
 ```
 
 For each Bloom bit position, all colors are packed into consecutive `u64`
 words. Querying ANDs the packed words from all Bloom positions and increments
 scores for the remaining set bits.
+
+The default flat layout has one technical bin per output color. The optional
+split-large layout maps several technical bins to one output color; queries
+count each color at most once per feature.
+
+## Zindex power-of-two merged directory
+
+`--power-of-two-merge` writes a new directory rather than a `.zoridx` file.
+`manifest.json` contains version `3`, feature/hash settings, dataset identities,
+group members and widths, bank sizes and abandoned-key map metadata.
+
+Each `bank-<exponent>.zorbank.zst` expands to magic `ZORPOW3\0`, followed by
+four little-endian `u64` values: slots, bits per row, group count and data bytes.
+Rows have `ceil(bits_per_row / 8)` bytes. Each row begins with all groups'
+8- or 16-bit fingerprints, followed by their packed origin bits. Singleton
+groups have no origin bits. Group offsets in the manifest describe the original
+complete-payload prefix; the origin-plane offset for group `i` is
+`group_count * fingerprint_bits + group.offset - i * fingerprint_bits`.
+
+`abandoned.zormap.zst` expands to magic `ZORABN1\0`, followed by records:
+32-bit abandoned-key hash, 32-bit origin count, then that many 32-bit origin IDs.
+All integers are little-endian. This is one global multimap across all banks;
+32-bit hash collisions union origin lists. It is omitted with `--drop-abandoned`.
+
+The current reader also supports manifest versions 1 and 2 and their legacy
+`ZORPOW1\0` interleaved banks. Version-1 per-group abandoned-key records are
+converted to the global 32-bit-hash multimap on load. Older readers cannot read
+new version-3 directories. Merged directories currently cannot be appended or
+repacked; rebuilding requires the complete input list.

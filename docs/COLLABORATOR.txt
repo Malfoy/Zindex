@@ -1,0 +1,72 @@
+Zindex / Bindex collaborator quick start
+
+Requirements: Git, a current stable Rust toolchain (Cargo), and a C/C++ compiler
+with standard build tools. On Debian/Ubuntu: sudo apt install build-essential
+pkg-config. Compile on the machine where the binaries will run: the repository
+uses target-cpu=native, so do not assume a binary is portable to another CPU.
+
+Get and build:
+  git clone https://github.com/Malfoy/Zindex.git
+  cd Zindex
+  cargo build --release --locked
+
+Create samples.fof with one absolute FASTA/FASTQ path per line, or
+name<TAB>absolute-path (an actual tab). Gzip, zstd, xz and bzip2 inputs work.
+Example:
+  sample_a<TAB>/absolute/path/sample_a.fasta.gz
+  sample_b<TAB>/absolute/path/sample_b.fasta.gz
+
+Recommended merged Zindex minimizer build (approximately one minimizer per
+ten valid sequence positions, depending on the input):
+  ./target/release/zorindex build --fof samples.fof --output samples.zindex \
+    --power-of-two-merge --merge-planner streaming --merge-column-order compression \
+    --k 49 --index-mode minimizers --minimizer-size 31 \
+    --hashes 4 --fingerprint-bits 16 --slot-scale 1.0 \
+    --cycle-break most-deg2 --tie-scan 8
+  ./target/release/zorindex query --index samples.zindex --query reads.fasta.gz
+  ./target/release/zorindex info --index samples.zindex
+
+All-pairs planner comparison: run the same build command with
+--merge-planner all-pairs and a different --output directory. The old streaming
+planner is available as --merge-planner streaming-unpruned. No merge reverts.
+
+Plain Zindex baseline, using the same feature and graph settings:
+  ./target/release/zorindex build --fof samples.fof --output samples.plain.zoridx \
+    --k 49 --index-mode minimizers --minimizer-size 31 \
+    --hashes 4 --fingerprint-bits 16 --slot-scale 1.0 \
+    --cycle-break most-deg2 --tie-scan 8
+  ./target/release/zorindex query --index samples.plain.zoridx --query reads.fasta.gz
+
+Bindex minimizer baseline (Bloom backend, without Zindex merging):
+  ./target/release/bloomindex build --fof samples.fof --output samples.blmidx \
+    --k 49 --index-mode minimizers --minimizer-size 31 \
+    --false-positive-rate 0.0000152587890625 --hashes 4
+  ./target/release/bloomindex query --index samples.blmidx --query reads.fasta.gz
+  ./target/release/bloomindex info --index samples.blmidx
+
+All-k-mer mode: use --k 31 --index-mode kmers, removing --minimizer-size.
+Findere mode: use --k 31 --index-mode findere --findere-z 10, removing
+--minimizer-size. Findere is available in both tools; z defaults to 10.
+
+Threads default to all available hardware threads. Add --threads N to any
+command to choose a limit; --build-jobs N limits concurrent construction jobs.
+Query uses the feature/hash settings stored in the index: do not repeat them.
+Results aggregate feature matches per dataset over the entire query file;
+they are not per-read classifications. Minimizer matches count minimizers,
+not all k-mers. Findere matches count reconstructed k-mer positions.
+
+Merged Zindex keeps all abandoned keys in one global 32-bit-hash multimap by
+default. --drop-abandoned during build omits it, allowing misses;
+--ignore-abandoned during query skips an existing map, also allowing misses.
+Plain Zindex has no corresponding multimap; abandoned keys may cause misses.
+Neither probabilistic tool guarantees exact membership.
+
+Merged --output must be a new directory. Do not use append/repack on merged
+directories: these operations are not supported. New merged layout version 3
+requires the current reader; current readers also accept old merged layouts.
+
+Tests and command help:
+  cargo fmt --check
+  cargo test --release --locked
+  ./target/release/zorindex build --help
+  ./target/release/bloomindex build --help

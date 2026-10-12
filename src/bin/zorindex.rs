@@ -13,6 +13,9 @@ use fastpfor::AnyLenCodec;
 use helicase::input::{FromMmap, FromSlice};
 use helicase::{FastxParser, HelicaseParser};
 use rayon::prelude::*;
+use zorindex::power_merge::{
+    DegreeQueue, GraphIndex, IndexedDegreeHeap, PeelGraph, TypedPeelGraph,
+};
 use zorindex::{
     create_index_writer, finish_index_writer, is_compressed_path, mixsplit, open_index_reader,
     parse_features_from_file, read_fof, scan_index_features, splitmix64, ColorInput, FastxStats,
@@ -21,13 +24,14 @@ use zorindex::{
 };
 
 const MAGIC: &[u8; 8] = b"ZORIDX1\0";
-const FORMAT_VERSION: u32 = 6;
+const FORMAT_VERSION: u32 = 7;
 const FLAG_UNION_GRAPH: u8 = 1;
 const MAX_SEGMENT_LENGTH_LOG: u32 = 12;
 const DEFAULT_STACK_BLOCK_ROWS: usize = 4096;
 const QUERY_BATCH_FEATURES: usize = 262_144;
 const FINGERPRINT_SEED: u64 = 0x8E2D_4F6A_9B13_C5D7;
 const UNION_SEED_XOR: u64 = 0xC6BC_2796_92B5_CC83;
+const SPLIT_SEED_XOR: u64 = 0xA54D_BA5E_1F2C_8D93;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -60,6 +64,9 @@ enum Command {
 
 #[derive(Args, Debug)]
 struct BuildArgs {
+    #[command(flatten)]
+    merge: zorindex::power_merge::MergeArgs,
+
     /// File containing one input FASTA/FASTQ path per line, or name<TAB>path.
     #[arg(long)]
     fof: PathBuf,
@@ -132,6 +139,22 @@ struct BuildArgs {
     /// Deprecated: slice codecs always compress one slot row per slice.
     #[arg(long, default_value_t = DEFAULT_STACK_BLOCK_ROWS)]
     stack_block_rows: usize,
+
+    /// Internal color layout: flat keeps one technical bin per dataset, split-large partitions outliers.
+    #[arg(long, value_enum, default_value = "flat")]
+    technical_layout: TechnicalLayoutMode,
+
+    /// Explicit maximum number of unique features per technical bin in split-large mode.
+    #[arg(long)]
+    target_technical_features: Option<usize>,
+
+    /// Maximum number of technical bins created for one dataset in split-large mode.
+    #[arg(long, default_value_t = 64)]
+    max_split_parts: usize,
+
+    /// Maximum number of datasets parsed/built concurrently. Defaults to all Rayon workers.
+    #[arg(long)]
+    build_jobs: Option<usize>,
 }
 
 #[derive(Args, Debug)]
@@ -228,6 +251,39 @@ enum StackCompression {
     FastpforPack,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum TechnicalLayoutMode {
+    /// One internal technical bin per output color.
+    Flat,
+    /// Split large output colors across several internal technical bins.
+    #[value(name = "split-large")]
+    SplitLarge,
+}
+
+impl TechnicalLayoutMode {
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Flat => 0,
+            Self::SplitLarge => 1,
+        }
+    }
+
+    fn from_u8(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Flat),
+            1 => Ok(Self::SplitLarge),
+            _ => anyhow::bail!("unsupported technical layout mode {}", value),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Flat => "flat",
+            Self::SplitLarge => "split-large",
+        }
+    }
+}
+
 impl StackCompression {
     fn as_u8(self) -> u8 {
         match self {
@@ -296,6 +352,10 @@ struct QueryArgs {
     #[arg(long, default_value_t = 0.0)]
     min_ratio: f64,
 
+    /// Skip the global abandoned-key recovery map for merged indexes.
+    #[arg(long)]
+    ignore_abandoned: bool,
+
     /// Do not use the optional union graph to skip color-stack probes.
     #[arg(long, default_value_t = false)]
     ignore_union: bool,
@@ -322,6 +382,14 @@ struct ColorMeta {
 }
 
 #[derive(Clone, Debug)]
+struct TechnicalBinMeta {
+    color_id: usize,
+    part_id: usize,
+    part_count: usize,
+    unique_kmers: u64,
+}
+
+#[derive(Clone, Debug)]
 struct ParsedColor {
     input: ColorInput,
     kmers: Vec<u64>,
@@ -329,9 +397,69 @@ struct ParsedColor {
 }
 
 #[derive(Clone, Debug)]
+struct ColorSummary {
+    input: ColorInput,
+    occurrences: u64,
+    unique_kmers: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ColorBuildPlan {
+    input: ColorInput,
+    color_id: usize,
+    occurrences: u64,
+    unique_kmers: usize,
+    first_technical_bin: usize,
+    part_count: usize,
+}
+
+#[derive(Clone, Debug)]
+struct TechnicalLayoutPlan {
+    mode: TechnicalLayoutMode,
+    target_features: usize,
+    max_part_features: usize,
+    part_counts: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct ZorPartBuild {
+    technical_bin_id: usize,
+    unique_kmers: usize,
+    abandoned: u64,
+    cells: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct ZorColorBuild {
+    color_id: usize,
+    occurrences: u64,
+    unique_kmers: usize,
+    abandoned: u64,
+    parts: Vec<ZorPartBuild>,
+}
+
+#[derive(Debug)]
+struct AppendedZorPart {
+    unique_kmers: usize,
+    abandoned: u64,
+    cells: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct AppendedZorColor {
+    color_offset: usize,
+    input: ColorInput,
+    occurrences: u64,
+    unique_kmers: usize,
+    abandoned: u64,
+    parts: Vec<AppendedZorPart>,
+}
+
+#[derive(Clone, Debug)]
 struct PureZorBuild {
     cells: Vec<u8>,
     abandoned: u64,
+    abandoned_keys: Vec<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -386,7 +514,10 @@ struct ZorIndex {
     seed: u64,
     feature_config: FeatureConfig,
     layout: Layout,
+    technical_layout: TechnicalLayoutMode,
+    split_target_features: u64,
     colors: Vec<ColorMeta>,
+    technical_bins: Vec<TechnicalBinMeta>,
     stack: StackStorage,
     union_graph: Option<UnionGraph>,
 }
@@ -417,7 +548,62 @@ fn main() -> Result<()> {
 
 fn build_command(args: BuildArgs) -> Result<()> {
     validate_build_args(&args)?;
+    if args.merge.power_of_two_merge {
+        ensure!(
+            args.technical_layout == TechnicalLayoutMode::Flat,
+            "power-of-two merging cannot be combined with --technical-layout split-large"
+        );
+        ensure!(
+            !args.union_graph,
+            "power-of-two banks do not yet support --union-graph"
+        );
+        ensure!(
+            args.stack_compression == StackCompression::None,
+            "power-of-two banks currently support plain slices only (files are zstd compressed)"
+        );
+        ensure!(
+            args.segment_length.is_none(),
+            "power-of-two banks select their segment length automatically"
+        );
+        let config = zorindex::power_merge::BuildConfig {
+            backend: zorindex::power_merge::Backend::Zor,
+            k: args.k,
+            hashes: args.hashes,
+            seed: args.seed,
+            fingerprint_bits: args.fingerprint_bits as usize,
+            feature_config: FeatureConfig::new(
+                args.index_mode,
+                args.minimizer_size,
+                args.modimizer_sampling,
+            )
+            .with_findere_z(args.findere_z),
+            slot_scale: args.slot_scale,
+            minimum_slots: args.slot_count,
+            merge: args.merge.clone(),
+            build_jobs: bounded_build_jobs(args.build_jobs)?,
+        };
+        return zorindex::power_merge::build(&args.fof, &args.output, config, |keys, slots| {
+            let segment_length = (slots / args.hashes)
+                .max(1)
+                .min(1 << MAX_SEGMENT_LENGTH_LOG);
+            let segment_length = 1 << segment_length.ilog2();
+            let layout = calculate_layout_with_segment_length(slots, args.hashes, segment_length)?;
+            ensure!(layout.array_length == slots, "invalid power-of-two layout");
+            peel_zor_graph(
+                keys,
+                PureZorConfig {
+                    layout,
+                    hashes: args.hashes,
+                    seed: args.seed,
+                    fingerprint_bits: args.fingerprint_bits,
+                    cycle_break: args.cycle_break,
+                    tie_scan: args.tie_scan,
+                },
+            )
+        });
+    }
     let start = Instant::now();
+    let build_jobs = bounded_build_jobs(args.build_jobs)?;
     let feature_config = FeatureConfig::new(
         args.index_mode,
         args.minimizer_size,
@@ -432,25 +618,19 @@ fn build_command(args: BuildArgs) -> Result<()> {
     );
 
     eprintln!(
-        "parsing {} color files with k={} and index_mode={}",
+        "counting {} color files with k={} and index_mode={} using build_jobs={}",
         inputs.len(),
         args.k,
-        feature_config.mode.label()
+        feature_config.mode.label(),
+        build_jobs
     );
-    let mut parsed = inputs
-        .par_iter()
-        .map(|input| parse_color(input, args.k, args.seed, feature_config))
-        .collect::<Result<Vec<_>>>()?;
-    parsed.sort_by(|left, right| left.input.name.cmp(&right.input.name));
+    let mut summaries = summarize_inputs(&inputs, args.k, args.seed, feature_config, build_jobs)?;
+    summaries.sort_by(|left, right| left.input.name.cmp(&right.input.name));
 
-    let max_unique = parsed
-        .iter()
-        .map(|color| color.kmers.len())
-        .max()
-        .unwrap_or(0);
+    let technical_plan = choose_zor_technical_layout(&summaries, &args)?;
     let target_slots = match args.slot_count {
         Some(slots) => slots,
-        None => scaled_slots(max_unique, args.slot_scale),
+        None => scaled_slots(technical_plan.max_part_features, args.slot_scale),
     }
     .max(args.hashes)
     .max(1);
@@ -464,10 +644,26 @@ fn build_command(args: BuildArgs) -> Result<()> {
         tie_scan: args.tie_scan,
     };
     let fingerprint_bytes = fingerprint_bytes(args.fingerprint_bits)?;
+    let (color_plans, mut colors, mut technical_bins) =
+        make_color_build_plan(&summaries, &technical_plan);
+    let color_count = colors.len();
+    let technical_bin_count = technical_bins.len();
+    let row_bytes = technical_bin_count
+        .checked_mul(fingerprint_bytes)
+        .context("row width overflow")?;
+    let total_bytes = layout
+        .array_length
+        .checked_mul(row_bytes)
+        .context("interlaced size overflow")?;
+    let mut interlaced = vec![0u8; total_bytes];
 
     eprintln!(
-        "building {} pure ZOR color layers: target_slots={}, array_slots={}, segment_length={}, segment_count={}, hashes={}, fingerprint_bits={}, cycle_break={:?}, tie_scan={}",
-        parsed.len(),
+        "building {} pure ZOR technical bins from {} colors: technical_layout={}, target_features={}, max_part_features={}, target_slots={}, array_slots={}, segment_length={}, segment_count={}, hashes={}, fingerprint_bits={}, cycle_break={:?}, tie_scan={}",
+        technical_bin_count,
+        color_count,
+        technical_plan.mode.label(),
+        technical_plan.target_features,
+        technical_plan.max_part_features,
         target_slots,
         layout.array_length,
         layout.segment_length,
@@ -477,16 +673,32 @@ fn build_command(args: BuildArgs) -> Result<()> {
         args.cycle_break,
         args.tie_scan
     );
-    let builds = parsed
-        .par_iter()
-        .map(|color| build_pure_zor(&color.kmers, build_config))
-        .collect::<Result<Vec<_>>>()?;
 
-    let color_count = parsed.len();
-    let interlaced = interlace_builds(layout, color_count, fingerprint_bytes, &builds)?;
-    let row_bytes = color_count
-        .checked_mul(fingerprint_bytes)
-        .context("row width overflow")?;
+    for chunk in color_plans.chunks(build_jobs) {
+        let results = chunk
+            .par_iter()
+            .map(|plan| {
+                build_zor_color_parts(plan, args.k, args.seed, feature_config, build_config)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for result in results {
+            for part in result.parts {
+                technical_bins[part.technical_bin_id].unique_kmers = part.unique_kmers as u64;
+                write_layer_into_interlaced(
+                    &mut interlaced,
+                    layout,
+                    technical_bin_count,
+                    fingerprint_bytes,
+                    part.technical_bin_id,
+                    &part.cells,
+                )?;
+            }
+            colors[result.color_id].occurrences = result.occurrences;
+            colors[result.color_id].unique_kmers = result.unique_kmers as u64;
+            colors[result.color_id].abandoned = result.abandoned;
+        }
+    }
+
     let stack = StackStorage::from_plain(
         interlaced,
         args.stack_compression,
@@ -495,44 +707,13 @@ fn build_command(args: BuildArgs) -> Result<()> {
         layout.array_length,
     )?;
 
-    let colors = parsed
-        .iter()
-        .zip(builds.iter())
-        .map(|(color, build)| ColorMeta {
-            name: color.input.name.clone(),
-            path: color.input.path.display().to_string(),
-            occurrences: color.occurrences,
-            unique_kmers: color.kmers.len() as u64,
-            abandoned: build.abandoned,
-        })
-        .collect::<Vec<_>>();
-
     let union_graph = if args.union_graph {
-        eprintln!("building optional union graph filter");
-        let mut union = Vec::new();
-        for color in &parsed {
-            union.extend_from_slice(&color.kmers);
-        }
-        union.sort_unstable();
-        union.dedup();
-        let union_target_slots = scaled_slots(union.len(), args.slot_scale)
-            .max(args.hashes)
-            .max(1);
-        let union_layout = calculate_layout(union_target_slots, args.hashes, args.segment_length)?;
-        let build = build_pure_zor(
-            &union,
-            PureZorConfig {
-                layout: union_layout,
-                seed: args.seed ^ UNION_SEED_XOR,
-                ..build_config
-            },
-        )?;
-        Some(UnionGraph {
-            layout: union_layout,
-            unique_kmers: union.len() as u64,
-            abandoned: build.abandoned,
-            cells: build.cells,
-        })
+        Some(build_union_graph_streaming(
+            &color_plans,
+            &args,
+            feature_config,
+            build_config,
+        )?)
     } else {
         None
     };
@@ -548,7 +729,10 @@ fn build_command(args: BuildArgs) -> Result<()> {
         seed: args.seed,
         feature_config,
         layout,
+        technical_layout: technical_plan.mode,
+        split_target_features: technical_plan.target_features as u64,
         colors,
+        technical_bins,
         stack,
         union_graph,
     };
@@ -557,10 +741,11 @@ fn build_command(args: BuildArgs) -> Result<()> {
         .with_context(|| format!("writing {}", args.output.display()))?;
 
     eprintln!(
-        "built {} in {:.3}s: colors={}, occurrences={}, unique_by_color={}, abandoned={} ({:.4}%), stack_compression={}, stack_stored_bytes={}",
+        "built {} in {:.3}s: colors={}, technical_bins={}, occurrences={}, unique_by_color={}, abandoned={} ({:.4}%), stack_compression={}, stack_stored_bytes={}",
         args.output.display(),
         start.elapsed().as_secs_f64(),
         color_count,
+        technical_bin_count,
         total_occurrences,
         total_unique_by_color,
         total_abandoned,
@@ -572,6 +757,10 @@ fn build_command(args: BuildArgs) -> Result<()> {
 }
 
 fn append_command(args: AppendArgs) -> Result<()> {
+    ensure!(
+        !args.index.is_dir(),
+        "append is not supported for power-of-two banks; rebuild from the complete FOF"
+    );
     ensure!(args.tie_scan > 0, "--tie-scan must be greater than 0");
     let start = Instant::now();
     let mut index =
@@ -627,8 +816,19 @@ fn append_command(args: AppendArgs) -> Result<()> {
             "--stack-block-rows must be greater than 0"
         );
     }
+    let append_results = parsed
+        .par_iter()
+        .enumerate()
+        .map(|(offset, color)| build_appended_zor_color(&index, color, offset, build_config))
+        .collect::<Result<Vec<_>>>()?;
+    let appended_technical_bins = append_results
+        .iter()
+        .map(|result| result.parts.len())
+        .sum::<usize>();
+
     eprintln!(
-        "building {} appended pure ZOR layers: slots={}, hashes={}, fingerprint_bits={}, cycle_break={:?}, tie_scan={}",
+        "building {} appended pure ZOR technical bins from {} colors: slots={}, hashes={}, fingerprint_bits={}, cycle_break={:?}, tie_scan={}",
+        appended_technical_bins,
         parsed.len(),
         index.layout.array_length,
         index.hashes,
@@ -636,34 +836,57 @@ fn append_command(args: AppendArgs) -> Result<()> {
         args.cycle_break,
         args.tie_scan
     );
-    let builds = parsed
-        .par_iter()
-        .map(|color| build_pure_zor(&color.kmers, build_config))
-        .collect::<Result<Vec<_>>>()?;
 
     let old_color_count = index.colors.len();
+    let old_technical_bin_count = index.technical_bins.len();
+    let mut builds = Vec::with_capacity(appended_technical_bins);
+    let mut new_colors = Vec::with_capacity(append_results.len());
+    let mut new_technical_bins = Vec::with_capacity(appended_technical_bins);
+    for result in append_results {
+        let color_id = old_color_count + result.color_offset;
+        let part_count = result.parts.len().max(1);
+        new_colors.push(ColorMeta {
+            name: result.input.name.clone(),
+            path: result.input.path.display().to_string(),
+            occurrences: result.occurrences,
+            unique_kmers: result.unique_kmers as u64,
+            abandoned: result.abandoned,
+        });
+        for (part_id, part) in result.parts.into_iter().enumerate() {
+            new_technical_bins.push(TechnicalBinMeta {
+                color_id,
+                part_id,
+                part_count,
+                unique_kmers: part.unique_kmers as u64,
+            });
+            builds.push(PureZorBuild {
+                cells: part.cells,
+                abandoned: part.abandoned,
+                abandoned_keys: Vec::new(),
+            });
+        }
+    }
+
     let existing_stack = index.stack.to_plain_vec()?;
     let interlaced = append_interlaced(
         &existing_stack,
         index.layout,
-        old_color_count,
+        old_technical_bin_count,
         fingerprint_bytes,
         &builds,
     )?;
-    index.colors.extend(
-        parsed
+    index.colors.extend(new_colors);
+    index.technical_bins.extend(new_technical_bins);
+    if index.technical_layout == TechnicalLayoutMode::Flat {
+        let max_appended = parsed
             .iter()
-            .zip(builds.iter())
-            .map(|(color, build)| ColorMeta {
-                name: color.input.name.clone(),
-                path: color.input.path.display().to_string(),
-                occurrences: color.occurrences,
-                unique_kmers: color.kmers.len() as u64,
-                abandoned: build.abandoned,
-            }),
-    );
+            .map(|color| color.kmers.len() as u64)
+            .max()
+            .unwrap_or(0);
+        index.split_target_features = index.split_target_features.max(max_appended);
+    }
     let row_bytes = index
-        .colors
+        .technical_bins
         .len()
         .checked_mul(fingerprint_bytes)
         .context("row width overflow")?;
@@ -690,8 +913,9 @@ fn append_command(args: AppendArgs) -> Result<()> {
     let appended_unique = parsed.iter().map(|c| c.kmers.len() as u64).sum::<u64>();
     let appended_abandoned = builds.iter().map(|b| b.abandoned).sum::<u64>();
     eprintln!(
-        "appended {} colors to {} in {:.3}s: appended_unique={}, appended_abandoned={} ({:.4}%), stack_compression={}, stack_stored_bytes={}",
+        "appended {} colors ({} technical bins) to {} in {:.3}s: appended_unique={}, appended_abandoned={} ({:.4}%), stack_compression={}, stack_stored_bytes={}",
         parsed.len(),
+        appended_technical_bins,
         output.display(),
         start.elapsed().as_secs_f64(),
         appended_unique,
@@ -705,6 +929,10 @@ fn append_command(args: AppendArgs) -> Result<()> {
 
 fn repack_command(args: RepackArgs) -> Result<()> {
     ensure!(
+        !args.index.is_dir(),
+        "repack is not supported for power-of-two banks"
+    );
+    ensure!(
         args.stack_block_rows > 0,
         "--stack-block-rows must be greater than 0"
     );
@@ -713,7 +941,7 @@ fn repack_command(args: RepackArgs) -> Result<()> {
         ZorIndex::load(&args.index).with_context(|| format!("loading {}", args.index.display()))?;
     let fingerprint_bytes = fingerprint_bytes(index.fingerprint_bits)?;
     let row_bytes = index
-        .colors
+        .technical_bins
         .len()
         .checked_mul(fingerprint_bytes)
         .context("row width overflow")?;
@@ -745,6 +973,14 @@ fn repack_command(args: RepackArgs) -> Result<()> {
 }
 
 fn query_command(args: QueryArgs) -> Result<()> {
+    if args.index.is_dir() {
+        return zorindex::power_merge::query_command_with_recovery(
+            &args.index,
+            &args.query,
+            args.min_ratio,
+            !args.ignore_abandoned,
+        );
+    }
     ensure!(
         (0.0..=1.0).contains(&args.min_ratio),
         "--min-ratio must be in [0, 1]"
@@ -799,6 +1035,9 @@ fn query_command(args: QueryArgs) -> Result<()> {
 }
 
 fn info_command(args: IndexArg) -> Result<()> {
+    if args.index.is_dir() {
+        return zorindex::power_merge::info_command(&args.index);
+    }
     let index =
         ZorIndex::load(&args.index).with_context(|| format!("loading {}", args.index.display()))?;
     let total_unique = index.colors.iter().map(|c| c.unique_kmers).sum::<u64>();
@@ -819,7 +1058,10 @@ fn info_command(args: IndexArg) -> Result<()> {
         index.feature_config.modimizer_sampling
     );
     println!("colors\t{}", index.colors.len());
-    println!("slots_per_color\t{}", index.layout.array_length);
+    println!("technical_layout\t{}", index.technical_layout.label());
+    println!("split_target_features\t{}", index.split_target_features);
+    println!("technical_bins\t{}", index.technical_bins.len());
+    println!("slots_per_technical_bin\t{}", index.layout.array_length);
     println!("segment_length\t{}", index.layout.segment_length);
     println!("segment_count\t{}", index.layout.segment_count);
     println!("stack_bytes\t{}", index.stack.len_uncompressed());
@@ -850,6 +1092,18 @@ fn info_command(args: IndexArg) -> Result<()> {
         println!(
             "{}\t{}\t{}\t{}\t{}",
             color.name, color.unique_kmers, color.occurrences, color.abandoned, color.path
+        );
+    }
+    println!("technical_bin\tcolor\tpart\tparts\tunique_kmers");
+    for (technical_id, bin) in index.technical_bins.iter().enumerate() {
+        let color_name = index
+            .colors
+            .get(bin.color_id)
+            .map(|color| color.name.as_str())
+            .unwrap_or("<invalid>");
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            technical_id, color_name, bin.part_id, bin.part_count, bin.unique_kmers
         );
     }
     Ok(())
@@ -884,6 +1138,19 @@ fn validate_build_args(args: &BuildArgs) -> Result<()> {
         args.stack_block_rows > 0,
         "--stack-block-rows must be greater than 0"
     );
+    ensure!(
+        args.max_split_parts > 0,
+        "--max-split-parts must be greater than 0"
+    );
+    if let Some(target) = args.target_technical_features {
+        ensure!(
+            target > 0,
+            "--target-technical-features must be greater than 0"
+        );
+    }
+    if let Some(build_jobs) = args.build_jobs {
+        ensure!(build_jobs > 0, "--build-jobs must be greater than 0");
+    }
     if let Some(segment_length) = args.segment_length {
         ensure!(
             segment_length.is_power_of_two(),
@@ -1677,44 +1944,6 @@ fn decompress_v5_stack_block(codec: u8, data: &[u8], uncompressed_len: usize) ->
     }
 }
 
-fn interlace_builds(
-    layout: Layout,
-    color_count: usize,
-    fingerprint_bytes: usize,
-    builds: &[PureZorBuild],
-) -> Result<Vec<u8>> {
-    ensure!(
-        builds.len() == color_count,
-        "build count does not match color count"
-    );
-    let row_bytes = color_count
-        .checked_mul(fingerprint_bytes)
-        .context("row width overflow")?;
-    let total_bytes = layout
-        .array_length
-        .checked_mul(row_bytes)
-        .context("interlaced size overflow")?;
-    let mut interlaced = vec![0u8; total_bytes];
-    for build in builds {
-        ensure!(
-            build.cells.len() == layout.array_length * fingerprint_bytes,
-            "build cell length does not match layout"
-        );
-    }
-    interlaced
-        .par_chunks_mut(row_bytes)
-        .enumerate()
-        .for_each(|(slot, row)| {
-            for (color_id, build) in builds.iter().enumerate() {
-                let src = slot * fingerprint_bytes;
-                let dst = color_id * fingerprint_bytes;
-                row[dst..dst + fingerprint_bytes]
-                    .copy_from_slice(&build.cells[src..src + fingerprint_bytes]);
-            }
-        });
-    Ok(interlaced)
-}
-
 fn append_interlaced(
     existing: &[u8],
     layout: Layout,
@@ -1791,6 +2020,414 @@ fn parse_color(
         input: input.clone(),
         kmers,
         occurrences,
+    })
+}
+
+fn bounded_build_jobs(requested: Option<usize>) -> Result<usize> {
+    let jobs = requested.unwrap_or_else(|| rayon::current_num_threads().max(1));
+    ensure!(jobs > 0, "--build-jobs must be greater than 0");
+    Ok(jobs)
+}
+
+fn summarize_inputs(
+    inputs: &[ColorInput],
+    k: usize,
+    seed: u64,
+    feature_config: FeatureConfig,
+    build_jobs: usize,
+) -> Result<Vec<ColorSummary>> {
+    let mut summaries = Vec::with_capacity(inputs.len());
+    for chunk in inputs.chunks(build_jobs) {
+        let mut chunk_summaries = chunk
+            .par_iter()
+            .map(|input| summarize_color(input, k, seed, feature_config))
+            .collect::<Result<Vec<_>>>()?;
+        summaries.append(&mut chunk_summaries);
+    }
+    Ok(summaries)
+}
+
+fn summarize_color(
+    input: &ColorInput,
+    k: usize,
+    seed: u64,
+    feature_config: FeatureConfig,
+) -> Result<ColorSummary> {
+    let start = Instant::now();
+    let mut kmers = Vec::new();
+    let mut occurrences = 0u64;
+    let stats = parse_features_from_file(&input.path, k, seed, feature_config, |kmer| {
+        kmers.push(kmer);
+        occurrences += 1;
+    })?;
+    kmers.sort_unstable();
+    kmers.dedup();
+    eprintln!(
+        "counted {}\tfeatures={}\tunique={}\tbases={}\tchunks={}\telapsed_s={:.3}",
+        input.name,
+        occurrences,
+        kmers.len(),
+        stats.bases,
+        stats.chunks,
+        start.elapsed().as_secs_f64()
+    );
+    Ok(ColorSummary {
+        input: input.clone(),
+        occurrences,
+        unique_kmers: kmers.len(),
+    })
+}
+
+fn choose_zor_technical_layout(
+    summaries: &[ColorSummary],
+    args: &BuildArgs,
+) -> Result<TechnicalLayoutPlan> {
+    let counts = summaries
+        .iter()
+        .map(|summary| summary.unique_kmers)
+        .collect::<Vec<_>>();
+    let max_unique = counts.iter().copied().max().unwrap_or(0).max(1);
+    if args.technical_layout == TechnicalLayoutMode::Flat {
+        return Ok(TechnicalLayoutPlan {
+            mode: TechnicalLayoutMode::Flat,
+            target_features: max_unique,
+            max_part_features: max_unique,
+            part_counts: vec![1; summaries.len()],
+        });
+    }
+
+    let candidates = if let Some(target) = args.target_technical_features {
+        vec![target.max(1)]
+    } else {
+        technical_target_candidates(&counts)
+    };
+    let fingerprint_bytes = fingerprint_bytes(args.fingerprint_bits)?;
+    let color_count = summaries.len().max(1);
+    let mut best: Option<(f64, usize, usize, Vec<usize>)> = None;
+    for target in candidates {
+        let (part_counts, max_part_features) =
+            split_part_counts(&counts, target, args.max_split_parts);
+        let technical_bin_count = part_counts.iter().sum::<usize>().max(1);
+        let target_slots = match args.slot_count {
+            Some(slots) => slots,
+            None => scaled_slots(max_part_features, args.slot_scale),
+        }
+        .max(args.hashes)
+        .max(1);
+        let layout = calculate_layout(target_slots, args.hashes, args.segment_length)?;
+        let estimated_bytes = layout
+            .array_length
+            .checked_mul(technical_bin_count)
+            .and_then(|bytes| bytes.checked_mul(fingerprint_bytes))
+            .context("technical layout size overflow")?;
+        let technical_bin_penalty = technical_bin_count as f64 / color_count as f64;
+        let estimated_cost = estimated_bytes as f64 * technical_bin_penalty;
+        let replace = best
+            .as_ref()
+            .map(|(best_cost, _, _, _)| estimated_cost < *best_cost)
+            .unwrap_or(true);
+        if replace {
+            best = Some((estimated_cost, target, max_part_features, part_counts));
+        }
+    }
+    let Some((_, target_features, max_part_features, part_counts)) = best else {
+        anyhow::bail!("no technical layout candidates were generated");
+    };
+    Ok(TechnicalLayoutPlan {
+        mode: args.technical_layout,
+        target_features,
+        max_part_features,
+        part_counts,
+    })
+}
+
+fn technical_target_candidates(counts: &[usize]) -> Vec<usize> {
+    let mut nonzero = counts
+        .iter()
+        .copied()
+        .filter(|&count| count > 0)
+        .collect::<Vec<_>>();
+    if nonzero.is_empty() {
+        return vec![1];
+    }
+    nonzero.sort_unstable();
+    let max_unique = *nonzero.last().unwrap();
+    let mut candidates = vec![
+        max_unique,
+        percentile_sorted(&nonzero, 99),
+        percentile_sorted(&nonzero, 95),
+        percentile_sorted(&nonzero, 90),
+        percentile_sorted(&nonzero, 75),
+        percentile_sorted(&nonzero, 50),
+    ];
+    candidates.retain(|&target| target > 0);
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+}
+
+fn percentile_sorted(sorted: &[usize], percentile: usize) -> usize {
+    debug_assert!(!sorted.is_empty());
+    let index = ((sorted.len() - 1) * percentile).div_ceil(100);
+    sorted[index.min(sorted.len() - 1)].max(1)
+}
+
+fn split_part_counts(
+    counts: &[usize],
+    target_features: usize,
+    max_split_parts: usize,
+) -> (Vec<usize>, usize) {
+    let target = target_features.max(1);
+    let max_parts = max_split_parts.max(1);
+    let mut max_part_features = 1usize;
+    let part_counts = counts
+        .iter()
+        .map(|&count| {
+            let parts = count.div_ceil(target).max(1).min(max_parts);
+            max_part_features = max_part_features.max(count.div_ceil(parts));
+            parts
+        })
+        .collect::<Vec<_>>();
+    (part_counts, max_part_features)
+}
+
+fn make_color_build_plan(
+    summaries: &[ColorSummary],
+    technical_plan: &TechnicalLayoutPlan,
+) -> (Vec<ColorBuildPlan>, Vec<ColorMeta>, Vec<TechnicalBinMeta>) {
+    let mut color_plans = Vec::with_capacity(summaries.len());
+    let mut colors = Vec::with_capacity(summaries.len());
+    let mut technical_bins = Vec::new();
+    for (color_id, summary) in summaries.iter().enumerate() {
+        let part_count = technical_plan.part_counts[color_id].max(1);
+        let first_technical_bin = technical_bins.len();
+        colors.push(ColorMeta {
+            name: summary.input.name.clone(),
+            path: summary.input.path.display().to_string(),
+            occurrences: summary.occurrences,
+            unique_kmers: summary.unique_kmers as u64,
+            abandoned: 0,
+        });
+        color_plans.push(ColorBuildPlan {
+            input: summary.input.clone(),
+            color_id,
+            occurrences: summary.occurrences,
+            unique_kmers: summary.unique_kmers,
+            first_technical_bin,
+            part_count,
+        });
+        for part_id in 0..part_count {
+            technical_bins.push(TechnicalBinMeta {
+                color_id,
+                part_id,
+                part_count,
+                unique_kmers: 0,
+            });
+        }
+    }
+    (color_plans, colors, technical_bins)
+}
+
+fn flat_technical_bins(colors: &[ColorMeta]) -> Vec<TechnicalBinMeta> {
+    colors
+        .iter()
+        .enumerate()
+        .map(|(color_id, color)| TechnicalBinMeta {
+            color_id,
+            part_id: 0,
+            part_count: 1,
+            unique_kmers: color.unique_kmers,
+        })
+        .collect()
+}
+
+fn build_zor_color_parts(
+    plan: &ColorBuildPlan,
+    k: usize,
+    seed: u64,
+    feature_config: FeatureConfig,
+    build_config: PureZorConfig,
+) -> Result<ZorColorBuild> {
+    let parsed = parse_color(&plan.input, k, seed, feature_config)?;
+    ensure!(
+        parsed.kmers.len() == plan.unique_kmers,
+        "{} changed while building: counted {} unique features but parsed {}",
+        plan.input.name,
+        plan.unique_kmers,
+        parsed.kmers.len()
+    );
+    ensure!(
+        parsed.occurrences == plan.occurrences,
+        "{} changed while building: counted {} features but parsed {}",
+        plan.input.name,
+        plan.occurrences,
+        parsed.occurrences
+    );
+    let partitions = partition_keys(&parsed.kmers, plan.part_count, seed ^ SPLIT_SEED_XOR);
+    let (parts, abandoned) =
+        build_zor_part_sequence(partitions, plan.first_technical_bin, build_config)?;
+    Ok(ZorColorBuild {
+        color_id: plan.color_id,
+        occurrences: parsed.occurrences,
+        unique_kmers: parsed.kmers.len(),
+        abandoned,
+        parts,
+    })
+}
+
+fn build_appended_zor_color(
+    index: &ZorIndex,
+    color: &ParsedColor,
+    color_offset: usize,
+    build_config: PureZorConfig,
+) -> Result<AppendedZorColor> {
+    let part_count = appended_part_count(
+        index.technical_layout,
+        index.split_target_features,
+        color.kmers.len(),
+    );
+    let partitions = partition_keys(&color.kmers, part_count, index.seed ^ SPLIT_SEED_XOR);
+    let (parts, abandoned) = build_zor_part_sequence(partitions, 0, build_config)?;
+    let parts = parts
+        .into_iter()
+        .map(|part| AppendedZorPart {
+            unique_kmers: part.unique_kmers,
+            abandoned: part.abandoned,
+            cells: part.cells,
+        })
+        .collect();
+    Ok(AppendedZorColor {
+        color_offset,
+        input: color.input.clone(),
+        occurrences: color.occurrences,
+        unique_kmers: color.kmers.len(),
+        abandoned,
+        parts,
+    })
+}
+
+fn build_zor_part_sequence(
+    partitions: Vec<Vec<u64>>,
+    first_technical_bin: usize,
+    build_config: PureZorConfig,
+) -> Result<(Vec<ZorPartBuild>, u64)> {
+    let mut parts = Vec::with_capacity(partitions.len());
+    let mut carry = Vec::new();
+    let mut final_abandoned = 0u64;
+
+    for (part_id, mut keys) in partitions.into_iter().enumerate() {
+        if !carry.is_empty() {
+            keys.extend_from_slice(&carry);
+            keys.sort_unstable();
+            keys.dedup();
+        }
+        let build = build_pure_zor(&keys, build_config)?;
+        final_abandoned = build.abandoned;
+        carry = build.abandoned_keys;
+        parts.push(ZorPartBuild {
+            technical_bin_id: first_technical_bin + part_id,
+            unique_kmers: keys.len(),
+            abandoned: build.abandoned,
+            cells: build.cells,
+        });
+    }
+
+    Ok((parts, final_abandoned))
+}
+
+fn appended_part_count(
+    technical_layout: TechnicalLayoutMode,
+    split_target_features: u64,
+    unique_kmers: usize,
+) -> usize {
+    if technical_layout == TechnicalLayoutMode::SplitLarge {
+        let target = (split_target_features as usize).max(1);
+        unique_kmers.div_ceil(target).max(1)
+    } else {
+        1
+    }
+}
+
+fn partition_keys(keys: &[u64], part_count: usize, seed: u64) -> Vec<Vec<u64>> {
+    if part_count <= 1 {
+        return vec![keys.to_vec()];
+    }
+    let mut partitions = (0..part_count).map(|_| Vec::new()).collect::<Vec<_>>();
+    for &key in keys {
+        let part = reduce_u64(mixsplit(key, seed), part_count as u64);
+        partitions[part].push(key);
+    }
+    partitions
+}
+
+#[inline(always)]
+fn reduce_u64(hash: u64, modulus: u64) -> usize {
+    (((hash as u128) * (modulus as u128)) >> 64) as usize
+}
+
+fn write_layer_into_interlaced(
+    interlaced: &mut [u8],
+    layout: Layout,
+    technical_bin_count: usize,
+    fingerprint_bytes: usize,
+    technical_bin_id: usize,
+    cells: &[u8],
+) -> Result<()> {
+    ensure!(
+        cells.len() == layout.array_length * fingerprint_bytes,
+        "build cell length does not match layout"
+    );
+    ensure!(
+        technical_bin_id < technical_bin_count,
+        "technical bin id out of bounds"
+    );
+    let row_bytes = technical_bin_count
+        .checked_mul(fingerprint_bytes)
+        .context("row width overflow")?;
+    ensure!(
+        interlaced.len() == layout.array_length * row_bytes,
+        "interlaced stack length does not match layout"
+    );
+    for slot in 0..layout.array_length {
+        let src = slot * fingerprint_bytes;
+        let dst = slot * row_bytes + technical_bin_id * fingerprint_bytes;
+        interlaced[dst..dst + fingerprint_bytes]
+            .copy_from_slice(&cells[src..src + fingerprint_bytes]);
+    }
+    Ok(())
+}
+
+fn build_union_graph_streaming(
+    color_plans: &[ColorBuildPlan],
+    args: &BuildArgs,
+    feature_config: FeatureConfig,
+    build_config: PureZorConfig,
+) -> Result<UnionGraph> {
+    eprintln!("building optional union graph filter");
+    let mut union = Vec::new();
+    for plan in color_plans {
+        let parsed = parse_color(&plan.input, args.k, args.seed, feature_config)?;
+        union.extend_from_slice(&parsed.kmers);
+    }
+    union.sort_unstable();
+    union.dedup();
+    let union_target_slots = scaled_slots(union.len(), args.slot_scale)
+        .max(args.hashes)
+        .max(1);
+    let union_layout = calculate_layout(union_target_slots, args.hashes, args.segment_length)?;
+    let build = build_pure_zor(
+        &union,
+        PureZorConfig {
+            layout: union_layout,
+            seed: args.seed ^ UNION_SEED_XOR,
+            ..build_config
+        },
+    )?;
+    Ok(UnionGraph {
+        layout: union_layout,
+        unique_kmers: union.len() as u64,
+        abandoned: build.abandoned,
+        cells: build.cells,
     })
 }
 
@@ -2076,7 +2713,32 @@ fn validate_layout(layout: Layout, hashes: usize) -> Result<()> {
     Ok(())
 }
 
-fn build_pure_zor(keys: &[u64], config: PureZorConfig) -> Result<PureZorBuild> {
+fn peel_zor_graph(keys: &[u64], config: PureZorConfig) -> Result<zorindex::power_merge::PeelGraph> {
+    if compact_graph_eligible(keys.len(), config.layout.array_length, config.hashes) {
+        Ok(PeelGraph::Compact(peel_zor_graph_impl::<
+            u32,
+            IndexedDegreeHeap,
+        >(keys, config)?))
+    } else {
+        Ok(PeelGraph::Wide(peel_zor_graph_impl::<
+            usize,
+            BinaryHeap<(Reverse<u32>, usize)>,
+        >(keys, config)?))
+    }
+}
+
+fn compact_graph_eligible(edges: usize, slots: usize, hashes: usize) -> bool {
+    edges <= u32::MAX as usize
+        && slots <= u32::MAX as usize
+        && edges
+            .checked_mul(hashes)
+            .is_some_and(|n| n <= u32::MAX as usize)
+}
+
+fn peel_zor_graph_impl<I: GraphIndex, Q: DegreeQueue>(
+    keys: &[u64],
+    config: PureZorConfig,
+) -> Result<TypedPeelGraph<I>> {
     ensure!(config.hashes >= 2, "hash count must be at least 2");
     ensure!(
         config.hashes <= MAX_HASHES,
@@ -2084,12 +2746,13 @@ fn build_pure_zor(keys: &[u64], config: PureZorConfig) -> Result<PureZorBuild> {
         MAX_HASHES
     );
     ensure!(config.tie_scan > 0, "tie scan must be greater than 0");
-    let fingerprint_bytes = fingerprint_bytes(config.fingerprint_bits)?;
+    fingerprint_bytes(config.fingerprint_bits)?;
     validate_layout(config.layout, config.hashes)?;
     if keys.is_empty() {
-        return Ok(PureZorBuild {
-            cells: vec![0; config.layout.array_length * fingerprint_bytes],
-            abandoned: 0,
+        return Ok(TypedPeelGraph {
+            positions: Vec::new(),
+            order: Vec::new(),
+            dropped: Vec::new(),
         });
     }
 
@@ -2097,42 +2760,47 @@ fn build_pure_zor(keys: &[u64], config: PureZorConfig) -> Result<PureZorBuild> {
     let incidence_count = edge_count
         .checked_mul(config.hashes)
         .context("too many key/hash incidences")?;
-    let mut edge_slots = vec![0usize; incidence_count];
+    let mut edge_slots = vec![I::from_usize(0); incidence_count];
     let mut degrees = vec![0u32; config.layout.array_length];
 
     for (edge, &key) in keys.iter().enumerate() {
+        let mut locations = [0usize; MAX_HASHES];
         fill_positions(
             key,
             config.layout,
             config.hashes,
             config.seed,
-            &mut edge_slots[edge * config.hashes..][..config.hashes],
+            &mut locations[..config.hashes],
         );
-        for &slot in &edge_slots[edge * config.hashes..edge * config.hashes + config.hashes] {
+        for (stored, &slot) in edge_slots[edge * config.hashes..][..config.hashes]
+            .iter_mut()
+            .zip(&locations)
+        {
+            *stored = I::from_usize(slot);
             degrees[slot] += 1;
         }
     }
 
-    let mut offsets = vec![0usize; config.layout.array_length + 1];
+    let mut offsets = vec![I::from_usize(0); config.layout.array_length + 1];
     for slot in 0..config.layout.array_length {
-        offsets[slot + 1] = offsets[slot] + degrees[slot] as usize;
+        offsets[slot + 1] = I::from_usize(offsets[slot].as_usize() + degrees[slot] as usize);
     }
     let mut cursor = offsets[..config.layout.array_length].to_vec();
-    let mut adjacency = vec![0usize; incidence_count];
+    let mut adjacency = vec![I::from_usize(0); incidence_count];
     for edge in 0..edge_count {
         for &slot in &edge_slots[edge * config.hashes..edge * config.hashes + config.hashes] {
-            let pos = cursor[slot];
-            adjacency[pos] = edge;
-            cursor[slot] += 1;
+            let slot = slot.as_usize();
+            let pos = cursor[slot].as_usize();
+            adjacency[pos] = I::from_usize(edge);
+            cursor[slot] = I::from_usize(pos + 1);
         }
     }
 
     let mut queue = VecDeque::new();
-    let mut multi_heap: BinaryHeap<(Reverse<u32>, usize)> =
-        BinaryHeap::with_capacity(config.layout.array_length);
+    let mut multi_heap = Q::new(config.layout.array_length);
     for (slot, &degree) in degrees.iter().enumerate() {
         match degree {
-            1 => queue.push_back(slot),
+            1 => queue.push_back(I::from_usize(slot)),
             degree if degree > 1 => multi_heap.push((Reverse(degree), slot)),
             _ => {}
         }
@@ -2147,6 +2815,7 @@ fn build_pure_zor(keys: &[u64], config: PureZorConfig) -> Result<PureZorBuild> {
         let mut progress = false;
 
         while let Some(slot) = queue.pop_front() {
+            let slot = slot.as_usize();
             if degrees[slot] != 1 {
                 continue;
             }
@@ -2160,7 +2829,7 @@ fn build_pure_zor(keys: &[u64], config: PureZorConfig) -> Result<PureZorBuild> {
             progress = true;
             active[edge] = false;
             remaining -= 1;
-            peel_order.push((edge, slot));
+            peel_order.push((I::from_usize(edge), I::from_usize(slot)));
             decrement_edge(
                 edge,
                 config.hashes,
@@ -2197,7 +2866,7 @@ fn build_pure_zor(keys: &[u64], config: PureZorConfig) -> Result<PureZorBuild> {
             };
             active[edge] = false;
             remaining -= 1;
-            abandoned_edges.push(edge);
+            abandoned_edges.push(I::from_usize(edge));
             decrement_edge(
                 edge,
                 config.hashes,
@@ -2210,7 +2879,10 @@ fn build_pure_zor(keys: &[u64], config: PureZorConfig) -> Result<PureZorBuild> {
         };
 
         let mut to_abandon = Vec::new();
-        for edge in adjacency[offsets[slot]..offsets[slot + 1]].iter().copied() {
+        for edge in adjacency[offsets[slot].as_usize()..offsets[slot + 1].as_usize()]
+            .iter()
+            .map(|&edge| edge.as_usize())
+        {
             if edge != keep && active[edge] {
                 to_abandon.push(edge);
             }
@@ -2219,7 +2891,7 @@ fn build_pure_zor(keys: &[u64], config: PureZorConfig) -> Result<PureZorBuild> {
         if to_abandon.is_empty() {
             if active[keep] {
                 degrees[slot] = 1;
-                queue.push_back(slot);
+                queue.push_back(I::from_usize(slot));
             }
             continue;
         }
@@ -2227,7 +2899,7 @@ fn build_pure_zor(keys: &[u64], config: PureZorConfig) -> Result<PureZorBuild> {
         for edge in to_abandon {
             active[edge] = false;
             remaining -= 1;
-            abandoned_edges.push(edge);
+            abandoned_edges.push(I::from_usize(edge));
             decrement_edge(
                 edge,
                 config.hashes,
@@ -2238,17 +2910,41 @@ fn build_pure_zor(keys: &[u64], config: PureZorConfig) -> Result<PureZorBuild> {
             );
         }
         if degrees[slot] == 1 {
-            queue.push_back(slot);
+            queue.push_back(I::from_usize(slot));
         }
     }
 
     for (edge, is_active) in active.iter_mut().enumerate() {
         if *is_active {
             *is_active = false;
-            abandoned_edges.push(edge);
+            abandoned_edges.push(I::from_usize(edge));
         }
     }
 
+    Ok(TypedPeelGraph {
+        positions: edge_slots,
+        order: peel_order,
+        dropped: abandoned_edges,
+    })
+}
+
+fn build_pure_zor(keys: &[u64], config: PureZorConfig) -> Result<PureZorBuild> {
+    match peel_zor_graph(keys, config)? {
+        PeelGraph::Compact(graph) => finish_pure_zor(keys, config, graph),
+        PeelGraph::Wide(graph) => finish_pure_zor(keys, config, graph),
+    }
+}
+
+fn finish_pure_zor<I: GraphIndex>(
+    keys: &[u64],
+    config: PureZorConfig,
+    graph: TypedPeelGraph<I>,
+) -> Result<PureZorBuild> {
+    let TypedPeelGraph {
+        positions: edge_slots,
+        order: peel_order,
+        dropped: mut abandoned_edges,
+    } = graph;
     let cells = assign_cells(
         keys,
         &edge_slots,
@@ -2261,27 +2957,37 @@ fn build_pure_zor(keys: &[u64], config: PureZorConfig) -> Result<PureZorBuild> {
 
     abandoned_edges.sort_unstable();
     abandoned_edges.dedup();
-    let abandoned = abandoned_edges
+    let abandoned_keys = abandoned_edges
         .iter()
-        .filter(|&&edge| {
-            !contains_raw(
-                keys[edge],
+        .filter_map(|&edge| {
+            let key = keys[edge.as_usize()];
+            if contains_raw(
+                key,
                 &cells,
                 config.layout,
                 config.hashes,
                 config.seed,
                 config.fingerprint_bits,
-            )
+            ) {
+                None
+            } else {
+                Some(key)
+            }
         })
-        .count() as u64;
+        .collect::<Vec<_>>();
+    let abandoned = abandoned_keys.len() as u64;
 
-    Ok(PureZorBuild { cells, abandoned })
+    Ok(PureZorBuild {
+        cells,
+        abandoned,
+        abandoned_keys,
+    })
 }
 
-fn assign_cells(
+fn assign_cells<I: GraphIndex>(
     keys: &[u64],
-    edge_slots: &[usize],
-    peel_order: &[(usize, usize)],
+    edge_slots: &[I],
+    peel_order: &[(I, I)],
     layout: Layout,
     hashes: usize,
     seed: u64,
@@ -2291,8 +2997,11 @@ fn assign_cells(
         8 => {
             let mut cells = vec![0u8; layout.array_length];
             for &(edge, pivot) in peel_order.iter().rev() {
+                let edge = edge.as_usize();
+                let pivot = pivot.as_usize();
                 let mut value = fingerprint8(keys[edge], seed);
                 for &slot in &edge_slots[edge * hashes..edge * hashes + hashes] {
+                    let slot = slot.as_usize();
                     if slot != pivot {
                         value ^= cells[slot];
                     }
@@ -2304,8 +3013,11 @@ fn assign_cells(
         16 => {
             let mut cells = vec![0u8; layout.array_length * 2];
             for &(edge, pivot) in peel_order.iter().rev() {
+                let edge = edge.as_usize();
+                let pivot = pivot.as_usize();
                 let mut value = fingerprint16(keys[edge], seed);
                 for &slot in &edge_slots[edge * hashes..edge * hashes + hashes] {
+                    let slot = slot.as_usize();
                     if slot != pivot {
                         value ^= read_cell_u16(&cells, slot);
                     }
@@ -2319,35 +3031,35 @@ fn assign_cells(
 }
 
 #[inline(always)]
-fn decrement_edge(
+fn decrement_edge<I: GraphIndex, Q: DegreeQueue>(
     edge: usize,
     hashes: usize,
-    edge_slots: &[usize],
+    edge_slots: &[I],
     degrees: &mut [u32],
-    queue: &mut VecDeque<usize>,
-    multi_heap: &mut BinaryHeap<(Reverse<u32>, usize)>,
+    queue: &mut VecDeque<I>,
+    multi_heap: &mut Q,
 ) {
     for &slot in &edge_slots[edge * hashes..edge * hashes + hashes] {
+        let slot = slot.as_usize();
         if degrees[slot] > 0 {
             degrees[slot] -= 1;
             if degrees[slot] == 1 {
-                queue.push_back(slot);
-            } else if degrees[slot] > 1 {
-                multi_heap.push((Reverse(degrees[slot]), slot));
+                queue.push_back(I::from_usize(slot));
             }
+            multi_heap.update(slot, degrees[slot]);
         }
     }
 }
 
-fn find_one_active_edge(
+fn find_one_active_edge<I: GraphIndex>(
     slot: usize,
-    offsets: &[usize],
-    adjacency: &[usize],
+    offsets: &[I],
+    adjacency: &[I],
     active: &[bool],
 ) -> Option<usize> {
-    adjacency[offsets[slot]..offsets[slot + 1]]
+    adjacency[offsets[slot].as_usize()..offsets[slot + 1].as_usize()]
         .iter()
-        .copied()
+        .map(|&edge| edge.as_usize())
         .find(|&edge| active[edge])
 }
 
@@ -2367,16 +3079,16 @@ struct AbandonStats {
     deg2_count: u32,
 }
 
-fn choose_cycle_break_candidate(
+fn choose_cycle_break_candidate<I: GraphIndex, Q: DegreeQueue>(
     degrees: &mut [u32],
-    offsets: &[usize],
-    adjacency: &[usize],
+    offsets: &[I],
+    adjacency: &[I],
     active: &[bool],
-    edge_slots: &[usize],
+    edge_slots: &[I],
     hashes: usize,
     cycle_break: CycleBreakHeuristic,
     tie_scan: usize,
-    multi_heap: &mut BinaryHeap<(Reverse<u32>, usize)>,
+    multi_heap: &mut Q,
 ) -> Option<(usize, usize)> {
     if cycle_break == CycleBreakHeuristic::NoHeuristic {
         loop {
@@ -2430,7 +3142,7 @@ fn choose_cycle_break_candidate(
         }
 
         while scanned < tie_scan {
-            let Some(&(Reverse(next_degree), _)) = multi_heap.peek() else {
+            let Some((Reverse(next_degree), _)) = multi_heap.peek() else {
                 break;
             };
             if next_degree != recorded_degree {
@@ -2489,13 +3201,13 @@ fn choose_cycle_break_candidate(
     }
 }
 
-fn best_key_for_cell(
+fn best_key_for_cell<I: GraphIndex>(
     cell: usize,
     active: &[bool],
     degrees: &[u32],
-    offsets: &[usize],
-    adjacency: &[usize],
-    edge_slots: &[usize],
+    offsets: &[I],
+    adjacency: &[I],
+    edge_slots: &[I],
     hashes: usize,
     cycle_break: CycleBreakHeuristic,
 ) -> Option<(usize, AbandonStats, Vec<u32>)> {
@@ -2506,7 +3218,10 @@ fn best_key_for_cell(
     let mut max_count = 0u32;
     let mut second_max = 0u32;
 
-    for edge in adjacency[offsets[cell]..offsets[cell + 1]].iter().copied() {
+    for edge in adjacency[offsets[cell].as_usize()..offsets[cell + 1].as_usize()]
+        .iter()
+        .map(|&edge| edge.as_usize())
+    {
         if !active[edge] {
             continue;
         }
@@ -2578,7 +3293,12 @@ fn best_key_for_cell(
     best_edge.map(|edge| (edge, best_stats, best_degrees))
 }
 
-fn key_stats(edge: usize, degrees: &[u32], edge_slots: &[usize], hashes: usize) -> KeyStats {
+fn key_stats<I: GraphIndex>(
+    edge: usize,
+    degrees: &[u32],
+    edge_slots: &[I],
+    hashes: usize,
+) -> KeyStats {
     let mut sum_degrees = 0u64;
     let mut max_degree = 0u32;
     let mut deg2_count = 0u32;
@@ -2588,7 +3308,7 @@ fn key_stats(edge: usize, degrees: &[u32], edge_slots: &[usize], hashes: usize) 
         .iter()
         .enumerate()
     {
-        let degree = degrees[slot];
+        let degree = degrees[slot.as_usize()];
         sum_degrees += degree as u64;
         max_degree = max_degree.max(degree);
         if degree == 2 {
@@ -2784,6 +3504,8 @@ fn increment_matching_u16_lanes(diff: u64, scores: &mut [u64], offset: usize) {
 struct QueryScratch {
     acc: Vec<u8>,
     row_codec: RowCodecScratch,
+    seen_users: Vec<u32>,
+    epoch: u32,
 }
 
 impl QueryScratch {
@@ -2791,6 +3513,19 @@ impl QueryScratch {
         if self.acc.len() != row_bytes {
             self.acc.resize(row_bytes, 0);
         }
+    }
+
+    fn next_epoch(&mut self, user_count: usize) -> u32 {
+        if self.seen_users.len() != user_count {
+            self.seen_users.resize(user_count, 0);
+            self.epoch = 0;
+        }
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.seen_users.fill(0);
+            self.epoch = 1;
+        }
+        self.epoch
     }
 }
 
@@ -2810,6 +3545,19 @@ fn xor_bytes_into(acc: &mut [u8], row: &[u8]) {
 }
 
 impl ZorIndex {
+    fn technical_bin_count(&self) -> usize {
+        self.technical_bins.len()
+    }
+
+    fn is_flat_technical_layout(&self) -> bool {
+        self.technical_bins.len() == self.colors.len()
+            && self
+                .technical_bins
+                .iter()
+                .enumerate()
+                .all(|(idx, bin)| bin.color_id == idx && bin.part_id == 0 && bin.part_count == 1)
+    }
+
     #[cfg(test)]
     fn query_kmer_into(&self, key: u64, scores: &mut [u64]) {
         let mut scratch = QueryScratch::default();
@@ -2823,10 +3571,102 @@ impl ZorIndex {
         scratch: &mut QueryScratch,
     ) {
         debug_assert_eq!(scores.len(), self.colors.len());
+        if !self.is_flat_technical_layout() {
+            match self.fingerprint_bits {
+                8 => self.query_kmer_into_mapped_8(key, scores, scratch),
+                16 => self.query_kmer_into_mapped_16(key, scores, scratch),
+                _ => unreachable!("invalid fingerprint width in loaded index"),
+            }
+            return;
+        }
         match self.fingerprint_bits {
             8 => self.query_kmer_into_8(key, scores, scratch),
             16 => self.query_kmer_into_16(key, scores, scratch),
             _ => unreachable!("invalid fingerprint width in loaded index"),
+        }
+    }
+
+    fn query_kmer_into_mapped_8(&self, key: u64, scores: &mut [u64], scratch: &mut QueryScratch) {
+        let mut slots = [0usize; MAX_HASHES];
+        fill_positions(
+            key,
+            self.layout,
+            self.hashes,
+            self.seed,
+            &mut slots[..self.hashes],
+        );
+        let target = fingerprint8(key, self.seed);
+        let row_bytes = self.technical_bin_count();
+        scratch.ensure(row_bytes);
+        scratch.acc.fill(0);
+        if let Some(interlaced) = self.stack.as_plain() {
+            for &slot in &slots[..self.hashes] {
+                let start = slot * row_bytes;
+                xor_bytes_into(&mut scratch.acc, &interlaced[start..start + row_bytes]);
+            }
+        } else {
+            for &slot in &slots[..self.hashes] {
+                self.stack
+                    .xor_row_into(slot, &mut scratch.acc, &mut scratch.row_codec)
+                    .expect("failed to decode compressed stack slice");
+            }
+        }
+        self.score_mapped_row_8(target, scores, scratch);
+    }
+
+    fn query_kmer_into_mapped_16(&self, key: u64, scores: &mut [u64], scratch: &mut QueryScratch) {
+        let mut slots = [0usize; MAX_HASHES];
+        fill_positions(
+            key,
+            self.layout,
+            self.hashes,
+            self.seed,
+            &mut slots[..self.hashes],
+        );
+        let target = fingerprint16(key, self.seed);
+        let row_bytes = self.technical_bin_count() * 2;
+        scratch.ensure(row_bytes);
+        scratch.acc.fill(0);
+        if let Some(interlaced) = self.stack.as_plain() {
+            for &slot in &slots[..self.hashes] {
+                let start = slot * row_bytes;
+                xor_bytes_into(&mut scratch.acc, &interlaced[start..start + row_bytes]);
+            }
+        } else {
+            for &slot in &slots[..self.hashes] {
+                self.stack
+                    .xor_row_into(slot, &mut scratch.acc, &mut scratch.row_codec)
+                    .expect("failed to decode compressed stack slice");
+            }
+        }
+        self.score_mapped_row_16(target, scores, scratch);
+    }
+
+    fn score_mapped_row_8(&self, target: u8, scores: &mut [u64], scratch: &mut QueryScratch) {
+        let epoch = scratch.next_epoch(self.colors.len());
+        for (technical_id, &value) in scratch.acc.iter().enumerate() {
+            if value != target {
+                continue;
+            }
+            let color_id = self.technical_bins[technical_id].color_id;
+            if scratch.seen_users[color_id] != epoch {
+                scratch.seen_users[color_id] = epoch;
+                scores[color_id] += 1;
+            }
+        }
+    }
+
+    fn score_mapped_row_16(&self, target: u16, scores: &mut [u64], scratch: &mut QueryScratch) {
+        let epoch = scratch.next_epoch(self.colors.len());
+        for technical_id in 0..self.technical_bin_count() {
+            if read_u16_le(&scratch.acc, technical_id * 2) != target {
+                continue;
+            }
+            let color_id = self.technical_bins[technical_id].color_id;
+            if scratch.seen_users[color_id] != epoch {
+                scratch.seen_users[color_id] = epoch;
+                scores[color_id] += 1;
+            }
         }
     }
 
@@ -3232,6 +4072,15 @@ impl ZorIndex {
             write_u64(&mut writer, color.unique_kmers)?;
             write_u64(&mut writer, color.abandoned)?;
         }
+        write_u8(&mut writer, self.technical_layout.as_u8())?;
+        write_u64(&mut writer, self.split_target_features)?;
+        write_u64(&mut writer, self.technical_bins.len() as u64)?;
+        for bin in &self.technical_bins {
+            write_u64(&mut writer, bin.color_id as u64)?;
+            write_u64(&mut writer, bin.part_id as u64)?;
+            write_u64(&mut writer, bin.part_count as u64)?;
+            write_u64(&mut writer, bin.unique_kmers)?;
+        }
         write_stack(&mut writer, &self.stack)?;
         if let Some(union) = &self.union_graph {
             write_layout(&mut writer, union.layout)?;
@@ -3299,7 +4148,52 @@ impl ZorIndex {
                 abandoned: read_u64(&mut reader)?,
             });
         }
-        let stack = read_stack(&mut reader, version, layout, color_count, fingerprint_bytes)?;
+        let (technical_layout, split_target_features, technical_bins) = if version >= 7 {
+            let technical_layout = TechnicalLayoutMode::from_u8(read_u8(&mut reader)?)?;
+            let split_target_features = read_u64(&mut reader)?;
+            let technical_count = read_u64(&mut reader)? as usize;
+            ensure!(technical_count > 0, "corrupt index: no technical bins");
+            let mut technical_bins = Vec::with_capacity(technical_count);
+            for _ in 0..technical_count {
+                let color_id = read_u64(&mut reader)? as usize;
+                let part_id = read_u64(&mut reader)? as usize;
+                let part_count = read_u64(&mut reader)? as usize;
+                let unique_kmers = read_u64(&mut reader)?;
+                ensure!(
+                    color_id < color_count,
+                    "corrupt index: technical bin color id out of bounds"
+                );
+                ensure!(part_count > 0, "corrupt index: zero split part count");
+                ensure!(
+                    part_id < part_count,
+                    "corrupt index: split part id out of bounds"
+                );
+                technical_bins.push(TechnicalBinMeta {
+                    color_id,
+                    part_id,
+                    part_count,
+                    unique_kmers,
+                });
+            }
+            (technical_layout, split_target_features, technical_bins)
+        } else {
+            (
+                TechnicalLayoutMode::Flat,
+                colors
+                    .iter()
+                    .map(|color| color.unique_kmers)
+                    .max()
+                    .unwrap_or(0),
+                flat_technical_bins(&colors),
+            )
+        };
+        let stack = read_stack(
+            &mut reader,
+            version,
+            layout,
+            technical_bins.len(),
+            fingerprint_bytes,
+        )?;
 
         let union_graph = if flags & FLAG_UNION_GRAPH != 0 {
             let union_layout = read_layout(&mut reader)?;
@@ -3330,7 +4224,10 @@ impl ZorIndex {
             seed,
             feature_config,
             layout,
+            technical_layout,
+            split_target_features,
             colors,
+            technical_bins,
             stack,
             union_graph,
         })
@@ -3645,12 +4542,116 @@ mod tests {
     use super::*;
     use zorindex::{scan_canonical_kmers, ZSTD_FRAME_MAGIC};
 
+    #[test]
+    fn compact_graph_preserves_lazy_heap_decisions() {
+        for n in [0usize, 17, 129, 513] {
+            let keys: Vec<_> = (0..n).map(|i| splitmix64(i as u64)).collect();
+            for hashes in [2, 3, 4, 8] {
+                for heuristic in [
+                    CycleBreakHeuristic::NoHeuristic,
+                    CycleBreakHeuristic::Lightest,
+                    CycleBreakHeuristic::Heaviest,
+                    CycleBreakHeuristic::MostDeg2,
+                    CycleBreakHeuristic::MinMaxDegree,
+                ] {
+                    for tie_scan in [1, 4, 8] {
+                        let config = PureZorConfig {
+                            layout: calculate_layout(n.max(16).next_power_of_two(), hashes, None)
+                                .unwrap(),
+                            hashes,
+                            seed: 69,
+                            fingerprint_bits: 16,
+                            cycle_break: heuristic,
+                            tie_scan,
+                        };
+                        let old = peel_zor_graph_impl::<usize, BinaryHeap<(Reverse<u32>, usize)>>(
+                            &keys, config,
+                        )
+                        .unwrap();
+                        let new =
+                            peel_zor_graph_impl::<u32, IndexedDegreeHeap>(&keys, config).unwrap();
+                        assert_eq!(
+                            old.positions,
+                            new.positions
+                                .iter()
+                                .map(|&i| i as usize)
+                                .collect::<Vec<_>>()
+                        );
+                        assert_eq!(
+                            old.order,
+                            new.order
+                                .iter()
+                                .map(|&(a, b)| (a as usize, b as usize))
+                                .collect::<Vec<_>>()
+                        );
+                        assert_eq!(
+                            old.dropped,
+                            new.dropped.iter().map(|&i| i as usize).collect::<Vec<_>>()
+                        );
+                        for bits in [8, 16] {
+                            assert_eq!(
+                                assign_cells(
+                                    &keys,
+                                    &old.positions,
+                                    &old.order,
+                                    config.layout,
+                                    hashes,
+                                    config.seed,
+                                    bits
+                                )
+                                .unwrap(),
+                                assign_cells(
+                                    &keys,
+                                    &new.positions,
+                                    &new.order,
+                                    config.layout,
+                                    hashes,
+                                    config.seed,
+                                    bits
+                                )
+                                .unwrap()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(!compact_graph_eligible(u32::MAX as usize, 16, 4));
+        assert!(!compact_graph_eligible(16, u32::MAX as usize + 1, 4));
+    }
+
     fn temp_index_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "zorindex_{name}_{}_{}.zoridx",
             std::process::id(),
             splitmix64(name.len() as u64)
         ))
+    }
+
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "zorindex_{name}_{}_{}",
+            std::process::id(),
+            splitmix64(name.len() as u64)
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn write_fasta(path: &Path, name: &str, seq: &str) {
+        std::fs::write(path, format!(">{name}\n{seq}\n")).unwrap();
+    }
+
+    fn write_fof(path: &Path, entries: &[(&str, &Path)]) {
+        let mut text = String::new();
+        for (name, fasta) in entries {
+            text.push_str(name);
+            text.push('\t');
+            text.push_str(&fasta.display().to_string());
+            text.push('\n');
+        }
+        std::fs::write(path, text).unwrap();
     }
 
     #[test]
@@ -3782,6 +4783,23 @@ mod tests {
             interlaced[slot * 2] = b0.cells[slot];
             interlaced[slot * 2 + 1] = b1.cells[slot];
         }
+        let colors = vec![
+            ColorMeta {
+                name: "a".into(),
+                path: "a.fa".into(),
+                occurrences: 0,
+                unique_kmers: c0.len() as u64,
+                abandoned: b0.abandoned,
+            },
+            ColorMeta {
+                name: "b".into(),
+                path: "b.fa".into(),
+                occurrences: 0,
+                unique_kmers: c1.len() as u64,
+                abandoned: b1.abandoned,
+            },
+        ];
+        let technical_bins = flat_technical_bins(&colors);
         let index = ZorIndex {
             k: 3,
             hashes: 3,
@@ -3789,28 +4807,166 @@ mod tests {
             seed: 9,
             feature_config: FeatureConfig::legacy_kmers(),
             layout,
-            colors: vec![
-                ColorMeta {
-                    name: "a".into(),
-                    path: "a.fa".into(),
-                    occurrences: 0,
-                    unique_kmers: c0.len() as u64,
-                    abandoned: b0.abandoned,
-                },
-                ColorMeta {
-                    name: "b".into(),
-                    path: "b.fa".into(),
-                    occurrences: 0,
-                    unique_kmers: c1.len() as u64,
-                    abandoned: b1.abandoned,
-                },
-            ],
+            technical_layout: TechnicalLayoutMode::Flat,
+            split_target_features: 0,
+            colors,
+            technical_bins,
             stack: StackStorage::Plain(interlaced),
             union_graph: None,
         };
         let mut scores = [0, 0];
         index.query_kmer_into(4, &mut scores);
         assert_eq!(scores, [1, 1]);
+    }
+
+    #[test]
+    fn split_technical_bins_count_once_per_user_color() {
+        let layout = calculate_layout(32, 3, None).unwrap();
+        let seed = 91;
+        let key = (1..1000)
+            .find(|&candidate| fingerprint8(candidate, seed) != 0)
+            .unwrap();
+        let target = fingerprint8(key, seed);
+        let mut slots = [0usize; MAX_HASHES];
+        fill_positions(key, layout, 3, seed, &mut slots[..3]);
+        let mut interlaced = vec![0u8; layout.array_length * 2];
+        interlaced[slots[0] * 2] = target;
+        interlaced[slots[0] * 2 + 1] = target;
+        let colors = vec![ColorMeta {
+            name: "split".into(),
+            path: "split.fa".into(),
+            occurrences: 0,
+            unique_kmers: 2,
+            abandoned: 0,
+        }];
+        let technical_bins = vec![
+            TechnicalBinMeta {
+                color_id: 0,
+                part_id: 0,
+                part_count: 2,
+                unique_kmers: 1,
+            },
+            TechnicalBinMeta {
+                color_id: 0,
+                part_id: 1,
+                part_count: 2,
+                unique_kmers: 1,
+            },
+        ];
+        let index = ZorIndex {
+            k: 5,
+            hashes: 3,
+            fingerprint_bits: 8,
+            seed,
+            feature_config: FeatureConfig::legacy_kmers(),
+            layout,
+            technical_layout: TechnicalLayoutMode::SplitLarge,
+            split_target_features: 1,
+            colors,
+            technical_bins,
+            stack: StackStorage::Plain(interlaced),
+            union_graph: None,
+        };
+        let mut scores = [0u64];
+        index.query_kmer_into(key, &mut scores);
+        assert_eq!(scores, [1]);
+    }
+
+    #[test]
+    fn split_build_carries_abandoned_keys_to_next_part() {
+        let layout = calculate_layout(32, 3, None).unwrap();
+        let config = PureZorConfig {
+            layout,
+            hashes: 3,
+            seed: 123,
+            fingerprint_bits: 16,
+            cycle_break: CycleBreakHeuristic::NoHeuristic,
+            tie_scan: 1,
+        };
+        let mut first = (0..200).map(splitmix64).collect::<Vec<_>>();
+        let mut second = (200..240).map(splitmix64).collect::<Vec<_>>();
+        first.sort_unstable();
+        first.dedup();
+        second.sort_unstable();
+        second.dedup();
+
+        let first_build = build_pure_zor(&first, config).unwrap();
+        assert!(!first_build.abandoned_keys.is_empty());
+
+        let mut expected_second_input = second.clone();
+        expected_second_input.extend_from_slice(&first_build.abandoned_keys);
+        expected_second_input.sort_unstable();
+        expected_second_input.dedup();
+
+        let (parts, final_abandoned) =
+            build_zor_part_sequence(vec![first, second], 0, config).unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].abandoned, first_build.abandoned);
+        assert_eq!(parts[1].unique_kmers, expected_second_input.len());
+        assert_eq!(final_abandoned, parts[1].abandoned);
+    }
+
+    #[test]
+    fn append_splits_large_color_in_split_large_index() {
+        let dir = temp_test_dir("append_split_zor");
+        let a = dir.join("a.fa");
+        let b = dir.join("b.fa");
+        let build_fof = dir.join("build.fof");
+        let append_fof = dir.join("append.fof");
+        let index_path = dir.join("base.zoridx");
+        let appended_path = dir.join("appended.zoridx");
+        write_fasta(&a, "a", "ACGTACGTACGTACGT");
+        write_fasta(&b, "b", "AAAACCCCCGGGGGTTTTTACGTACGT");
+        write_fof(&build_fof, &[("a", &a)]);
+        write_fof(&append_fof, &[("b", &b)]);
+
+        build_command(BuildArgs {
+            merge: zorindex::power_merge::MergeArgs::default(),
+            fof: build_fof,
+            k: 5,
+            output: index_path.clone(),
+            hashes: 3,
+            fingerprint_bits: 8,
+            seed: 99,
+            index_mode: IndexMode::Kmers,
+            findere_z: zorindex::findere::DEFAULT_Z,
+            minimizer_size: DEFAULT_MINIMIZER_SIZE,
+            modimizer_sampling: DEFAULT_MODIMIZER_SAMPLING,
+            slot_scale: 4.0,
+            slot_count: None,
+            segment_length: None,
+            cycle_break: CycleBreakHeuristic::MostDeg2,
+            tie_scan: 1,
+            union_graph: false,
+            stack_compression: StackCompression::None,
+            stack_block_rows: DEFAULT_STACK_BLOCK_ROWS,
+            technical_layout: TechnicalLayoutMode::SplitLarge,
+            target_technical_features: Some(2),
+            max_split_parts: 64,
+            build_jobs: Some(1),
+        })
+        .unwrap();
+        append_command(AppendArgs {
+            index: index_path,
+            fof: append_fof,
+            output: Some(appended_path.clone()),
+            cycle_break: CycleBreakHeuristic::MostDeg2,
+            tie_scan: 1,
+            stack_compression: Some(StackCompression::None),
+            stack_block_rows: None,
+        })
+        .unwrap();
+
+        let loaded = ZorIndex::load(&appended_path).unwrap();
+        assert_eq!(loaded.colors.len(), 2);
+        assert_eq!(loaded.technical_layout, TechnicalLayoutMode::SplitLarge);
+        let appended_bins = loaded
+            .technical_bins
+            .iter()
+            .filter(|bin| bin.color_id == 1)
+            .count();
+        assert!(appended_bins > 1);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -3832,7 +4988,8 @@ mod tests {
                 unique_kmers: 0,
                 abandoned: 0,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let technical_bins = flat_technical_bins(&colors);
         let index = ZorIndex {
             k: 7,
             hashes,
@@ -3840,7 +4997,10 @@ mod tests {
             seed: 99,
             feature_config: FeatureConfig::legacy_kmers(),
             layout,
+            technical_layout: TechnicalLayoutMode::Flat,
+            split_target_features: 0,
             colors,
+            technical_bins,
             stack: StackStorage::Plain(interlaced),
             union_graph: None,
         };
@@ -3877,7 +5037,8 @@ mod tests {
                 unique_kmers: 0,
                 abandoned: 0,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let technical_bins = flat_technical_bins(&colors);
         let index = ZorIndex {
             k: 7,
             hashes,
@@ -3885,7 +5046,10 @@ mod tests {
             seed: 99,
             feature_config: FeatureConfig::legacy_kmers(),
             layout,
+            technical_layout: TechnicalLayoutMode::Flat,
+            split_target_features: 0,
             colors,
+            technical_bins,
             stack: StackStorage::Plain(interlaced),
             union_graph: None,
         };
@@ -3919,6 +5083,7 @@ mod tests {
                 abandoned: 0,
             })
             .collect::<Vec<_>>();
+        let technical_bins = flat_technical_bins(&colors);
 
         for codec in [
             StackCompression::Svb32Sparse,
@@ -3936,7 +5101,10 @@ mod tests {
                 seed: 99,
                 feature_config: FeatureConfig::legacy_kmers(),
                 layout,
+                technical_layout: TechnicalLayoutMode::Flat,
+                split_target_features: 0,
                 colors: colors.clone(),
+                technical_bins: technical_bins.clone(),
                 stack: StackStorage::from_plain(
                     interlaced.clone(),
                     codec,
@@ -3982,6 +5150,7 @@ mod tests {
                 abandoned: 0,
             })
             .collect::<Vec<_>>();
+        let technical_bins = flat_technical_bins(&colors);
 
         for codec in [
             StackCompression::Svb32Sparse,
@@ -3999,7 +5168,10 @@ mod tests {
                 seed: 99,
                 feature_config: FeatureConfig::legacy_kmers(),
                 layout,
+                technical_layout: TechnicalLayoutMode::Flat,
+                split_target_features: 0,
                 colors: colors.clone(),
+                technical_bins: technical_bins.clone(),
                 stack: StackStorage::from_plain(
                     interlaced.clone(),
                     codec,
@@ -4042,6 +5214,7 @@ mod tests {
             },
         ];
         let stack = StackStorage::Plain(vec![0x5au8; layout.array_length * colors.len()]);
+        let technical_bins = flat_technical_bins(&colors);
         let index = ZorIndex {
             k: 5,
             hashes: 3,
@@ -4049,7 +5222,10 @@ mod tests {
             seed: 99,
             feature_config: FeatureConfig::legacy_kmers(),
             layout,
+            technical_layout: TechnicalLayoutMode::Flat,
+            split_target_features: 0,
             colors,
+            technical_bins,
             stack,
             union_graph: None,
         };

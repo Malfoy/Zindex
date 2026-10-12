@@ -14,8 +14,9 @@ use zorindex::{
 };
 
 const MAGIC: &[u8; 8] = b"BLMIDX1\0";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 const DEFAULT_FALSE_POSITIVE_RATE: f64 = 1.0 / 256.0;
+const SPLIT_SEED_XOR: u64 = 0xA54D_BA5E_1F2C_8D93;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -93,6 +94,22 @@ struct BuildArgs {
     /// Override the common Bloom bit count for every color.
     #[arg(long)]
     bit_count: Option<usize>,
+
+    /// Internal color layout: flat keeps one technical bin per dataset, split-large partitions outliers.
+    #[arg(long, value_enum, default_value = "flat")]
+    technical_layout: TechnicalLayoutMode,
+
+    /// Explicit maximum number of unique features per technical bin in split-large mode.
+    #[arg(long)]
+    target_technical_features: Option<usize>,
+
+    /// Maximum number of technical bins created for one dataset in split-large mode.
+    #[arg(long, default_value_t = 64)]
+    max_split_parts: usize,
+
+    /// Maximum number of datasets parsed/built concurrently. Defaults to all Rayon workers.
+    #[arg(long)]
+    build_jobs: Option<usize>,
 }
 
 #[derive(Args, Debug)]
@@ -141,6 +158,46 @@ struct ColorMeta {
 }
 
 #[derive(Clone, Debug)]
+struct TechnicalBinMeta {
+    color_id: usize,
+    part_id: usize,
+    part_count: usize,
+    unique_kmers: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ColorSummary {
+    input: ColorInput,
+    occurrences: u64,
+    unique_kmers: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ColorBuildPlan {
+    input: ColorInput,
+    color_id: usize,
+    occurrences: u64,
+    unique_kmers: usize,
+    first_technical_bin: usize,
+    part_count: usize,
+}
+
+#[derive(Clone, Debug)]
+struct TechnicalLayoutPlan {
+    mode: TechnicalLayoutMode,
+    target_features: usize,
+    max_part_features: usize,
+    max_part_count: usize,
+    part_counts: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AppendBloomSpec {
+    first_technical_bin: usize,
+    part_count: usize,
+}
+
+#[derive(Clone, Debug)]
 struct ParsedColor {
     input: ColorInput,
     kmers: Vec<u64>,
@@ -155,8 +212,44 @@ struct BloomIndex {
     target_fp_rate: f64,
     feature_config: FeatureConfig,
     bit_count: usize,
+    technical_layout: TechnicalLayoutMode,
+    split_target_features: u64,
     colors: Vec<ColorMeta>,
+    technical_bins: Vec<TechnicalBinMeta>,
     bitstack: Vec<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum TechnicalLayoutMode {
+    /// One internal technical bin per output color.
+    Flat,
+    /// Split large output colors across several internal technical bins.
+    #[value(name = "split-large")]
+    SplitLarge,
+}
+
+impl TechnicalLayoutMode {
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Flat => 0,
+            Self::SplitLarge => 1,
+        }
+    }
+
+    fn from_u8(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Flat),
+            1 => Ok(Self::SplitLarge),
+            _ => anyhow::bail!("unsupported technical layout mode {}", value),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Flat => "flat",
+            Self::SplitLarge => "split-large",
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -185,6 +278,7 @@ fn main() -> Result<()> {
 fn build_command(args: BuildArgs) -> Result<()> {
     validate_build_args(&args)?;
     let start = Instant::now();
+    let build_jobs = bounded_build_jobs(args.build_jobs)?;
     let feature_config = FeatureConfig::new(
         args.index_mode,
         args.minimizer_size,
@@ -199,68 +293,98 @@ fn build_command(args: BuildArgs) -> Result<()> {
     );
 
     eprintln!(
-        "parsing {} color files with k={} and index_mode={}",
+        "counting {} color files with k={} and index_mode={} using build_jobs={}",
         inputs.len(),
         args.k,
-        feature_config.mode.label()
+        feature_config.mode.label(),
+        build_jobs
     );
-    let mut parsed = inputs
-        .par_iter()
-        .map(|input| parse_color(input, args.k, args.seed, feature_config))
-        .collect::<Result<Vec<_>>>()?;
-    parsed.sort_by(|left, right| left.input.name.cmp(&right.input.name));
+    let mut summaries = summarize_inputs(&inputs, args.k, args.seed, feature_config, build_jobs)?;
+    summaries.sort_by(|left, right| left.input.name.cmp(&right.input.name));
 
-    let max_unique = parsed
-        .iter()
-        .map(|color| color.kmers.len())
-        .max()
-        .unwrap_or(0);
+    let technical_plan = choose_bloom_technical_layout(&summaries, &args)?;
+    let corrected_fp_rate =
+        split_corrected_fp_rate(args.false_positive_rate, technical_plan.max_part_count);
     let bit_count = choose_bit_count(
-        max_unique,
+        technical_plan.max_part_features,
         args.hashes,
-        args.false_positive_rate,
+        corrected_fp_rate,
         args.bits_per_item,
         args.bit_count,
     )?;
-    let color_words = color_words(parsed.len());
+    let (color_plans, mut colors, mut technical_bins) =
+        make_color_build_plan(&summaries, &technical_plan);
+    let technical_bin_count = technical_bins.len();
+    let color_words = color_words(technical_bin_count);
     let stack_words = bit_count
         .checked_mul(color_words)
         .context("Bloom stack size overflow")?;
 
     eprintln!(
-        "building {} Bloom color layers: bit_count={}, color_words={}, hashes={}, target_fp_rate={:.8}, stack_bytes={}",
-        parsed.len(),
+        "building {} Bloom technical bins from {} colors: technical_layout={}, target_features={}, max_part_features={}, max_part_count={}, bit_count={}, color_words={}, hashes={}, target_fp_rate={:.8}, corrected_part_fp_rate={:.8}, stack_bytes={}",
+        technical_bin_count,
+        colors.len(),
+        technical_plan.mode.label(),
+        technical_plan.target_features,
+        technical_plan.max_part_features,
+        technical_plan.max_part_count,
         bit_count,
         color_words,
         args.hashes,
         args.false_positive_rate,
+        corrected_fp_rate,
         stack_words * 8
     );
     let stack = make_atomic_stack(stack_words);
-    parsed.par_iter().enumerate().for_each(|(color_id, color)| {
-        set_color_bits(
-            &stack,
-            bit_count,
-            color_words,
-            color_id,
-            args.hashes,
-            args.seed,
-            &color.kmers,
-        );
-    });
+    for chunk in color_plans.chunks(build_jobs) {
+        let results = chunk
+            .par_iter()
+            .map(|plan| {
+                let parsed = parse_color(&plan.input, args.k, args.seed, feature_config)?;
+                ensure!(
+                    parsed.kmers.len() == plan.unique_kmers,
+                    "{} changed while building: counted {} unique features but parsed {}",
+                    plan.input.name,
+                    plan.unique_kmers,
+                    parsed.kmers.len()
+                );
+                ensure!(
+                    parsed.occurrences == plan.occurrences,
+                    "{} changed while building: counted {} features but parsed {}",
+                    plan.input.name,
+                    plan.occurrences,
+                    parsed.occurrences
+                );
+                let partitions =
+                    partition_keys(&parsed.kmers, plan.part_count, args.seed ^ SPLIT_SEED_XOR);
+                for (part_id, keys) in partitions.iter().enumerate() {
+                    set_color_bits(
+                        &stack,
+                        bit_count,
+                        color_words,
+                        plan.first_technical_bin + part_id,
+                        args.hashes,
+                        args.seed,
+                        keys,
+                    );
+                }
+                Ok((plan.color_id, parsed.occurrences, partitions))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (color_id, occurrences, partitions) in results {
+            let mut unique = 0u64;
+            for (part_id, keys) in partitions.iter().enumerate() {
+                let technical_id = color_plans[color_id].first_technical_bin + part_id;
+                technical_bins[technical_id].unique_kmers = keys.len() as u64;
+                unique += keys.len() as u64;
+            }
+            colors[color_id].occurrences = occurrences;
+            colors[color_id].unique_kmers = unique;
+        }
+    }
     let bitstack = stack
         .into_iter()
         .map(AtomicU64::into_inner)
-        .collect::<Vec<_>>();
-
-    let colors = parsed
-        .iter()
-        .map(|color| ColorMeta {
-            name: color.input.name.clone(),
-            path: color.input.path.display().to_string(),
-            occurrences: color.occurrences,
-            unique_kmers: color.kmers.len() as u64,
-        })
         .collect::<Vec<_>>();
     let total_occurrences = colors.iter().map(|c| c.occurrences).sum::<u64>();
     let total_unique_by_color = colors.iter().map(|c| c.unique_kmers).sum::<u64>();
@@ -272,7 +396,10 @@ fn build_command(args: BuildArgs) -> Result<()> {
         target_fp_rate: args.false_positive_rate,
         feature_config,
         bit_count,
+        technical_layout: technical_plan.mode,
+        split_target_features: technical_plan.target_features as u64,
         colors,
+        technical_bins,
         bitstack,
     };
     index
@@ -280,10 +407,11 @@ fn build_command(args: BuildArgs) -> Result<()> {
         .with_context(|| format!("writing {}", args.output.display()))?;
 
     eprintln!(
-        "built {} in {:.3}s: colors={}, occurrences={}, unique_by_color={}, bit_count={}, stack_bytes={}",
+        "built {} in {:.3}s: colors={}, technical_bins={}, occurrences={}, unique_by_color={}, bit_count={}, stack_bytes={}",
         args.output.display(),
         start.elapsed().as_secs_f64(),
         index.colors.len(),
+        index.technical_bins.len(),
         total_occurrences,
         total_unique_by_color,
         bit_count,
@@ -330,11 +458,32 @@ fn append_command(args: AppendArgs) -> Result<()> {
     drop(names);
 
     let old_color_count = index.colors.len();
-    let new_color_count = old_color_count
-        .checked_add(parsed.len())
-        .context("color count overflow")?;
-    let old_color_words = color_words(old_color_count);
-    let new_color_words = color_words(new_color_count);
+    let old_technical_bin_count = index.technical_bins.len();
+    let append_specs = parsed
+        .iter()
+        .scan(old_technical_bin_count, |next_technical_bin, color| {
+            let part_count = appended_part_count(
+                index.technical_layout,
+                index.split_target_features,
+                color.kmers.len(),
+            );
+            let spec = AppendBloomSpec {
+                first_technical_bin: *next_technical_bin,
+                part_count,
+            };
+            *next_technical_bin += part_count;
+            Some(spec)
+        })
+        .collect::<Vec<_>>();
+    let appended_technical_bins = append_specs
+        .iter()
+        .map(|spec| spec.part_count)
+        .sum::<usize>();
+    let new_technical_bin_count = old_technical_bin_count
+        .checked_add(appended_technical_bins)
+        .context("technical bin count overflow")?;
+    let old_color_words = color_words(old_technical_bin_count);
+    let new_color_words = color_words(new_technical_bin_count);
     let mut new_stack = if new_color_words == old_color_words {
         index.bitstack
     } else {
@@ -362,34 +511,68 @@ fn append_command(args: AppendArgs) -> Result<()> {
         .drain(..)
         .map(AtomicU64::new)
         .collect::<Vec<AtomicU64>>();
-    parsed.par_iter().enumerate().for_each(|(offset, color)| {
-        set_color_bits(
-            &stack,
-            index.bit_count,
-            new_color_words,
-            old_color_count + offset,
-            index.hashes,
-            index.seed,
-            &color.kmers,
-        );
-    });
+    let append_sizes = parsed
+        .par_iter()
+        .zip(append_specs.par_iter())
+        .map(|(color, spec)| {
+            let partitions =
+                partition_keys(&color.kmers, spec.part_count, index.seed ^ SPLIT_SEED_XOR);
+            for (part_id, keys) in partitions.iter().enumerate() {
+                set_color_bits(
+                    &stack,
+                    index.bit_count,
+                    new_color_words,
+                    spec.first_technical_bin + part_id,
+                    index.hashes,
+                    index.seed,
+                    keys,
+                );
+            }
+            partitions
+                .iter()
+                .map(|keys| keys.len() as u64)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     index.bitstack = stack
         .into_iter()
         .map(AtomicU64::into_inner)
         .collect::<Vec<_>>();
-    index.colors.extend(parsed.iter().map(|color| ColorMeta {
-        name: color.input.name.clone(),
-        path: color.input.path.display().to_string(),
-        occurrences: color.occurrences,
-        unique_kmers: color.kmers.len() as u64,
-    }));
+    for (offset, color) in parsed.iter().enumerate() {
+        let color_id = old_color_count + offset;
+        let part_sizes = &append_sizes[offset];
+        let unique_kmers = part_sizes.iter().sum::<u64>();
+        index.colors.push(ColorMeta {
+            name: color.input.name.clone(),
+            path: color.input.path.display().to_string(),
+            occurrences: color.occurrences,
+            unique_kmers,
+        });
+        let part_count = part_sizes.len().max(1);
+        for (part_id, &unique_kmers) in part_sizes.iter().enumerate() {
+            index.technical_bins.push(TechnicalBinMeta {
+                color_id,
+                part_id,
+                part_count,
+                unique_kmers,
+            });
+        }
+    }
+    if index.technical_layout == TechnicalLayoutMode::Flat {
+        let max_appended = parsed
+            .iter()
+            .map(|color| color.kmers.len() as u64)
+            .max()
+            .unwrap_or(0);
+        index.split_target_features = index.split_target_features.max(max_appended);
+    }
 
-    for color in &parsed {
-        let estimate = estimated_fp_rate(color.kmers.len() as u64, index.bit_count, index.hashes);
+    for color_id in old_color_count..index.colors.len() {
+        let estimate = index.estimated_user_fp_rate(color_id);
         if estimate > index.target_fp_rate * 1.25 {
             eprintln!(
                 "warning: appended color {} has estimated_fp_rate={:.8}, above stored target {:.8}",
-                color.input.name, estimate, index.target_fp_rate
+                index.colors[color_id].name, estimate, index.target_fp_rate
             );
         }
     }
@@ -401,8 +584,9 @@ fn append_command(args: AppendArgs) -> Result<()> {
 
     let appended_unique = parsed.iter().map(|c| c.kmers.len() as u64).sum::<u64>();
     eprintln!(
-        "appended {} colors to {} in {:.3}s: appended_unique={}, colors={}, stack_bytes={}",
+        "appended {} colors ({} technical bins) to {} in {:.3}s: appended_unique={}, colors={}, stack_bytes={}",
         parsed.len(),
+        appended_technical_bins,
         output.display(),
         start.elapsed().as_secs_f64(),
         appended_unique,
@@ -421,6 +605,7 @@ fn query_command(args: QueryArgs) -> Result<()> {
         .with_context(|| format!("loading {}", args.index.display()))?;
     let start = Instant::now();
     let mut scores = vec![0u64; index.colors.len()];
+    let mut scratch = BloomQueryScratch::default();
     let mut total_features = 0u64;
     let feature_queries;
 
@@ -430,9 +615,9 @@ fn query_command(args: QueryArgs) -> Result<()> {
             index.k,
             index.feature_config.findere_z,
             index.colors.len(),
-            || (),
-            |_, key, hits| {
-                index.query_kmer_into(key, hits);
+            BloomQueryScratch::default,
+            |scratch, key, hits| {
+                index.query_kmer_into_with_scratch(key, hits, scratch);
                 true
             },
         )
@@ -448,7 +633,7 @@ fn query_command(args: QueryArgs) -> Result<()> {
             index.feature_config,
             |kmer| {
                 total_features += 1;
-                index.query_kmer_into(kmer, &mut scores);
+                index.query_kmer_into_with_scratch(kmer, &mut scores, &mut scratch);
             },
         )
         .with_context(|| format!("querying {}", args.query.display()))?;
@@ -465,7 +650,7 @@ fn query_command(args: QueryArgs) -> Result<()> {
         start.elapsed().as_secs_f64()
     );
     println!("color\tmatches\tratio\tunique_kmers\testimated_fp_rate");
-    for (color, &matches) in index.colors.iter().zip(scores.iter()) {
+    for (color_id, (color, &matches)) in index.colors.iter().zip(scores.iter()).enumerate() {
         let ratio = if total_features == 0 {
             0.0
         } else {
@@ -478,7 +663,7 @@ fn query_command(args: QueryArgs) -> Result<()> {
                 matches,
                 ratio,
                 color.unique_kmers,
-                estimated_fp_rate(color.unique_kmers, index.bit_count, index.hashes)
+                index.estimated_user_fp_rate(color_id)
             );
         }
     }
@@ -510,26 +695,41 @@ fn info_command(args: IndexArg) -> Result<()> {
         index.feature_config.modimizer_sampling
     );
     println!("colors\t{}", index.colors.len());
-    println!("bits_per_color\t{}", index.bit_count);
-    println!("color_words\t{}", color_words(index.colors.len()));
+    println!("technical_layout\t{}", index.technical_layout.label());
+    println!("split_target_features\t{}", index.split_target_features);
+    println!("technical_bins\t{}", index.technical_bins.len());
+    println!("bits_per_technical_bin\t{}", index.bit_count);
+    println!("color_words\t{}", color_words(index.technical_bins.len()));
     println!("stack_words\t{}", index.bitstack.len());
     println!("stack_bytes\t{}", index.bitstack.len() * 8);
     println!("unique_by_color\t{}", total_unique);
     println!("max_unique_color\t{}", max_unique);
     println!("target_fp_rate\t{:.8}", index.target_fp_rate);
-    println!(
-        "max_color_estimated_fp_rate\t{:.8}",
-        estimated_fp_rate(max_unique, index.bit_count, index.hashes)
-    );
+    let max_estimated_fp = (0..index.colors.len())
+        .map(|color_id| index.estimated_user_fp_rate(color_id))
+        .fold(0.0, f64::max);
+    println!("max_color_estimated_fp_rate\t{:.8}", max_estimated_fp);
     println!("color\tunique_kmers\toccurrences\testimated_fp_rate\tpath");
-    for color in &index.colors {
+    for (color_id, color) in index.colors.iter().enumerate() {
         println!(
             "{}\t{}\t{}\t{:.8}\t{}",
             color.name,
             color.unique_kmers,
             color.occurrences,
-            estimated_fp_rate(color.unique_kmers, index.bit_count, index.hashes),
+            index.estimated_user_fp_rate(color_id),
             color.path
+        );
+    }
+    println!("technical_bin\tcolor\tpart\tparts\tunique_kmers");
+    for (technical_id, bin) in index.technical_bins.iter().enumerate() {
+        let color_name = index
+            .colors
+            .get(bin.color_id)
+            .map(|color| color.name.as_str())
+            .unwrap_or("<invalid>");
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            technical_id, color_name, bin.part_id, bin.part_count, bin.unique_kmers
         );
     }
     Ok(())
@@ -567,6 +767,19 @@ fn validate_build_args(args: &BuildArgs) -> Result<()> {
     }
     if let Some(bit_count) = args.bit_count {
         ensure!(bit_count > 0, "--bit-count must be greater than 0");
+    }
+    ensure!(
+        args.max_split_parts > 0,
+        "--max-split-parts must be greater than 0"
+    );
+    if let Some(target) = args.target_technical_features {
+        ensure!(
+            target > 0,
+            "--target-technical-features must be greater than 0"
+        );
+    }
+    if let Some(build_jobs) = args.build_jobs {
+        ensure!(build_jobs > 0, "--build-jobs must be greater than 0");
     }
     Ok(())
 }
@@ -628,6 +841,14 @@ fn estimated_fp_rate(unique: u64, bit_count: usize, hashes: usize) -> f64 {
     }
     let exponent = -((hashes as f64) * (unique as f64)) / (bit_count as f64);
     (1.0 - exponent.exp()).powi(hashes as i32)
+}
+
+fn split_corrected_fp_rate(target_fp_rate: f64, split_parts: usize) -> f64 {
+    if split_parts <= 1 {
+        target_fp_rate
+    } else {
+        1.0 - (1.0 - target_fp_rate).powf(1.0 / split_parts as f64)
+    }
 }
 
 fn align_to_64(value: usize) -> usize {
@@ -741,14 +962,317 @@ fn parse_color(
     })
 }
 
-impl BloomIndex {
-    fn color_words(&self) -> usize {
-        color_words(self.colors.len())
+fn bounded_build_jobs(requested: Option<usize>) -> Result<usize> {
+    let jobs = requested.unwrap_or_else(|| rayon::current_num_threads().max(1));
+    ensure!(jobs > 0, "--build-jobs must be greater than 0");
+    Ok(jobs)
+}
+
+fn summarize_inputs(
+    inputs: &[ColorInput],
+    k: usize,
+    seed: u64,
+    feature_config: FeatureConfig,
+    build_jobs: usize,
+) -> Result<Vec<ColorSummary>> {
+    let mut summaries = Vec::with_capacity(inputs.len());
+    for chunk in inputs.chunks(build_jobs) {
+        let mut chunk_summaries = chunk
+            .par_iter()
+            .map(|input| summarize_color(input, k, seed, feature_config))
+            .collect::<Result<Vec<_>>>()?;
+        summaries.append(&mut chunk_summaries);
+    }
+    Ok(summaries)
+}
+
+fn summarize_color(
+    input: &ColorInput,
+    k: usize,
+    seed: u64,
+    feature_config: FeatureConfig,
+) -> Result<ColorSummary> {
+    let start = Instant::now();
+    let mut kmers = Vec::new();
+    let mut occurrences = 0u64;
+    let stats = parse_features_from_file(&input.path, k, seed, feature_config, |kmer| {
+        kmers.push(kmer);
+        occurrences += 1;
+    })?;
+    kmers.sort_unstable();
+    kmers.dedup();
+    eprintln!(
+        "counted {}\tfeatures={}\tunique={}\tbases={}\tchunks={}\telapsed_s={:.3}",
+        input.name,
+        occurrences,
+        kmers.len(),
+        stats.bases,
+        stats.chunks,
+        start.elapsed().as_secs_f64()
+    );
+    Ok(ColorSummary {
+        input: input.clone(),
+        occurrences,
+        unique_kmers: kmers.len(),
+    })
+}
+
+fn choose_bloom_technical_layout(
+    summaries: &[ColorSummary],
+    args: &BuildArgs,
+) -> Result<TechnicalLayoutPlan> {
+    let counts = summaries
+        .iter()
+        .map(|summary| summary.unique_kmers)
+        .collect::<Vec<_>>();
+    let max_unique = counts.iter().copied().max().unwrap_or(0).max(1);
+    if args.technical_layout == TechnicalLayoutMode::Flat {
+        return Ok(TechnicalLayoutPlan {
+            mode: TechnicalLayoutMode::Flat,
+            target_features: max_unique,
+            max_part_features: max_unique,
+            max_part_count: 1,
+            part_counts: vec![1; summaries.len()],
+        });
     }
 
+    let candidates = if let Some(target) = args.target_technical_features {
+        vec![target.max(1)]
+    } else {
+        technical_target_candidates(&counts)
+    };
+    let color_count = summaries.len().max(1);
+    let mut best: Option<(f64, usize, usize, usize, Vec<usize>)> = None;
+    for target in candidates {
+        let (part_counts, max_part_features) =
+            split_part_counts(&counts, target, args.max_split_parts);
+        let max_part_count = part_counts.iter().copied().max().unwrap_or(1);
+        let technical_bin_count = part_counts.iter().sum::<usize>().max(1);
+        let corrected_fp_rate = split_corrected_fp_rate(args.false_positive_rate, max_part_count);
+        let bit_count = choose_bit_count(
+            max_part_features,
+            args.hashes,
+            corrected_fp_rate,
+            args.bits_per_item,
+            args.bit_count,
+        )?;
+        let estimated_words = bit_count
+            .checked_mul(color_words(technical_bin_count))
+            .context("technical layout size overflow")?;
+        let technical_bin_penalty = technical_bin_count as f64 / color_count as f64;
+        let estimated_cost = estimated_words as f64 * technical_bin_penalty;
+        let replace = best
+            .as_ref()
+            .map(|(best_cost, _, _, _, _)| estimated_cost < *best_cost)
+            .unwrap_or(true);
+        if replace {
+            best = Some((
+                estimated_cost,
+                target,
+                max_part_features,
+                max_part_count,
+                part_counts,
+            ));
+        }
+    }
+    let Some((_, target_features, max_part_features, max_part_count, part_counts)) = best else {
+        anyhow::bail!("no technical layout candidates were generated");
+    };
+    Ok(TechnicalLayoutPlan {
+        mode: args.technical_layout,
+        target_features,
+        max_part_features,
+        max_part_count,
+        part_counts,
+    })
+}
+
+fn technical_target_candidates(counts: &[usize]) -> Vec<usize> {
+    let mut nonzero = counts
+        .iter()
+        .copied()
+        .filter(|&count| count > 0)
+        .collect::<Vec<_>>();
+    if nonzero.is_empty() {
+        return vec![1];
+    }
+    nonzero.sort_unstable();
+    let max_unique = *nonzero.last().unwrap();
+    let mut candidates = vec![
+        max_unique,
+        percentile_sorted(&nonzero, 99),
+        percentile_sorted(&nonzero, 95),
+        percentile_sorted(&nonzero, 90),
+        percentile_sorted(&nonzero, 75),
+        percentile_sorted(&nonzero, 50),
+    ];
+    candidates.retain(|&target| target > 0);
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+}
+
+fn percentile_sorted(sorted: &[usize], percentile: usize) -> usize {
+    debug_assert!(!sorted.is_empty());
+    let index = ((sorted.len() - 1) * percentile).div_ceil(100);
+    sorted[index.min(sorted.len() - 1)].max(1)
+}
+
+fn split_part_counts(
+    counts: &[usize],
+    target_features: usize,
+    max_split_parts: usize,
+) -> (Vec<usize>, usize) {
+    let target = target_features.max(1);
+    let max_parts = max_split_parts.max(1);
+    let mut max_part_features = 1usize;
+    let part_counts = counts
+        .iter()
+        .map(|&count| {
+            let parts = count.div_ceil(target).max(1).min(max_parts);
+            max_part_features = max_part_features.max(count.div_ceil(parts));
+            parts
+        })
+        .collect::<Vec<_>>();
+    (part_counts, max_part_features)
+}
+
+fn make_color_build_plan(
+    summaries: &[ColorSummary],
+    technical_plan: &TechnicalLayoutPlan,
+) -> (Vec<ColorBuildPlan>, Vec<ColorMeta>, Vec<TechnicalBinMeta>) {
+    let mut color_plans = Vec::with_capacity(summaries.len());
+    let mut colors = Vec::with_capacity(summaries.len());
+    let mut technical_bins = Vec::new();
+    for (color_id, summary) in summaries.iter().enumerate() {
+        let part_count = technical_plan.part_counts[color_id].max(1);
+        let first_technical_bin = technical_bins.len();
+        colors.push(ColorMeta {
+            name: summary.input.name.clone(),
+            path: summary.input.path.display().to_string(),
+            occurrences: summary.occurrences,
+            unique_kmers: summary.unique_kmers as u64,
+        });
+        color_plans.push(ColorBuildPlan {
+            input: summary.input.clone(),
+            color_id,
+            occurrences: summary.occurrences,
+            unique_kmers: summary.unique_kmers,
+            first_technical_bin,
+            part_count,
+        });
+        for part_id in 0..part_count {
+            technical_bins.push(TechnicalBinMeta {
+                color_id,
+                part_id,
+                part_count,
+                unique_kmers: 0,
+            });
+        }
+    }
+    (color_plans, colors, technical_bins)
+}
+
+fn flat_technical_bins(colors: &[ColorMeta]) -> Vec<TechnicalBinMeta> {
+    colors
+        .iter()
+        .enumerate()
+        .map(|(color_id, color)| TechnicalBinMeta {
+            color_id,
+            part_id: 0,
+            part_count: 1,
+            unique_kmers: color.unique_kmers,
+        })
+        .collect()
+}
+
+fn partition_keys(keys: &[u64], part_count: usize, seed: u64) -> Vec<Vec<u64>> {
+    if part_count <= 1 {
+        return vec![keys.to_vec()];
+    }
+    let mut partitions = (0..part_count).map(|_| Vec::new()).collect::<Vec<_>>();
+    for &key in keys {
+        let part = reduce_u64(mixsplit(key, seed), part_count as u64);
+        partitions[part].push(key);
+    }
+    partitions
+}
+
+fn appended_part_count(
+    technical_layout: TechnicalLayoutMode,
+    split_target_features: u64,
+    unique_kmers: usize,
+) -> usize {
+    if technical_layout == TechnicalLayoutMode::SplitLarge {
+        let target = (split_target_features as usize).max(1);
+        unique_kmers.div_ceil(target).max(1)
+    } else {
+        1
+    }
+}
+
+#[derive(Default)]
+struct BloomQueryScratch {
+    seen_users: Vec<u32>,
+    epoch: u32,
+}
+
+impl BloomQueryScratch {
+    fn next_epoch(&mut self, user_count: usize) -> u32 {
+        if self.seen_users.len() != user_count {
+            self.seen_users.resize(user_count, 0);
+            self.epoch = 0;
+        }
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.seen_users.fill(0);
+            self.epoch = 1;
+        }
+        self.epoch
+    }
+}
+
+impl BloomIndex {
+    fn technical_words(&self) -> usize {
+        color_words(self.technical_bins.len())
+    }
+
+    fn is_flat_technical_layout(&self) -> bool {
+        self.technical_bins.len() == self.colors.len()
+            && self
+                .technical_bins
+                .iter()
+                .enumerate()
+                .all(|(idx, bin)| bin.color_id == idx && bin.part_id == 0 && bin.part_count == 1)
+    }
+
+    fn estimated_user_fp_rate(&self, color_id: usize) -> f64 {
+        let mut no_fp = 1.0;
+        for bin in self
+            .technical_bins
+            .iter()
+            .filter(|bin| bin.color_id == color_id)
+        {
+            let part_fp = estimated_fp_rate(bin.unique_kmers, self.bit_count, self.hashes);
+            no_fp *= 1.0 - part_fp;
+        }
+        1.0 - no_fp
+    }
+
+    #[cfg(test)]
     fn query_kmer_into(&self, key: u64, scores: &mut [u64]) {
+        let mut scratch = BloomQueryScratch::default();
+        self.query_kmer_into_with_scratch(key, scores, &mut scratch);
+    }
+
+    fn query_kmer_into_with_scratch(
+        &self,
+        key: u64,
+        scores: &mut [u64],
+        scratch: &mut BloomQueryScratch,
+    ) {
         debug_assert_eq!(scores.len(), self.colors.len());
-        let color_words = self.color_words();
+        let color_words = self.technical_words();
         let mut positions = [0usize; MAX_HASHES];
         fill_bloom_positions(
             key,
@@ -757,6 +1281,31 @@ impl BloomIndex {
             self.seed,
             &mut positions[..self.hashes],
         );
+        if !self.is_flat_technical_layout() {
+            let epoch = scratch.next_epoch(self.colors.len());
+            for word in 0..color_words {
+                let mut mask = !0u64;
+                for &position in &positions[..self.hashes] {
+                    mask &= self.bitstack[position * color_words + word];
+                    if mask == 0 {
+                        break;
+                    }
+                }
+                while mask != 0 {
+                    let bit = mask.trailing_zeros() as usize;
+                    let technical_id = word * 64 + bit;
+                    if technical_id < self.technical_bins.len() {
+                        let color_id = self.technical_bins[technical_id].color_id;
+                        if scratch.seen_users[color_id] != epoch {
+                            scratch.seen_users[color_id] = epoch;
+                            scores[color_id] += 1;
+                        }
+                    }
+                    mask &= mask - 1;
+                }
+            }
+            return;
+        }
         for word in 0..color_words {
             let mut mask = !0u64;
             for &position in &positions[..self.hashes] {
@@ -801,6 +1350,15 @@ impl BloomIndex {
             write_u64(&mut writer, color.occurrences)?;
             write_u64(&mut writer, color.unique_kmers)?;
         }
+        write_u8(&mut writer, self.technical_layout.as_u8())?;
+        write_u64(&mut writer, self.split_target_features)?;
+        write_u64(&mut writer, self.technical_bins.len() as u64)?;
+        for bin in &self.technical_bins {
+            write_u64(&mut writer, bin.color_id as u64)?;
+            write_u64(&mut writer, bin.part_id as u64)?;
+            write_u64(&mut writer, bin.part_count as u64)?;
+            write_u64(&mut writer, bin.unique_kmers)?;
+        }
         write_u64(&mut writer, self.bitstack.len() as u64)?;
         write_u64_slice(&mut writer, &self.bitstack)?;
         finish_index_writer(writer)
@@ -813,7 +1371,7 @@ impl BloomIndex {
         ensure!(&magic == MAGIC, "not a BLOOMINDEX file");
         let version = read_u32(&mut reader)?;
         ensure!(
-            version == FORMAT_VERSION,
+            version == 1 || version == FORMAT_VERSION,
             "unsupported Bloom index version {}",
             version
         );
@@ -857,9 +1415,48 @@ impl BloomIndex {
                 unique_kmers: read_u64(&mut reader)?,
             });
         }
+        let (technical_layout, split_target_features, technical_bins) = if version >= 2 {
+            let technical_layout = TechnicalLayoutMode::from_u8(read_u8(&mut reader)?)?;
+            let split_target_features = read_u64(&mut reader)?;
+            let technical_count = read_u64(&mut reader)? as usize;
+            ensure!(technical_count > 0, "corrupt index: no technical bins");
+            let mut technical_bins = Vec::with_capacity(technical_count);
+            for _ in 0..technical_count {
+                let color_id = read_u64(&mut reader)? as usize;
+                let part_id = read_u64(&mut reader)? as usize;
+                let part_count = read_u64(&mut reader)? as usize;
+                let unique_kmers = read_u64(&mut reader)?;
+                ensure!(
+                    color_id < color_count,
+                    "corrupt index: technical bin color id out of bounds"
+                );
+                ensure!(part_count > 0, "corrupt index: zero split part count");
+                ensure!(
+                    part_id < part_count,
+                    "corrupt index: split part id out of bounds"
+                );
+                technical_bins.push(TechnicalBinMeta {
+                    color_id,
+                    part_id,
+                    part_count,
+                    unique_kmers,
+                });
+            }
+            (technical_layout, split_target_features, technical_bins)
+        } else {
+            (
+                TechnicalLayoutMode::Flat,
+                colors
+                    .iter()
+                    .map(|color| color.unique_kmers)
+                    .max()
+                    .unwrap_or(0),
+                flat_technical_bins(&colors),
+            )
+        };
         let bitstack_len = read_u64(&mut reader)? as usize;
         let expected_len = bit_count
-            .checked_mul(color_words(color_count))
+            .checked_mul(color_words(technical_bins.len()))
             .context("index dimensions overflow")?;
         ensure!(
             bitstack_len == expected_len,
@@ -876,7 +1473,10 @@ impl BloomIndex {
             target_fp_rate,
             feature_config,
             bit_count,
+            technical_layout,
+            split_target_features,
             colors,
+            technical_bins,
             bitstack,
         })
     }
@@ -999,6 +1599,32 @@ mod tests {
         ))
     }
 
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "bloomindex_{name}_{}_{}",
+            std::process::id(),
+            splitmix64(name.len() as u64)
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn write_fasta(path: &Path, name: &str, seq: &str) {
+        std::fs::write(path, format!(">{name}\n{seq}\n")).unwrap();
+    }
+
+    fn write_fof(path: &Path, entries: &[(&str, &Path)]) {
+        let mut text = String::new();
+        for (name, fasta) in entries {
+            text.push_str(name);
+            text.push('\t');
+            text.push_str(&fasta.display().to_string());
+            text.push('\n');
+        }
+        std::fs::write(path, text).unwrap();
+    }
+
     #[test]
     fn bit_count_for_one_over_256_with_four_hashes_is_reasonable() {
         let bits = bits_per_item_for_fp(1.0 / 256.0, 4);
@@ -1022,6 +1648,15 @@ mod tests {
             .into_iter()
             .map(AtomicU64::into_inner)
             .collect::<Vec<_>>();
+        let color_metas = (0..3)
+            .map(|idx| ColorMeta {
+                name: format!("c{idx}"),
+                path: String::new(),
+                occurrences: 0,
+                unique_kmers: colors[idx].len() as u64,
+            })
+            .collect::<Vec<_>>();
+        let technical_bins = flat_technical_bins(&color_metas);
         let index = BloomIndex {
             k: 3,
             hashes: 4,
@@ -1034,14 +1669,10 @@ mod tests {
                 modimizer_sampling: DEFAULT_MODIMIZER_SAMPLING,
             },
             bit_count,
-            colors: (0..3)
-                .map(|idx| ColorMeta {
-                    name: format!("c{idx}"),
-                    path: String::new(),
-                    occurrences: 0,
-                    unique_kmers: colors[idx].len() as u64,
-                })
-                .collect(),
+            technical_layout: TechnicalLayoutMode::Flat,
+            split_target_features: 0,
+            colors: color_metas,
+            technical_bins,
             bitstack,
         };
         let mut scores = vec![0u64; 3];
@@ -1049,6 +1680,107 @@ mod tests {
         assert_eq!(scores[0], 1);
         assert_eq!(scores[1], 1);
         assert_eq!(scores[2], 0);
+    }
+
+    #[test]
+    fn split_bloom_technical_bins_count_once_per_user_color() {
+        let bit_count = 4096;
+        let technical_words = color_words(2);
+        let stack = make_atomic_stack(bit_count * technical_words);
+        set_color_bits(&stack, bit_count, technical_words, 0, 4, 99, &[4]);
+        set_color_bits(&stack, bit_count, technical_words, 1, 4, 99, &[4]);
+        let bitstack = stack
+            .into_iter()
+            .map(AtomicU64::into_inner)
+            .collect::<Vec<_>>();
+        let colors = vec![ColorMeta {
+            name: "split".into(),
+            path: "split.fa".into(),
+            occurrences: 0,
+            unique_kmers: 2,
+        }];
+        let technical_bins = vec![
+            TechnicalBinMeta {
+                color_id: 0,
+                part_id: 0,
+                part_count: 2,
+                unique_kmers: 1,
+            },
+            TechnicalBinMeta {
+                color_id: 0,
+                part_id: 1,
+                part_count: 2,
+                unique_kmers: 1,
+            },
+        ];
+        let index = BloomIndex {
+            k: 3,
+            hashes: 4,
+            seed: 99,
+            target_fp_rate: DEFAULT_FALSE_POSITIVE_RATE,
+            feature_config: FeatureConfig::legacy_kmers(),
+            bit_count,
+            technical_layout: TechnicalLayoutMode::SplitLarge,
+            split_target_features: 1,
+            colors,
+            technical_bins,
+            bitstack,
+        };
+        let mut scores = vec![0u64; 1];
+        index.query_kmer_into(4, &mut scores);
+        assert_eq!(scores, [1]);
+    }
+
+    #[test]
+    fn append_splits_large_color_in_split_large_index() {
+        let dir = temp_test_dir("append_split_bloom");
+        let a = dir.join("a.fa");
+        let b = dir.join("b.fa");
+        let build_fof = dir.join("build.fof");
+        let append_fof = dir.join("append.fof");
+        let index_path = dir.join("base.blmidx");
+        let appended_path = dir.join("appended.blmidx");
+        write_fasta(&a, "a", "ACGTACGTACGTACGT");
+        write_fasta(&b, "b", "AAAACCCCCGGGGGTTTTTACGTACGT");
+        write_fof(&build_fof, &[("a", &a)]);
+        write_fof(&append_fof, &[("b", &b)]);
+
+        build_command(BuildArgs {
+            fof: build_fof,
+            k: 5,
+            output: index_path.clone(),
+            hashes: 4,
+            seed: 99,
+            index_mode: IndexMode::Kmers,
+            findere_z: zorindex::findere::DEFAULT_Z,
+            minimizer_size: DEFAULT_MINIMIZER_SIZE,
+            modimizer_sampling: DEFAULT_MODIMIZER_SAMPLING,
+            false_positive_rate: DEFAULT_FALSE_POSITIVE_RATE,
+            bits_per_item: None,
+            bit_count: Some(4096),
+            technical_layout: TechnicalLayoutMode::SplitLarge,
+            target_technical_features: Some(2),
+            max_split_parts: 64,
+            build_jobs: Some(1),
+        })
+        .unwrap();
+        append_command(AppendArgs {
+            index: index_path,
+            fof: append_fof,
+            output: Some(appended_path.clone()),
+        })
+        .unwrap();
+
+        let loaded = BloomIndex::load(&appended_path).unwrap();
+        assert_eq!(loaded.colors.len(), 2);
+        assert_eq!(loaded.technical_layout, TechnicalLayoutMode::SplitLarge);
+        let appended_bins = loaded
+            .technical_bins
+            .iter()
+            .filter(|bin| bin.color_id == 1)
+            .count();
+        assert!(appended_bins > 1);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1081,6 +1813,7 @@ mod tests {
             },
         ];
         let bitstack = vec![0x55aa_55aa_55aa_55aau64; bit_count * color_words(colors.len())];
+        let technical_bins = flat_technical_bins(&colors);
         let index = BloomIndex {
             k: 5,
             hashes: 3,
@@ -1088,7 +1821,10 @@ mod tests {
             target_fp_rate: DEFAULT_FALSE_POSITIVE_RATE,
             feature_config: FeatureConfig::legacy_kmers(),
             bit_count,
+            technical_layout: TechnicalLayoutMode::Flat,
+            split_target_features: 0,
             colors,
+            technical_bins,
             bitstack,
         };
         index.save(&path).unwrap();

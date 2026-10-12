@@ -17,6 +17,7 @@ The source tree is organized as:
 src/lib.rs              shared DNA parsing, feature extraction, hashing, FOF parsing
 src/bin/zorindex.rs     Zindex CLI and pure ZOR stack implementation
 src/bin/bloomindex.rs   Bindex CLI and interleaved Bloom stack implementation
+src/power_merge/        Zindex merge planning, colored power-of-two banks and lookup
 ```
 
 ## Requirements
@@ -39,6 +40,10 @@ target/release/bloomindex
 
 Both tools default to all available hardware threads. Override this with
 `--threads`.
+
+For copy-paste collaborator commands, see
+[docs/COLLABORATOR.txt](docs/COLLABORATOR.txt). Build on the machine where you
+will run the binaries: `.cargo/config.toml` enables `target-cpu=native`.
 
 ## Input Format
 
@@ -67,7 +72,9 @@ Supported sequence input:
 - FASTA
 - FASTQ
 - gzip-compressed FASTA/FASTQ
-- zstd-compressed FASTA/FASTQ
+- zstd-compressed FASTA/FASTQ (`.zst`, `.zstd`)
+- xz-compressed FASTA/FASTQ (`.xz`)
+- bzip2-compressed FASTA/FASTQ (`.bz2`, `.bz`, `.bzip2`)
 
 ## Feature Modes
 
@@ -217,6 +224,115 @@ color_name  hits  total_features  hit_ratio
 zorindex info --index samples.zoridx
 ```
 
+### Zindex: merge-only power-of-two banks (experimental)
+
+```bash
+zorindex build --fof samples.fof --k 31 --fingerprint-bits 16 \
+  --slot-scale 1.0 --power-of-two-merge --output samples.pow2
+zorindex info --index samples.pow2
+zorindex query --threads 4 --index samples.pow2 --query query.fa.gz
+```
+
+`--output` is a new directory. It contains `manifest.json` and one compressed
+bank file per occupied power-of-two cell count. Each bank stores all groups
+of that size in bit-packed slices, with a contiguous fingerprint plane followed
+by origin bits. Queries XOR and screen fingerprints using AVX2 where available,
+with a scalar fallback; origin bits are decoded only for matching fingerprints.
+Groups are sorted by payload width, then by
+samples of their assigned filter cells to cluster similar physical columns. Dataset
+names and query output order stay the same as in the FOF; datasets are never split.
+
+The planner sketches the actual indexed feature sets, so k-mers, minimizers,
+modimizers, and findere use the same features for planning and construction.
+Sketching follows the threshold-filtered mod-bucket method described by
+[Ragnar Groot Koerkamp's SimdSketch](https://curiouscoding.nl/posts/simd-sketch/),
+using full 64-bit minima to retain mergeability and AVX2 comparisons where
+available. Singleton cardinalities are counted exactly during feature extraction;
+group union cardinalities are estimated from sketch Jaccard values. This is an
+implementation of the method for feature IDs, not a dependency on the upstream
+sequence-sketching crate.
+
+Planning modes are selectable with `--merge-planner`:
+
+- `all-pairs`: repeatedly merge the pair with the largest predicted
+  bit saving until no profitable pair remains. Candidate comparisons and heap
+  storage can be quadratic in the number of datasets. Equal-saving ties use
+  group IDs derived from input order, so its partition can also depend on order.
+- `streaming` (default): process datasets in FOF order. Bucket current groups by
+  slot exponent and origin count. Compare an incoming sketch only with buckets
+  whose optimistic cost could save bits, excluding origin-limited buckets.
+  Merge it into the group with the largest positive saving,
+  or keep it separate. Update that group's sketch without revisiting old pairs.
+  Pruning preserves the original streaming decisions and tie-breaking exactly;
+  groups skipped for a small arrival remain eligible for larger future arrivals.
+  There is no fixed size cap or merge reversion. Only current sketches are retained.
+  Comparisons can still be quadratic in the worst case. Results depend on input order.
+- `streaming-unpruned`: retain the original streaming scan over every current
+  group, as a comparison baseline. It produces the same partition as `streaming`.
+
+All modes use the same cost, including power-of-two rounding and payload width:
+the fingerprint alone for a singleton, or fingerprint plus one membership bit
+per dataset for a merged group. The fingerprint width is never reduced. These are
+greedy optimizers, not globally optimal partition searches. Streaming is planning
+only: all filters are constructed once after the batch's final plan is known.
+
+Use `--merge-planner all-pairs` to opt into the all-pairs planner.
+All modes default to `--merge-column-order compression`: within each bank's
+equal-width sections, lexicographically sort samples from eight short windows
+of the actual completed filter cells. This bounded-memory heuristic puts identical
+sampled columns together without an all-pairs ordering search. It does not guarantee
+smaller files on every collection. `--merge-column-order width` retains the previous
+width/input-ID order for comparisons. Physical ordering never changes merges,
+origin bit assignments, dataset identities, or query output order; offsets and member
+IDs are stored in the manifest. Old manifests retain their legacy defaults.
+
+Construction reuses the existing ZOR peel and cycle-breaking implementation.
+Every retained equation's complete fingerprint/membership payload is verified.
+By default, abandoned features are recovered through **one global multimap** shared
+by all banks: a 32-bit hash of each abandoned feature maps to its originating
+datasets (packed 32-bit IDs). Its open-addressed directory is queried once per
+feature, not once per group. Hash collisions union the originating dataset lists;
+there is no full-key collision check. Recovery adds to the filter's hits and never
+overwrites them; each dataset is counted once per queried feature.
+`build --power-of-two-merge --drop-abandoned` omits both recovery storage and lookup,
+accepting missing abandoned features. `query --ignore-abandoned` skips loading and
+querying the map of an existing merged index. Recovery is enabled by default.
+Version-1 and version-2 merged indexes remain readable. Version-1 fallback records are
+converted into the global 32-bit-hash map on load, without rewriting the files.
+New indexes use manifest/bank layout version 3 and require an updated reader.
+**Merges are never
+reverted**, even when exact union cardinalities, byte padding or fallback entries
+erase the estimated savings. Actual capacity is computed from exact union keys
+and remains a power of two; the planned membership partition is unchanged.
+Temporary feature caches keep the initial pass bounded by `--build-jobs`.
+Completed groups' verified `u64` cells are written to temporary disk files rather
+than retained in RAM; their feature caches are then removed. Bank packing reads
+small blocks of completed filters into bounded row tiles and writes each tile
+directly to the compressor; no complete packed banks are retained during construction.
+Sorted feature caches are unioned through bounded readers directly into key/payload
+vectors. Graph positions, adjacency, offsets and peel records use checked 32-bit
+indices where possible, with a wide fallback. A mutable indexed degree heap avoids
+stale priority entries while retaining the original tie-breaking and peel decisions.
+Construction still needs memory for active groups' final keys/payloads/graphs and
+uses extra temporary disk I/O. Fingerprints, origin assignments, hash positions,
+false positives and query counts are unchanged.
+
+Options: `--merge-sketch-size` (4096 buckets), `--merge-max-colors` (48 datasets),
+`--merge-min-saving` (0; a fractional safety margin), and `--merge-disabled`
+(power-of-two singleton banks for comparisons). Payloads currently fit at most
+64 bits, including the 8- or 16-bit fingerprint. `--slot-count` acts as a minimum
+per-group cell budget before rounding.
+
+Query supports all feature modes and uses Rayon for ordinary and findere queries.
+This format currently supports plain in-memory slices with zstd-compressed files;
+append, repack, union prefilters, manual segment lengths, and split-large layouts
+are rejected. A future append implementation must plan merges only within the
+new update batch, never against old filters whose source documents may be gone.
+`info` reports the planner, candidate evaluations, payload, padding, recovery-map
+hashes/associations/RAM, fallback storage, metadata, and disk bytes
+separately. The 1,024-genome before/after benchmark is summarized in
+[docs/OPTIMIZATION_BENCHMARK.txt](docs/OPTIMIZATION_BENCHMARK.txt).
+
 ## Bindex
 
 Bindex is the Bloom-filter comparison backend. It stores one Bloom filter per
@@ -331,3 +447,5 @@ Antoine Limasset. ZOR Filters: Fast and Smaller Than Fuse Filters. In 24th
 International Symposium on Experimental Algorithms (SEA 2026), LIPIcs 371,
 24:1-24:17, 2026. DOI:
 [10.4230/LIPIcs.SEA.2026.24](https://doi.org/10.4230/LIPIcs.SEA.2026.24).
+
+Compression applies to construction inputs and queries, including findere. Use the appropriate compression suffix; decoding errors are returned. Compressed construction inputs are decoded into memory before feature parsing.

@@ -1,5 +1,9 @@
 /target/
 
+# Local research scripts, frozen sources, datasets and generated benchmark runs.
+# Publish curated benchmark summaries under docs/ instead.
+/experiments/
+
 # Local data and generated indexes
 *.fa
 *.fna

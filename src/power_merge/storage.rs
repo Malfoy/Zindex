@@ -1,0 +1,2180 @@
+use super::{
+    abandoned::{self, OriginMap},
+    planner,
+    sketch::Sketch,
+    Backend, BuildConfig, ColumnOrder, MergePlanner, PeelGraph,
+};
+use crate::{
+    create_index_writer, finish_index_writer, open_index_reader, parse_features_from_file,
+    read_fof, splitmix64, FeatureConfig, IndexMode, MAX_HASHES,
+};
+use anyhow::{ensure, Context, Result};
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, BinaryHeap},
+    fs::{self, File},
+    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
+
+const MAGIC: &[u8; 8] = b"ZORPOW1\0";
+const PLANE_MAGIC: &[u8; 8] = b"ZORPOW3\0";
+const ABANDONED_MAGIC: &[u8; 8] = b"ZORABN1\0";
+const ABANDONED_FILE: &str = "abandoned.zormap.zst";
+const FINGERPRINT_SEED: u64 = 0x8E2D_4F6A_9B13_C5D7;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Color {
+    name: String,
+    path: String,
+    occurrences: u64,
+    unique_kmers: usize,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct GroupMeta {
+    members: Vec<usize>,
+    width: usize,
+    offset: usize,
+    union_cardinality: usize,
+    fallback_keys: usize,
+    #[serde(default)]
+    abandoned_keys: Option<usize>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct BankMeta {
+    file: String,
+    slots: usize,
+    row_bits: usize,
+    groups: Vec<GroupMeta>,
+    #[serde(default)]
+    fingerprint_first: bool,
+}
+#[derive(Debug, Serialize, Deserialize)]
+struct Manifest {
+    version: u32,
+    #[serde(default = "recovery_enabled")]
+    abandoned_recovery: bool,
+    #[serde(default)]
+    abandoned_file: Option<String>,
+    #[serde(default)]
+    abandoned_hashes: usize,
+    #[serde(default)]
+    abandoned_origins: usize,
+    backend: Backend,
+    k: usize,
+    hashes: usize,
+    seed: u64,
+    fingerprint_bits: usize,
+    index_mode: u8,
+    minimizer_size: usize,
+    modimizer_sampling: u64,
+    findere_z: usize,
+    sketch_size: usize,
+    sketch_method: String,
+    #[serde(default = "legacy_merge_planner")]
+    merge_planner: MergePlanner,
+    #[serde(default = "legacy_column_order")]
+    column_order: ColumnOrder,
+    #[serde(default)]
+    planning_pair_evaluations: u64,
+    #[serde(default)]
+    planning_possible_pair_evaluations: u64,
+    #[serde(default = "legacy_merge_reverts_enabled")]
+    merge_reverts_enabled: bool,
+    #[serde(default = "legacy_cell_storage")]
+    construction_cell_storage: String,
+    slot_scale: f64,
+    singleton_logical_bits: u64,
+    predicted_logical_bits: u64,
+    planned_groups: usize,
+    rejected_groups: usize,
+    exact_group_verifications: u64,
+    sketch_seconds: f64,
+    plan_seconds: f64,
+    build_seconds: f64,
+    colors: Vec<Color>,
+    banks: Vec<BankMeta>,
+}
+fn recovery_enabled() -> bool {
+    true
+}
+fn legacy_merge_reverts_enabled() -> bool {
+    true
+}
+fn legacy_merge_planner() -> MergePlanner {
+    MergePlanner::AllPairs
+}
+fn legacy_column_order() -> ColumnOrder {
+    ColumnOrder::Width
+}
+fn legacy_cell_storage() -> String {
+    "in-memory-u64".into()
+}
+impl Manifest {
+    fn features(&self) -> Result<FeatureConfig> {
+        Ok(FeatureConfig::new(
+            IndexMode::from_u8(self.index_mode)?,
+            self.minimizer_size,
+            self.modimizer_sampling,
+        )
+        .with_findere_z(self.findere_z))
+    }
+}
+struct BuiltGroup {
+    meta: GroupMeta,
+    slots: usize,
+    cells: PathBuf,
+    // Construction-only 32-bit hashes and origin masks. Converted to the single
+    // global dataset multimap before publication, never consulted during queries.
+    fallback: Vec<(u32, u64)>,
+}
+struct Bank {
+    meta: BankMeta,
+    data: Vec<u8>,
+    #[cfg(test)]
+    fallback: Vec<Vec<(u32, u64)>>,
+}
+struct Index {
+    manifest: Manifest,
+    banks: Vec<Bank>,
+    abandoned: Option<OriginMap>,
+    row_scratch_bytes: usize,
+}
+
+// A build writes only to a newly created staging directory. Publishing it at
+// the end avoids leaving an apparently usable index after a failed build.
+struct Staging(PathBuf);
+impl Drop for Staging {
+    fn drop(&mut self) {
+        if self.0.exists() {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+}
+fn cache_path(stage: &Path, id: usize) -> PathBuf {
+    stage.join("features").join(format!("{id}.u64"))
+}
+fn cache_write(path: &Path, keys: &[u64]) -> Result<()> {
+    let mut writer = BufWriter::new(File::create(path)?);
+    for &key in keys {
+        writer.write_all(&key.to_le_bytes())?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+#[cfg(test)]
+fn cache_read(path: &Path) -> Result<Vec<u64>> {
+    let bytes = fs::read(path)?;
+    ensure!(bytes.len() % 8 == 0, "invalid feature cache");
+    Ok(bytes
+        .chunks_exact(8)
+        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+        .collect())
+}
+
+pub fn build(
+    fof: &Path,
+    output: &Path,
+    config: BuildConfig,
+    graph: impl Fn(&[u64], usize) -> Result<PeelGraph> + Sync,
+) -> Result<()> {
+    config.validate()?;
+    ensure!(
+        !output.exists(),
+        "output {} already exists; choose a new directory",
+        output.display()
+    );
+    let start = Instant::now();
+    let inputs = read_fof(fof)?;
+    ensure!(!inputs.is_empty(), "{} contains no inputs", fof.display());
+    ensure!(
+        inputs.len() <= u32::MAX as usize,
+        "dataset IDs must fit in 32 bits"
+    );
+    let parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let stage = Staging(parent.join(format!(".zor-pow2-building-{}-{stamp}", std::process::id())));
+    fs::create_dir(&stage.0)?;
+    fs::create_dir(stage.0.join("features"))?;
+    fs::create_dir(stage.0.join("cells"))?;
+    eprintln!(
+        "sketching {} datasets with {} mergeable full-minimum buckets",
+        inputs.len(),
+        config.merge.sketch_size
+    );
+    let mut colors = Vec::new();
+    let mut initial = Vec::new();
+    let mut streaming = planner::StreamingPlanner::default();
+    let mut singleton_logical_bits = 0u128;
+    let mut plan_seconds = 0.0;
+    let mut sketch_seconds = 0.0;
+    for (chunk_id, chunk) in inputs.chunks(config.build_jobs).enumerate() {
+        let parsed = chunk
+            .par_iter()
+            .enumerate()
+            .map(|(offset, input)| {
+                let id = chunk_id * config.build_jobs + offset;
+                let mut keys = Vec::new();
+                let mut occurrences = 0;
+                parse_features_from_file(
+                    &input.path,
+                    config.k,
+                    config.seed,
+                    config.feature_config,
+                    |key| {
+                        occurrences += 1;
+                        keys.push(key);
+                    },
+                )?;
+                keys.sort_unstable();
+                keys.dedup();
+                let sketch_start = Instant::now();
+                let sketch = Sketch::new(&keys, config.merge.sketch_size, config.seed);
+                let sketch_sec = sketch_start.elapsed().as_secs_f64();
+                cache_write(&cache_path(&stage.0, id), &keys)?;
+                let color = Color {
+                    name: input.name.clone(),
+                    path: input.path.to_string_lossy().into_owned(),
+                    occurrences,
+                    unique_kmers: keys.len(),
+                };
+                Ok((
+                    color,
+                    planner::singleton(keys.len(), sketch, id, &config)?,
+                    sketch_sec,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (color, group, seconds) in parsed {
+            colors.push(color);
+            singleton_logical_bits += planner::cost(group.slots, group.width);
+            if config.merge.planner.is_streaming() {
+                let plan_start = Instant::now();
+                streaming.insert(group, &config)?;
+                plan_seconds += plan_start.elapsed().as_secs_f64();
+            } else {
+                initial.push(group);
+            }
+            sketch_seconds += seconds;
+        }
+    }
+    let singleton_logical_bits = u64::try_from(singleton_logical_bits)?;
+    let plan_start = Instant::now();
+    let plan = if config.merge.planner.is_streaming() {
+        streaming.finish()
+    } else {
+        planner::plan(initial, &config)?
+    };
+    plan_seconds += plan_start.elapsed().as_secs_f64();
+    let planning_pair_evaluations = plan.pair_evaluations;
+    let planning_possible_pair_evaluations = plan.possible_pair_evaluations;
+    let planned = plan.groups;
+    let predicted_logical_bits = u64::try_from(
+        planned
+            .iter()
+            .map(|g| planner::cost(g.slots, g.width))
+            .sum::<u128>(),
+    )?;
+    let planned_groups = planned.len();
+    eprintln!(
+        "merge plan ({}; no reverts): {} datasets -> {} groups, predicted bits {} -> {}, planning {:.3}s, pair evaluations {}",
+        config.merge.planner.label(),
+        colors.len(),
+        planned_groups,
+        singleton_logical_bits,
+        predicted_logical_bits,
+        plan_seconds,
+        planning_pair_evaluations
+    );
+    let mut built = Vec::new();
+    let rejected_groups = 0;
+    let mut exact_group_verifications = 0;
+    for chunk in planned.chunks(config.build_jobs) {
+        let results = chunk
+            .par_iter()
+            .map(|group| build_group(group, &stage.0, &config, &graph))
+            .collect::<Result<Vec<_>>>()?;
+        for (group, verified) in results {
+            built.push(group);
+            exact_group_verifications += verified;
+        }
+    }
+    let (abandoned_hashes, abandoned_origins) = if config.merge.drop_abandoned {
+        (0, 0)
+    } else {
+        save_abandoned_groups(&mut built, &stage.0)?
+    };
+    let banks = pack_banks_streaming(
+        built,
+        config.merge.column_order,
+        config.fingerprint_bits,
+        &stage.0,
+    )?;
+    fs::remove_dir(stage.0.join("cells"))?;
+    fs::remove_dir(stage.0.join("features"))?;
+    let mut manifest = Manifest {
+        version: 3,
+        abandoned_recovery: !config.merge.drop_abandoned,
+        abandoned_file: (!config.merge.drop_abandoned).then(|| ABANDONED_FILE.into()),
+        abandoned_hashes,
+        abandoned_origins,
+        backend: config.backend,
+        k: config.k,
+        hashes: config.hashes,
+        seed: config.seed,
+        fingerprint_bits: config.fingerprint_bits,
+        index_mode: config.feature_config.mode.as_u8(),
+        minimizer_size: config.feature_config.minimizer_size,
+        modimizer_sampling: config.feature_config.modimizer_sampling,
+        findere_z: config.feature_config.findere_z,
+        sketch_size: config.merge.sketch_size,
+        sketch_method: "simd-sketch-style mod-buckets, 64-bit full minima, AVX2 comparisons".into(),
+        merge_planner: config.merge.planner,
+        column_order: config.merge.column_order,
+        planning_pair_evaluations,
+        planning_possible_pair_evaluations,
+        merge_reverts_enabled: false,
+        construction_cell_storage: "temporary-disk-u64-tiled-packing".into(),
+        slot_scale: config.slot_scale,
+        singleton_logical_bits,
+        predicted_logical_bits,
+        planned_groups,
+        rejected_groups,
+        exact_group_verifications,
+        sketch_seconds,
+        plan_seconds,
+        build_seconds: 0.0,
+        colors,
+        banks,
+    };
+    manifest.build_seconds = start.elapsed().as_secs_f64();
+    let mut writer = BufWriter::new(File::create(stage.0.join("manifest.json"))?);
+    serde_json::to_writer_pretty(&mut writer, &manifest)?;
+    writer.flush()?;
+    ensure!(
+        !output.exists(),
+        "output appeared during build: {}",
+        output.display()
+    );
+    fs::rename(&stage.0, output)?;
+    eprintln!("built {} in {:.3}s: banks={}, groups={}, stack_bytes={}, fallback_bytes={}, rejected_groups={}",
+        output.display(), start.elapsed().as_secs_f64(), manifest.banks.len(), manifest.banks.iter().map(|b| b.groups.len()).sum::<usize>(),
+        manifest.banks.iter().map(|b| b.slots * b.row_bits.div_ceil(8)).sum::<usize>(), abandoned_hashes * 8 + abandoned_origins * 4, rejected_groups);
+    Ok(())
+}
+
+fn union_features(group: &planner::Group, stage: &Path) -> Result<(Vec<u64>, Vec<u64>)> {
+    let mut readers = group
+        .members
+        .iter()
+        .map(|&id| {
+            let file = File::open(cache_path(stage, id))?;
+            ensure!(file.metadata()?.len() % 8 == 0, "invalid feature cache");
+            Ok(BufReader::with_capacity(64 * 1024, file))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut heap = BinaryHeap::new();
+    fn next(reader: &mut impl Read) -> Result<Option<u64>> {
+        let mut bytes = [0; 8];
+        if reader.read(&mut bytes[..1])? == 0 {
+            return Ok(None);
+        }
+        reader.read_exact(&mut bytes[1..])?;
+        Ok(Some(u64::from_le_bytes(bytes)))
+    }
+    for (id, reader) in readers.iter_mut().enumerate() {
+        if let Some(key) = next(reader)? {
+            heap.push(Reverse((key, id)));
+        }
+    }
+    let mut keys = Vec::new();
+    let mut memberships = Vec::new();
+    while let Some(Reverse((key, id))) = heap.pop() {
+        let mask = 1u64 << id;
+        if keys.last() == Some(&key) {
+            *memberships.last_mut().unwrap() |= mask;
+        } else {
+            keys.push(key);
+            memberships.push(mask);
+        }
+        if let Some(next) = next(&mut readers[id])? {
+            ensure!(next > key, "unsorted/duplicate feature cache");
+            heap.push(Reverse((next, id)));
+        }
+    }
+    Ok((keys, memberships))
+}
+
+fn build_group(
+    group: &planner::Group,
+    stage: &Path,
+    config: &BuildConfig,
+    graph: &(impl Fn(&[u64], usize) -> Result<PeelGraph> + Sync),
+) -> Result<(BuiltGroup, u64)> {
+    let (keys, mut values) = union_features(group, stage)?;
+    let slots = config.slots(keys.len() as f64)?;
+    for (&key, value) in keys.iter().zip(&mut values) {
+        *value = fingerprint(key, config.seed, config.fingerprint_bits)
+            | if group.members.len() == 1 {
+                0
+            } else {
+                *value << config.fingerprint_bits
+            };
+    }
+    let mut peeled = graph(&keys, slots)?;
+    let cells = peeled.assign_verified(&keys, &values, slots, config.hashes)?;
+    // Recover all dropped origins, including when the unconstrained cells happen
+    // to match a fingerprint. Recovery adds hits; it never replaces filter hits.
+    let fallback: Vec<_> = if config.merge.drop_abandoned {
+        Vec::new()
+    } else {
+        peeled
+            .dropped()
+            .map(|edge| {
+                (
+                    abandoned::hash(keys[edge], config.seed),
+                    if group.members.len() == 1 {
+                        1
+                    } else {
+                        values[edge] >> config.fingerprint_bits
+                    },
+                )
+            })
+            .collect()
+    };
+    let dropped_len = peeled.dropped_len();
+    let meta = GroupMeta {
+        members: group.members.clone(),
+        width: group.width,
+        offset: 0,
+        union_cardinality: keys.len(),
+        fallback_keys: fallback.len(),
+        abandoned_keys: Some(dropped_len),
+    };
+    let verified = (keys.len()
+        - if config.merge.drop_abandoned {
+            dropped_len
+        } else {
+            0
+        }) as u64;
+    // Completed groups do not remain resident until all graph builds finish.
+    // Every cell is persisted losslessly; packing still uses the same order and
+    // bit layout. Release graph/union workspaces before writing the cell cache.
+    drop(peeled);
+    drop(values);
+    drop(keys);
+    let cell_path = stage
+        .join("cells")
+        .join(format!("{}.u64", group.members[0]));
+    cache_write(&cell_path, &cells)?;
+    // The immutable plan partitions datasets, so no other group will consume
+    // these feature caches. Free them as soon as this group's cells are safe.
+    for &id in &group.members {
+        fs::remove_file(cache_path(stage, id))?;
+    }
+    Ok((
+        BuiltGroup {
+            meta,
+            slots,
+            cells: cell_path,
+            fallback,
+        },
+        verified,
+    ))
+}
+
+// Sample eight short windows across the complete filter, including its ends.
+// This bounds ordering memory/I/O independently of filter capacity. Using the
+// actual assigned cells avoids assuming Jaccard predicts XOR solution similarity.
+fn column_sample(group: &BuiltGroup) -> Result<Vec<u8>> {
+    let mut file = File::open(&group.cells)?;
+    ensure!(
+        file.metadata()?.len()
+            == (group.slots as u64)
+                .checked_mul(8)
+                .context("cell size overflow")?,
+        "invalid completed filter cell cache"
+    );
+    let window = group.slots.min(16);
+    let windows = if group.slots <= 16 { 1 } else { 8 };
+    let mut sample = vec![0; windows * window * 8];
+    for i in 0..windows {
+        let slot = if windows == 1 {
+            0
+        } else {
+            ((group.slots - window) as u128 * i as u128 / (windows - 1) as u128) as u64
+        };
+        file.seek(SeekFrom::Start(slot * 8))?;
+        file.read_exact(&mut sample[i * window * 8..(i + 1) * window * 8])?;
+    }
+    Ok(sample)
+}
+
+fn order_columns(groups: &mut [BuiltGroup], order: ColumnOrder) -> Result<()> {
+    // Width sorting is retained: variable-width sections stay contiguous and
+    // physical reordering never changes origin bit assignments or color IDs.
+    groups.sort_by_key(|g| (g.meta.width, g.meta.members[0]));
+    if order == ColumnOrder::Width || groups.len() < 2 {
+        return Ok(());
+    }
+    for section in groups.chunk_by_mut(|a, b| a.meta.width == b.meta.width) {
+        if section.len() < 2 {
+            continue;
+        }
+        let samples = section
+            .par_iter()
+            .map(|g| Ok((g.meta.members[0], column_sample(g)?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        // A lexicographic locality heuristic, not a global compression optimum.
+        // No quadratic similarity matrix, no filter rebuild, no merge reverts.
+        section.sort_by(|a, b| {
+            samples[&a.meta.members[0]]
+                .cmp(&samples[&b.meta.members[0]])
+                .then_with(|| a.meta.members[0].cmp(&b.meta.members[0]))
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn transpose(groups: Vec<BuiltGroup>, order: ColumnOrder) -> Result<Vec<Bank>> {
+    let mut by_size = BTreeMap::<usize, Vec<BuiltGroup>>::new();
+    for group in groups {
+        by_size.entry(group.slots).or_default().push(group);
+    }
+    let mut banks = Vec::new();
+    for (slots, mut groups) in by_size {
+        order_columns(&mut groups, order)?;
+        let mut row_bits = 0;
+        for group in &mut groups {
+            group.meta.offset = row_bits;
+            row_bits += group.meta.width;
+        }
+        let row_bytes = row_bits.div_ceil(8);
+        let mut data = vec![0; slots.checked_mul(row_bytes).context("bank size overflow")?];
+        for group in &groups {
+            let cells = cache_read(&group.cells)?;
+            ensure!(cells.len() == slots, "invalid completed filter cell cache");
+            for (slot, &value) in cells.iter().enumerate() {
+                put_bits(
+                    &mut data[slot * row_bytes..(slot + 1) * row_bytes],
+                    group.meta.offset,
+                    group.meta.width,
+                    value,
+                );
+            }
+            fs::remove_file(&group.cells)?;
+        }
+        let meta = BankMeta {
+            file: format!("bank-{}.zorbank.zst", slots.ilog2()),
+            slots,
+            row_bits,
+            groups: groups.iter().map(|g| g.meta.clone()).collect(),
+            fingerprint_first: false,
+        };
+        banks.push(Bank {
+            meta,
+            data,
+            fallback: groups.into_iter().map(|g| g.fallback).collect(),
+        });
+    }
+    Ok(banks)
+}
+
+fn pack_banks_streaming(
+    groups: Vec<BuiltGroup>,
+    order: ColumnOrder,
+    fp_bits: usize,
+    directory: &Path,
+) -> Result<Vec<BankMeta>> {
+    let mut by_size = BTreeMap::<usize, Vec<BuiltGroup>>::new();
+    for group in groups {
+        by_size.entry(group.slots).or_default().push(group);
+    }
+    let mut banks = Vec::new();
+    for (slots, mut groups) in by_size {
+        order_columns(&mut groups, order)?;
+        let mut row_bits = 0usize;
+        for group in &mut groups {
+            group.meta.offset = row_bits;
+            row_bits = row_bits
+                .checked_add(group.meta.width)
+                .context("row width overflow")?;
+            ensure!(
+                fs::metadata(&group.cells)?.len() == slots as u64 * 8,
+                "invalid completed filter cell cache"
+            );
+        }
+        let meta = BankMeta {
+            file: format!("bank-{}.zorbank.zst", slots.ilog2()),
+            slots,
+            row_bits,
+            groups: groups.iter().map(|g| g.meta.clone()).collect(),
+            fingerprint_first: true,
+        };
+        let row_bytes = row_bits.div_ceil(8);
+        let expected_bytes = slots.checked_mul(row_bytes).context("bank size overflow")?;
+        let mut writer = create_index_writer(&directory.join(&meta.file))?;
+        writer.write_all(PLANE_MAGIC)?;
+        for n in [slots, row_bits, groups.len(), expected_bytes] {
+            writer.write_all(&(n as u64).to_le_bytes())?;
+        }
+        // Keep all row writes in an 8-MiB tile. Input blocks stay small and each
+        // completed bank goes directly to its compressor instead of a Vec<Bank>.
+        let tile_rows = (8 * 1024 * 1024 / row_bytes).clamp(1, 4096).min(slots);
+        let mut tile = vec![0; tile_rows * row_bytes];
+        let mut input = vec![0; tile_rows * 8];
+        // Reuse descriptors when allowed. If a host's FD limit is too small,
+        // discard partial opens and read one file/block at a time instead.
+        let mut files = groups
+            .iter()
+            .map(|g| File::open(&g.cells))
+            .collect::<std::io::Result<Vec<_>>>()
+            .ok();
+        let fp_mask = (1u64 << fp_bits) - 1;
+        for start in (0..slots).step_by(tile_rows) {
+            let rows = tile_rows.min(slots - start);
+            let output = &mut tile[..rows * row_bytes];
+            output.fill(0);
+            for (index, group) in groups.iter().enumerate() {
+                let block = &mut input[..rows * 8];
+                if let Some(files) = &mut files {
+                    files[index].read_exact(block)?;
+                } else {
+                    let mut file = File::open(&group.cells)?;
+                    file.seek(SeekFrom::Start(start as u64 * 8))?;
+                    file.read_exact(block)?;
+                }
+                let origin_offset = groups.len() * fp_bits + group.meta.offset - index * fp_bits;
+                for (row, bytes) in output
+                    .chunks_exact_mut(row_bytes)
+                    .zip(block.chunks_exact(8))
+                {
+                    let value = u64::from_le_bytes(bytes.try_into().unwrap());
+                    put_bits(row, index * fp_bits, fp_bits, value & fp_mask);
+                    if group.meta.width > fp_bits {
+                        put_bits(
+                            row,
+                            origin_offset,
+                            group.meta.width - fp_bits,
+                            value >> fp_bits,
+                        );
+                    }
+                }
+            }
+            writer.write_all(output)?;
+        }
+        finish_index_writer(writer)?;
+        drop(files);
+        for group in groups {
+            fs::remove_file(group.cells)?;
+        }
+        banks.push(meta);
+    }
+    Ok(banks)
+}
+
+type AbandonedRecord = (u32, u32, u64); // hash, construction group, origin mask
+
+fn visit_abandoned(
+    records: &mut [AbandonedRecord],
+    members: &[Vec<usize>],
+    mut emit: impl FnMut(u32, &[u32]) -> Result<()>,
+) -> Result<(usize, usize)> {
+    records.sort_unstable_by_key(|record| (record.0, record.1));
+    let mut origins = Vec::new();
+    let mut hashes = 0usize;
+    let mut associations = 0usize;
+    for chunk in records.chunk_by(|a, b| a.0 == b.0) {
+        origins.clear();
+        for &(_, group, mut mask) in chunk {
+            let group_members = &members[group as usize];
+            while mask != 0 {
+                let bit = mask.trailing_zeros() as usize;
+                ensure!(
+                    bit < group_members.len(),
+                    "invalid abandoned membership bit"
+                );
+                origins
+                    .push(u32::try_from(group_members[bit]).context("dataset ID exceeds 32 bits")?);
+                mask &= mask - 1;
+            }
+        }
+        origins.sort_unstable();
+        origins.dedup();
+        ensure!(!origins.is_empty(), "empty abandoned membership");
+        emit(chunk[0].0, &origins)?;
+        hashes += 1;
+        associations = associations
+            .checked_add(origins.len())
+            .context("abandoned origins overflow")?;
+    }
+    ensure!(hashes <= u32::MAX as usize, "too many abandoned hashes");
+    Ok((hashes, associations))
+}
+
+#[cfg(test)]
+fn save_abandoned(banks: &mut [Bank], directory: &Path) -> Result<(usize, usize)> {
+    let count: usize = banks
+        .iter()
+        .flat_map(|bank| &bank.fallback)
+        .map(Vec::len)
+        .sum();
+    let mut records = Vec::with_capacity(count);
+    let mut members = Vec::new();
+    for bank in banks {
+        for (group, fallback) in bank.meta.groups.iter().zip(&mut bank.fallback) {
+            let id = u32::try_from(members.len()).context("group ID exceeds 32 bits")?;
+            members.push(group.members.clone());
+            for (hash, mask) in std::mem::take(fallback) {
+                records.push((hash, id, mask));
+            }
+        }
+        // Banks have no per-group recovery table in the query representation.
+        bank.fallback.clear();
+    }
+    let mut writer = create_index_writer(&directory.join(ABANDONED_FILE))?;
+    writer.write_all(ABANDONED_MAGIC)?;
+    let stats = visit_abandoned(&mut records, &members, |hash, origins| {
+        writer.write_all(&hash.to_le_bytes())?;
+        let count =
+            u32::try_from(origins.len()).context("too many origins for an abandoned hash")?;
+        writer.write_all(&count.to_le_bytes())?;
+        for &origin in origins {
+            writer.write_all(&origin.to_le_bytes())?;
+        }
+        Ok(())
+    })?;
+    finish_index_writer(writer)?;
+    Ok(stats)
+}
+
+fn save_abandoned_groups(groups: &mut [BuiltGroup], directory: &Path) -> Result<(usize, usize)> {
+    let mut records = Vec::with_capacity(groups.iter().map(|g| g.fallback.len()).sum());
+    let mut members = Vec::with_capacity(groups.len());
+    for group in groups {
+        let id = u32::try_from(members.len()).context("group ID exceeds 32 bits")?;
+        members.push(group.meta.members.clone());
+        for (hash, mask) in std::mem::take(&mut group.fallback) {
+            records.push((hash, id, mask));
+        }
+    }
+    let mut writer = create_index_writer(&directory.join(ABANDONED_FILE))?;
+    writer.write_all(ABANDONED_MAGIC)?;
+    let stats = visit_abandoned(&mut records, &members, |hash, origins| {
+        writer.write_all(&hash.to_le_bytes())?;
+        writer.write_all(&(origins.len() as u32).to_le_bytes())?;
+        for &origin in origins {
+            writer.write_all(&origin.to_le_bytes())?;
+        }
+        Ok(())
+    })?;
+    finish_index_writer(writer)?;
+    Ok(stats)
+}
+
+fn read_u32(reader: &mut impl Read) -> Result<u32> {
+    let mut bytes = [0; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn load_abandoned(directory: &Path, manifest: &Manifest) -> Result<OriginMap> {
+    ensure!(
+        manifest.abandoned_file.as_deref() == Some(ABANDONED_FILE),
+        "invalid abandoned map filename"
+    );
+    let mut reader = open_index_reader(&directory.join(ABANDONED_FILE))?;
+    let mut magic = [0; 8];
+    reader.read_exact(&mut magic)?;
+    ensure!(&magic == ABANDONED_MAGIC, "invalid abandoned map magic");
+    let mut map = OriginMap::with_capacity(manifest.abandoned_hashes, manifest.abandoned_origins)?;
+    let mut origins = Vec::new();
+    for _ in 0..manifest.abandoned_hashes {
+        let hash = read_u32(&mut reader)?;
+        let count = read_u32(&mut reader)? as usize;
+        ensure!(
+            count > 0 && count <= manifest.colors.len(),
+            "invalid abandoned origin count"
+        );
+        ensure!(
+            count <= manifest.abandoned_origins.saturating_sub(map.origins_len()),
+            "abandoned origins exceed manifest"
+        );
+        origins.clear();
+        for _ in 0..count {
+            let origin = read_u32(&mut reader)?;
+            ensure!(
+                (origin as usize) < manifest.colors.len(),
+                "invalid abandoned dataset ID"
+            );
+            origins.push(origin);
+        }
+        map.push(hash, &origins)?;
+    }
+    ensure!(
+        map.origins_len() == manifest.abandoned_origins,
+        "abandoned origin count differs from manifest"
+    );
+    let mut extra = [0];
+    ensure!(
+        reader.read(&mut extra)? == 0,
+        "unexpected abandoned map data"
+    );
+    map.finish()?;
+    Ok(map)
+}
+
+#[cfg(test)]
+fn save_bank(bank: &Bank, directory: &Path) -> Result<()> {
+    let mut writer = create_index_writer(&directory.join(&bank.meta.file))?;
+    writer.write_all(if bank.meta.fingerprint_first {
+        PLANE_MAGIC
+    } else {
+        MAGIC
+    })?;
+    for value in [
+        bank.meta.slots,
+        bank.meta.row_bits,
+        bank.meta.groups.len(),
+        bank.data.len(),
+    ] {
+        writer.write_all(&(value as u64).to_le_bytes())?;
+    }
+    writer.write_all(&bank.data)?;
+    finish_index_writer(writer)
+}
+fn read_u64(reader: &mut impl Read) -> Result<u64> {
+    let mut bytes = [0; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+impl Index {
+    fn load(directory: &Path) -> Result<Self> {
+        Self::load_with_recovery(directory, true)
+    }
+
+    fn load_with_recovery(directory: &Path, recover: bool) -> Result<Self> {
+        let manifest: Manifest =
+            serde_json::from_reader(BufReader::new(File::open(directory.join("manifest.json"))?))?;
+        ensure!(
+            [1, 2, 3].contains(&manifest.version) && manifest.backend == Backend::Zor,
+            "unsupported power-of-two index format"
+        );
+        ensure!(
+            (2..=MAX_HASHES).contains(&manifest.hashes),
+            "invalid hash count"
+        );
+        ensure!(
+            [8, 16].contains(&manifest.fingerprint_bits),
+            "invalid fingerprint width"
+        );
+        ensure!(
+            manifest.colors.len() <= u32::MAX as usize,
+            "dataset IDs must fit in 32 bits"
+        );
+        if manifest.version >= 2 {
+            ensure!(
+                manifest.abandoned_recovery == manifest.abandoned_file.is_some(),
+                "inconsistent abandoned recovery metadata"
+            );
+            ensure!(
+                manifest.abandoned_file.is_none()
+                    || manifest.abandoned_file.as_deref() == Some(ABANDONED_FILE),
+                "invalid abandoned map filename"
+            );
+            ensure!(
+                manifest.abandoned_recovery
+                    || (manifest.abandoned_hashes == 0 && manifest.abandoned_origins == 0),
+                "disabled recovery has abandoned records"
+            );
+        }
+        let recover = recover && manifest.abandoned_recovery;
+        let mut legacy_records = Vec::new();
+        let mut legacy_members = Vec::new();
+        let features = manifest.features()?;
+        match features.mode {
+            IndexMode::Findere => {
+                crate::findere::indexed_length(manifest.k, features.findere_z)?;
+            }
+            IndexMode::Kmers | IndexMode::Modimizers => {
+                ensure!((1..=31).contains(&manifest.k), "invalid k")
+            }
+            IndexMode::Minimizers => ensure!(
+                (1..=255).contains(&manifest.k)
+                    && manifest.k % 2 == 1
+                    && features.minimizer_size <= manifest.k,
+                "invalid minimizer window"
+            ),
+        }
+        ensure!(
+            (1..=31).contains(&features.minimizer_size) && features.modimizer_sampling > 0,
+            "invalid feature parameters"
+        );
+        let mut seen = vec![false; manifest.colors.len()];
+        let mut banks = Vec::new();
+        let mut previous_slots = 0;
+        for meta in &manifest.banks {
+            ensure!(
+                !meta.fingerprint_first || manifest.version >= 3,
+                "unsupported bank layout"
+            );
+            ensure!(
+                meta.slots.is_power_of_two()
+                    && meta.slots >= manifest.hashes
+                    && meta.slots > previous_slots,
+                "invalid bank size/order"
+            );
+            previous_slots = meta.slots;
+            ensure!(
+                meta.file == format!("bank-{}.zorbank.zst", meta.slots.ilog2()),
+                "invalid bank file name"
+            );
+            let mut offset = 0;
+            for group in &meta.groups {
+                ensure!(
+                    !group.members.is_empty()
+                        && group.members.len() <= 64 - manifest.fingerprint_bits,
+                    "invalid membership width"
+                );
+                let width = manifest.fingerprint_bits
+                    + if group.members.len() == 1 {
+                        0
+                    } else {
+                        group.members.len()
+                    };
+                ensure!(
+                    group.offset == offset && group.width == width,
+                    "invalid group bit layout"
+                );
+                offset = offset.checked_add(width).context("row width overflow")?;
+                for &id in &group.members {
+                    ensure!(
+                        id < seen.len() && !seen[id],
+                        "invalid/duplicate dataset mapping"
+                    );
+                    seen[id] = true;
+                }
+                ensure!(
+                    group.fallback_keys <= group.union_cardinality,
+                    "invalid fallback count"
+                );
+                if manifest.version >= 2 {
+                    let count = group
+                        .abandoned_keys
+                        .context("missing abandoned equation count")?;
+                    ensure!(
+                        count <= group.union_cardinality,
+                        "invalid abandoned equation count"
+                    );
+                    ensure!(
+                        group.fallback_keys
+                            == if manifest.abandoned_recovery {
+                                count
+                            } else {
+                                0
+                            },
+                        "inconsistent abandoned equation count"
+                    );
+                }
+            }
+            ensure!(offset == meta.row_bits && offset > 0, "invalid row width");
+            let expected_bytes = meta
+                .slots
+                .checked_mul(meta.row_bits.div_ceil(8))
+                .context("bank size overflow")?;
+            let mut reader = open_index_reader(&directory.join(&meta.file))?;
+            let mut magic = [0; 8];
+            reader.read_exact(&mut magic)?;
+            ensure!(
+                &magic
+                    == if meta.fingerprint_first {
+                        PLANE_MAGIC
+                    } else {
+                        MAGIC
+                    },
+                "invalid bank magic"
+            );
+            for expected in [meta.slots, meta.row_bits, meta.groups.len(), expected_bytes] {
+                ensure!(
+                    read_u64(&mut reader)? == expected as u64,
+                    "bank header differs from manifest"
+                );
+            }
+            let mut data = vec![0; expected_bytes];
+            reader.read_exact(&mut data)?;
+            if manifest.version == 1 {
+                for group in &meta.groups {
+                    ensure!(
+                        read_u64(&mut reader)? == group.fallback_keys as u64,
+                        "invalid fallback length"
+                    );
+                    let group_id =
+                        u32::try_from(legacy_members.len()).context("group ID exceeds 32 bits")?;
+                    if recover {
+                        legacy_members.push(group.members.clone());
+                    }
+                    let mut previous = None;
+                    for _ in 0..group.fallback_keys {
+                        let key = read_u64(&mut reader)?;
+                        let value = read_u64(&mut reader)?;
+                        ensure!(
+                            group.width == 64 || value < (1u64 << group.width),
+                            "invalid fallback payload width"
+                        );
+                        let fp_mask = (1u64 << manifest.fingerprint_bits) - 1;
+                        ensure!(
+                            value & fp_mask
+                                == fingerprint(key, manifest.seed, manifest.fingerprint_bits),
+                            "invalid fallback fingerprint"
+                        );
+                        ensure!(
+                            previous.is_none_or(|last| last < key),
+                            "unsorted fallback keys"
+                        );
+                        previous = Some(key);
+                        if recover {
+                            let mask = if group.members.len() == 1 {
+                                1
+                            } else {
+                                value >> manifest.fingerprint_bits
+                            };
+                            ensure!(mask != 0, "empty fallback membership");
+                            legacy_records.push((
+                                abandoned::hash(key, manifest.seed),
+                                group_id,
+                                mask,
+                            ));
+                        }
+                    }
+                }
+            }
+            let mut extra = [0];
+            ensure!(reader.read(&mut extra)? == 0, "unexpected bank data");
+            banks.push(Bank {
+                meta: meta.clone(),
+                data,
+                #[cfg(test)]
+                fallback: Vec::new(),
+            });
+        }
+        ensure!(
+            !banks.is_empty() && seen.iter().all(|&s| s),
+            "incomplete dataset mapping"
+        );
+        let abandoned = if !recover {
+            None
+        } else if manifest.version >= 2 {
+            Some(load_abandoned(directory, &manifest)?)
+        } else {
+            let mut map = OriginMap::default();
+            visit_abandoned(&mut legacy_records, &legacy_members, |hash, origins| {
+                map.push(hash, origins)
+            })?;
+            drop(legacy_records);
+            map.finish()?;
+            Some(map)
+        };
+        let abandoned = abandoned.filter(|map| map.len() != 0);
+        let row_scratch_bytes = banks
+            .iter()
+            .map(|bank| {
+                if bank.meta.fingerprint_first {
+                    bank.meta.groups.len() * manifest.fingerprint_bits / 8
+                } else {
+                    bank.meta.row_bits.div_ceil(8)
+                }
+            })
+            .max()
+            .unwrap_or(0);
+        Ok(Self {
+            manifest,
+            banks,
+            abandoned,
+            row_scratch_bytes,
+        })
+    }
+
+    fn lookup(&self, key: u64, scores: &mut [u64], scratch: &mut Vec<u8>) {
+        // Exactly one map probe for the feature, shared by all groups and banks.
+        // Recovery is an additive union, including for 32-bit hash collisions.
+        let recovered = self.abandoned.as_ref().map_or(&[][..], |map| {
+            map.get(abandoned::hash(key, self.manifest.seed))
+        });
+        // Save only the recovered datasets' counters beyond the row workspace.
+        // After normal filter lookup, add recovery only where the counter did not
+        // advance. This avoids a set lookup for every positive filter hit, and the
+        // same worker-owned buffer is reused without a per-feature allocation.
+        let snapshots_end = self.row_scratch_bytes + recovered.len() * 8;
+        if scratch.len() < snapshots_end {
+            scratch.resize(snapshots_end, 0);
+        }
+        for (bytes, &origin) in scratch[self.row_scratch_bytes..snapshots_end]
+            .chunks_exact_mut(8)
+            .zip(recovered)
+        {
+            bytes.copy_from_slice(&scores[origin as usize].to_le_bytes());
+        }
+        let fp = fingerprint(key, self.manifest.seed, self.manifest.fingerprint_bits);
+        let fp_mask = (1u64 << self.manifest.fingerprint_bits) - 1;
+        for bank in &self.banks {
+            let row_bytes = bank.meta.row_bits.div_ceil(8);
+            let lookup_bytes = if bank.meta.fingerprint_first {
+                bank.meta.groups.len() * self.manifest.fingerprint_bits / 8
+            } else {
+                row_bytes
+            };
+            let row = &mut scratch[..lookup_bytes];
+            row.fill(0);
+            let mut slots = [0; MAX_HASHES];
+            positions(
+                key,
+                bank.meta.slots,
+                self.manifest.hashes,
+                self.manifest.seed,
+                &mut slots[..self.manifest.hashes],
+            );
+            for &slot in &slots[..self.manifest.hashes] {
+                xor_row(
+                    row,
+                    &bank.data[slot * row_bytes..slot * row_bytes + lookup_bytes],
+                );
+            }
+            if bank.meta.fingerprint_first {
+                fingerprint_matches(row, self.manifest.fingerprint_bits, fp, |i| {
+                    let group = &bank.meta.groups[i];
+                    if group.members.len() == 1 {
+                        scores[group.members[0]] += 1;
+                    } else {
+                        let offset = bank.meta.groups.len() * self.manifest.fingerprint_bits
+                            + group.offset
+                            - i * self.manifest.fingerprint_bits;
+                        let mut mask = 0;
+                        for &slot in &slots[..self.manifest.hashes] {
+                            mask ^= get_bits(
+                                &bank.data[slot * row_bytes..(slot + 1) * row_bytes],
+                                offset,
+                                group.width - self.manifest.fingerprint_bits,
+                            );
+                        }
+                        while mask != 0 {
+                            let bit = mask.trailing_zeros() as usize;
+                            scores[group.members[bit]] += 1;
+                            mask &= mask - 1;
+                        }
+                    }
+                });
+                continue;
+            }
+            for group in &bank.meta.groups {
+                let value = get_bits(row, group.offset, group.width);
+                if value & fp_mask != fp {
+                    continue;
+                }
+                if group.members.len() == 1 {
+                    scores[group.members[0]] += 1;
+                } else {
+                    let mut mask = value >> self.manifest.fingerprint_bits;
+                    while mask != 0 {
+                        let bit = mask.trailing_zeros() as usize;
+                        scores[group.members[bit]] += 1;
+                        mask &= mask - 1;
+                    }
+                }
+            }
+        }
+        for (bytes, &origin) in scratch[self.row_scratch_bytes..snapshots_end]
+            .chunks_exact(8)
+            .zip(recovered)
+        {
+            let before = u64::from_le_bytes(bytes.try_into().unwrap());
+            if scores[origin as usize] == before {
+                scores[origin as usize] += 1;
+            }
+        }
+    }
+}
+
+fn fingerprint(key: u64, seed: u64, bits: usize) -> u64 {
+    splitmix64(key ^ seed ^ FINGERPRINT_SEED) & ((1u64 << bits) - 1)
+}
+
+fn fingerprint_matches(row: &[u8], bits: usize, fp: u64, mut hit: impl FnMut(usize)) {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") {
+        // Runtime dispatch keeps indexes portable to machines without AVX2.
+        unsafe {
+            fingerprint_matches_avx2(row, bits, fp, &mut hit);
+        }
+        return;
+    }
+    fingerprint_matches_scalar(row, bits, fp, 0, &mut hit);
+}
+
+fn fingerprint_matches_scalar(
+    row: &[u8],
+    bits: usize,
+    fp: u64,
+    base: usize,
+    hit: &mut impl FnMut(usize),
+) {
+    for (i, value) in row.chunks_exact(bits / 8).enumerate() {
+        let value = if bits == 8 {
+            value[0] as u64
+        } else {
+            u16::from_le_bytes(value.try_into().unwrap()) as u64
+        };
+        if value == fp {
+            hit(base + i);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fingerprint_matches_avx2(row: &[u8], bits: usize, fp: u64, hit: &mut impl FnMut(usize)) {
+    use std::arch::x86_64::*;
+    let target = if bits == 8 {
+        _mm256_set1_epi8(fp as i8)
+    } else {
+        _mm256_set1_epi16(fp as i16)
+    };
+    let mut chunks = row.chunks_exact(32);
+    for (chunk, bytes) in chunks.by_ref().enumerate() {
+        let value = unsafe { _mm256_loadu_si256(bytes.as_ptr().cast()) };
+        let equal = if bits == 8 {
+            _mm256_cmpeq_epi8(value, target)
+        } else {
+            _mm256_cmpeq_epi16(value, target)
+        };
+        let mut mask = _mm256_movemask_epi8(equal) as u32;
+        if bits == 16 {
+            mask &= 0x5555_5555;
+        }
+        while mask != 0 {
+            hit((chunk * 32 + mask.trailing_zeros() as usize) / (bits / 8));
+            mask &= mask - 1;
+        }
+    }
+    let tail = chunks.remainder();
+    fingerprint_matches_scalar(tail, bits, fp, (row.len() - tail.len()) / (bits / 8), hit);
+}
+/// Same segmented mapping as production ZOR. Total cell count is a power of
+/// two; the number of overlapping segment starts is not necessarily one.
+fn positions(key: u64, cells: usize, hashes: usize, seed: u64, out: &mut [usize]) {
+    let length = (cells / hashes).clamp(1, 4096);
+    let length = 1usize << length.ilog2();
+    let count = cells / length - hashes + 1;
+    let hash1 = crate::mixsplit(key, seed);
+    let mut hash = hash1;
+    let hash2 = splitmix64(hash1);
+    let base = (((hash1 as u128 * count as u128) >> 64) as usize) * length;
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = base + i * length + ((hash ^ (hash >> 33)) as usize & (length - 1));
+        hash = hash.wrapping_add(hash2);
+    }
+}
+
+fn xor_row(acc: &mut [u8], row: &[u8]) {
+    let mut a = acc.chunks_exact_mut(8);
+    let mut b = row.chunks_exact(8);
+    for (x, y) in a.by_ref().zip(b.by_ref()) {
+        let value =
+            u64::from_le_bytes(x.try_into().unwrap()) ^ u64::from_le_bytes(y.try_into().unwrap());
+        x.copy_from_slice(&value.to_le_bytes());
+    }
+    for (x, &y) in a.into_remainder().iter_mut().zip(b.remainder()) {
+        *x ^= y;
+    }
+}
+fn put_bits(row: &mut [u8], offset: usize, width: usize, value: u64) {
+    let byte = offset / 8;
+    let shift = offset % 8;
+    let value = if width == 64 {
+        value
+    } else {
+        value & ((1u64 << width) - 1)
+    };
+    if row.len() - byte >= 8 {
+        let previous = u64::from_le_bytes(row[byte..byte + 8].try_into().unwrap());
+        row[byte..byte + 8].copy_from_slice(&(previous | (value << shift)).to_le_bytes());
+        if shift + width > 64 {
+            row[byte + 8] |= (value >> (64 - shift)) as u8;
+        }
+        return;
+    }
+    let mut left = width;
+    let mut bit = offset;
+    let mut consumed = 0;
+    while left > 0 {
+        let chunk = left.min(8 - bit % 8);
+        let mask = (1u64 << chunk) - 1;
+        row[bit / 8] |= (((value >> consumed) & mask) as u8) << (bit % 8);
+        left -= chunk;
+        bit += chunk;
+        consumed += chunk;
+    }
+}
+fn get_bits(row: &[u8], offset: usize, width: usize) -> u64 {
+    let byte = offset / 8;
+    let shift = offset % 8;
+    let count = (shift + width).div_ceil(8);
+    let mut buffer = [0; 8];
+    let first = count.min(8);
+    buffer[..first].copy_from_slice(&row[byte..byte + first]);
+    let mut value = u64::from_le_bytes(buffer) >> shift;
+    if count == 9 {
+        value |= (row[byte + 8] as u64) << (64 - shift);
+    }
+    if width < 64 {
+        value &= (1u64 << width) - 1;
+    }
+    value
+}
+
+struct QueryWorker {
+    scores: Vec<u64>,
+    scratch: Vec<u8>,
+}
+fn flush(index: &Index, batch: &mut Vec<u64>, workers: &mut Vec<QueryWorker>) {
+    if batch.is_empty() {
+        return;
+    }
+    let threads = rayon::current_num_threads().min(batch.len());
+    while workers.len() < threads {
+        workers.push(QueryWorker {
+            scores: vec![0; index.manifest.colors.len()],
+            scratch: Vec::new(),
+        });
+    }
+    workers[..threads]
+        .par_iter_mut()
+        .zip(batch.par_chunks(batch.len().div_ceil(threads)))
+        .for_each(|(worker, keys)| {
+            for &key in keys {
+                index.lookup(key, &mut worker.scores, &mut worker.scratch);
+            }
+        });
+    batch.clear();
+}
+
+pub fn query_command(directory: &Path, query: &Path, min_ratio: f64) -> Result<()> {
+    query_command_with_recovery(directory, query, min_ratio, true)
+}
+
+pub fn query_command_with_recovery(
+    directory: &Path,
+    query: &Path,
+    min_ratio: f64,
+    recover: bool,
+) -> Result<()> {
+    ensure!(
+        (0.0..=1.0).contains(&min_ratio),
+        "--min-ratio must be in [0, 1]"
+    );
+    let index = Index::load_with_recovery(directory, recover)
+        .with_context(|| format!("loading {}", directory.display()))?;
+    let start = Instant::now();
+    let features = index.manifest.features()?;
+    let (scores, total, probes) = if features.mode == IndexMode::Findere {
+        let result = crate::findere::query_file(
+            query,
+            index.manifest.k,
+            features.findere_z,
+            index.manifest.colors.len(),
+            Vec::<u8>::new,
+            |scratch, key, hits| {
+                index.lookup(key, hits, scratch);
+                true
+            },
+        )?;
+        (result.scores, result.total_kmers, result.smer_queries)
+    } else {
+        let mut workers = Vec::new();
+        let mut batch = Vec::with_capacity(262_144);
+        let mut total = 0;
+        parse_features_from_file(
+            query,
+            index.manifest.k,
+            index.manifest.seed,
+            features,
+            |key| {
+                total += 1;
+                batch.push(key);
+                if batch.len() == 262_144 {
+                    flush(&index, &mut batch, &mut workers);
+                }
+            },
+        )?;
+        flush(&index, &mut batch, &mut workers);
+        let mut scores = vec![0; index.manifest.colors.len()];
+        for worker in workers {
+            for (score, v) in scores.iter_mut().zip(worker.scores) {
+                *score += v;
+            }
+        }
+        (scores, total, total)
+    };
+    println!("#query\t{}\tk={}\tindex_mode={}\ttotal_features={}\tstack_probes={}\tbank_probes={}\telapsed_s={:.6}",
+        query.display(), index.manifest.k, features.mode.label(), total, probes, probes * index.banks.len() as u64, start.elapsed().as_secs_f64());
+    println!("color\tmatches\tratio\tunique_kmers\tabandoned");
+    for (color, &matches) in index.manifest.colors.iter().zip(&scores) {
+        let ratio = if total == 0 {
+            0.0
+        } else {
+            matches as f64 / total as f64
+        };
+        if ratio >= min_ratio {
+            println!(
+                "{}\t{}\t{:.8}\t{}\t0",
+                color.name, matches, ratio, color.unique_kmers
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn info_command(directory: &Path) -> Result<()> {
+    let index = Index::load(directory)?;
+    let m = &index.manifest;
+    let features = m.features()?;
+    let groups: usize = m.banks.iter().map(|b| b.groups.len()).sum();
+    let logical_bits: usize = m.banks.iter().map(|b| b.slots * b.row_bits).sum();
+    let stack_bytes: usize = index.banks.iter().map(|b| b.data.len()).sum();
+    let fallback_bytes: usize = if m.version == 1 {
+        m.banks
+            .iter()
+            .flat_map(|b| &b.groups)
+            .map(|g| g.fallback_keys * 16)
+            .sum()
+    } else {
+        m.abandoned_hashes * 8 + m.abandoned_origins * 4
+    };
+    let metadata_bytes = fs::metadata(directory.join("manifest.json"))?.len() as usize
+        + index.banks.len() * 40
+        + if m.version == 1 {
+            groups * 8
+        } else if m.abandoned_file.is_some() {
+            8
+        } else {
+            0
+        };
+    let disk_bytes: u64 = fs::read_dir(directory)?
+        .map(|entry| entry.and_then(|entry| entry.metadata()).map(|m| m.len()))
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .sum();
+    println!("index\t{}\nk\t{}\nhashes\t{}\nseed\t{}\nfingerprint_bits\t{}\nindex_mode\t{}\ntechnical_layout\tmerge-pow2\ncolors\t{}\ngroups\t{}\nbanks\t{}",
+        directory.display(), m.k, m.hashes, m.seed, m.fingerprint_bits, features.mode.label(), m.colors.len(), groups, m.banks.len());
+    if features.mode == IndexMode::Findere {
+        println!(
+            "findere_z\t{}\nindexed_k\t{}",
+            features.findere_z,
+            m.k - features.findere_z
+        );
+    }
+    println!(
+        "minimizer_size\t{}\nmodimizer_sampling\t{}",
+        features.minimizer_size, features.modimizer_sampling
+    );
+    println!(
+        "merge_planner\t{}\nplanning_pair_evaluations\t{}\nplanning_possible_pair_evaluations\t{}\nmerge_reverts_enabled\t{}",
+        m.merge_planner.label(),
+        m.planning_pair_evaluations,
+        m.planning_possible_pair_evaluations,
+        m.merge_reverts_enabled
+    );
+    println!("construction_cell_storage\t{}", m.construction_cell_storage);
+    println!("merge_column_order\t{}", m.column_order.label());
+    println!("abandoned_recovery\t{}\nabandoned_hash_bits\t32\nabandoned_keys\t{}\nabandoned_unique_hashes\t{}\nabandoned_dataset_associations\t{}\nabandoned_map_ram_bytes\t{}",
+        m.abandoned_recovery,
+        m.banks.iter().flat_map(|b| &b.groups).map(|g| g.abandoned_keys.unwrap_or(g.fallback_keys)).sum::<usize>(),
+        index.abandoned.as_ref().map_or(0, OriginMap::len),
+        index.abandoned.as_ref().map_or(0, OriginMap::origins_len),
+        index.abandoned.as_ref().map_or(0, OriginMap::memory_bytes));
+    println!("logical_bits\t{}\npadding_bits\t{}\nstack_bytes\t{}\nstack_stored_bytes\t{}\nfallback_bytes\t{}\nstructure_bytes\t{}\nsingleton_logical_bits\t{}\npredicted_logical_bits\t{}\nplanned_groups\t{}\nrejected_groups\t{}\nexact_group_verifications\t{}\nsketch_seconds\t{:.6}\nplan_seconds\t{:.6}\nbuild_seconds\t{:.6}",
+        logical_bits, stack_bytes * 8 - logical_bits, stack_bytes, stack_bytes, fallback_bytes, stack_bytes + fallback_bytes,
+        m.singleton_logical_bits, m.predicted_logical_bits, m.planned_groups, m.rejected_groups, m.exact_group_verifications,
+        m.sketch_seconds, m.plan_seconds, m.build_seconds);
+    println!(
+        "metadata_bytes\t{}\nuncompressed_index_bytes\t{}\ndisk_bytes\t{}",
+        metadata_bytes,
+        stack_bytes + fallback_bytes + metadata_bytes,
+        disk_bytes
+    );
+    println!("bank\tslots\tgroups\trow_bits\tpadding_bits_per_row\tfallback_keys");
+    for b in &m.banks {
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            b.file,
+            b.slots,
+            b.groups.len(),
+            b.row_bits,
+            b.row_bits.div_ceil(8) * 8 - b.row_bits,
+            b.groups.iter().map(|g| g.fallback_keys).sum::<usize>()
+        );
+    }
+    println!("group\tslots\twidth\tunion_cardinality\tfallback_keys\tcolors");
+    let mut id = 0;
+    for b in &m.banks {
+        for g in &b.groups {
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                id,
+                b.slots,
+                g.width,
+                g.union_cardinality,
+                g.fallback_keys,
+                g.members
+                    .iter()
+                    .map(|&c| m.colors[c].name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            id += 1;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simd_screening_matches_scalar_including_zero_and_tails() {
+        for bits in [8, 16] {
+            for count in [1, 15, 16, 17, 31, 32, 33, 257] {
+                let row: Vec<_> = (0..count * bits / 8)
+                    .map(|i| splitmix64(i as u64) as u8)
+                    .collect();
+                for fp in [0, 1, 255, if bits == 8 { 128 } else { 65535 }] {
+                    let mut scalar = Vec::new();
+                    fingerprint_matches_scalar(&row, bits, fp, 0, &mut |i| scalar.push(i));
+                    let mut simd = Vec::new();
+                    fingerprint_matches(&row, bits, fp, |i| simd.push(i));
+                    assert_eq!(scalar, simd);
+                }
+                let mut hits = Vec::new();
+                fingerprint_matches(&vec![0; row.len()], bits, 0, |i| hits.push(i));
+                assert_eq!(hits, (0..count).collect::<Vec<_>>());
+            }
+        }
+    }
+
+    #[test]
+    fn wide_bit_packing_matches_bit_reference() {
+        for offset in 0usize..64 {
+            for width in 1..=64 {
+                let value = splitmix64((offset * 64 + width) as u64);
+                for bytes in [(offset + width).div_ceil(8), 24] {
+                    let mut reference = vec![0; bytes];
+                    for bit in 0..width {
+                        reference[(offset + bit) / 8] |=
+                            (((value >> bit) & 1) as u8) << ((offset + bit) % 8);
+                    }
+                    let mut actual = vec![0; bytes];
+                    put_bits(&mut actual, offset, width, value);
+                    assert_eq!(actual, reference);
+                }
+            }
+        }
+    }
+
+    fn temporary_stage() -> Staging {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("zor-column-test-{}-{stamp}", std::process::id()));
+        fs::create_dir(&path).unwrap();
+        Staging(path)
+    }
+
+    fn test_group(stage: &Staging, id: usize, width: usize, cells: &[u64]) -> BuiltGroup {
+        let path = stage.0.join(format!("{id}.u64"));
+        cache_write(&path, cells).unwrap();
+        BuiltGroup {
+            meta: GroupMeta {
+                members: vec![id],
+                width,
+                offset: 0,
+                union_cardinality: 1,
+                fallback_keys: 1,
+                abandoned_keys: Some(1),
+            },
+            slots: cells.len(),
+            cells: path,
+            fallback: vec![(id as u32, cells[0])],
+        }
+    }
+
+    #[test]
+    fn bounded_union_combines_origins_and_rejects_invalid_caches() {
+        let stage = temporary_stage();
+        fs::create_dir(stage.0.join("features")).unwrap();
+        let group = planner::Group {
+            members: vec![0, 1, 2],
+            cardinality: 5.0,
+            slots: 8,
+            width: 11,
+            sketch: Sketch::new(&[], 4096, 69),
+        };
+        cache_write(&cache_path(&stage.0, 0), &[1, 3, 5]).unwrap();
+        cache_write(&cache_path(&stage.0, 1), &[2, 3, 5]).unwrap();
+        cache_write(&cache_path(&stage.0, 2), &[]).unwrap();
+        assert_eq!(
+            union_features(&group, &stage.0).unwrap(),
+            (vec![1, 2, 3, 5], vec![1, 2, 3, 3])
+        );
+        cache_write(&cache_path(&stage.0, 2), &[3, 5]).unwrap();
+        assert_eq!(
+            union_features(&group, &stage.0).unwrap().1,
+            vec![1, 2, 7, 7]
+        );
+        cache_write(&cache_path(&stage.0, 2), &[5, 3]).unwrap();
+        assert!(union_features(&group, &stage.0).is_err());
+        cache_write(&cache_path(&stage.0, 2), &[3, 3]).unwrap();
+        assert!(union_features(&group, &stage.0).is_err());
+        fs::write(cache_path(&stage.0, 2), [1, 2, 3]).unwrap();
+        assert!(union_features(&group, &stage.0).is_err());
+    }
+
+    #[test]
+    fn sampled_order_keeps_widths_contiguous_and_stable_ties() {
+        let stage = temporary_stage();
+        let mut groups = vec![
+            test_group(&stage, 0, 18, &[9; 32]),
+            test_group(&stage, 1, 16, &[250; 32]),
+            test_group(&stage, 2, 18, &[3; 32]),
+            test_group(&stage, 3, 18, &[9; 32]),
+            test_group(&stage, 4, 16, &[2; 32]),
+        ];
+        order_columns(&mut groups, ColumnOrder::Compression).unwrap();
+        assert_eq!(
+            groups.iter().map(|g| g.meta.members[0]).collect::<Vec<_>>(),
+            [4, 1, 2, 0, 3]
+        );
+        order_columns(&mut groups, ColumnOrder::Width).unwrap();
+        assert_eq!(
+            groups.iter().map(|g| g.meta.members[0]).collect::<Vec<_>>(),
+            [1, 4, 0, 2, 3]
+        );
+    }
+
+    #[test]
+    fn tiled_planes_preserve_every_payload_across_banks() {
+        for fp_bits in [8, 16] {
+            let stage = temporary_stage();
+            let mut groups = Vec::new();
+            for (id, count) in [1, 2, 3, 64 - fp_bits].into_iter().enumerate() {
+                let width = fp_bits + if count == 1 { 0 } else { count };
+                let cells: Vec<_> = (0..8192)
+                    .map(|slot| {
+                        let value = splitmix64((id * 8192 + slot) as u64);
+                        if width == 64 {
+                            value
+                        } else {
+                            value & ((1 << width) - 1)
+                        }
+                    })
+                    .collect();
+                let mut group = test_group(&stage, id, width, &cells);
+                group.meta.members = (0..count).map(|m| id * 64 + m).collect();
+                groups.push(group);
+            }
+            let banks =
+                pack_banks_streaming(groups, ColumnOrder::Width, fp_bits, &stage.0).unwrap();
+            for meta in banks {
+                let mut reader = open_index_reader(&stage.0.join(&meta.file)).unwrap();
+                let mut header = [0; 40];
+                reader.read_exact(&mut header).unwrap();
+                assert_eq!(&header[..8], PLANE_MAGIC);
+                let mut data = Vec::new();
+                reader.read_to_end(&mut data).unwrap();
+                let stride = meta.row_bits.div_ceil(8);
+                for (slot, row) in data.chunks_exact(stride).enumerate() {
+                    for (i, group) in meta.groups.iter().enumerate() {
+                        let mut actual = get_bits(row, i * fp_bits, fp_bits);
+                        if group.width > fp_bits {
+                            actual |= get_bits(
+                                row,
+                                meta.groups.len() * fp_bits + group.offset - i * fp_bits,
+                                group.width - fp_bits,
+                            ) << fp_bits;
+                        }
+                        let id = group.members[0] / 64;
+                        let expected = splitmix64((id * 8192 + slot) as u64);
+                        let expected = if group.width == 64 {
+                            expected
+                        } else {
+                            expected & ((1 << group.width) - 1)
+                        };
+                        assert_eq!(actual, expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sampling_checks_cache_length_and_includes_filter_ends() {
+        let stage = temporary_stage();
+        for slots in [4, 16, 32, 1024] {
+            let cells: Vec<_> = (0..slots as u64).collect();
+            let mut group = test_group(&stage, slots, 16, &cells);
+            let sample = column_sample(&group).unwrap();
+            assert_eq!(u64::from_le_bytes(sample[..8].try_into().unwrap()), 0);
+            assert_eq!(
+                u64::from_le_bytes(sample[sample.len() - 8..].try_into().unwrap()),
+                slots as u64 - 1
+            );
+            assert!(sample.len() <= 1024);
+            group.slots *= 2;
+            assert!(column_sample(&group).is_err());
+        }
+    }
+
+    #[test]
+    fn compression_order_clusters_repeated_columns_and_preserves_payloads() {
+        let stage = temporary_stage();
+        let slots = 1024;
+        let mut patterns: Vec<_> = (0..64).map(|id| (id, splitmix64(id as u64))).collect();
+        patterns.sort_by_key(|&(_, hash)| hash);
+        let patterns: Vec<_> = patterns.into_iter().map(|(id, _)| id / 4).collect();
+        let make = |prefix: usize| {
+            patterns
+                .iter()
+                .enumerate()
+                .map(|(id, &pattern)| {
+                    let cells: Vec<_> = (0..slots)
+                        .map(|slot| splitmix64(slot as u64 ^ (pattern as u64 * 10007)) & 0xffff)
+                        .collect();
+                    let mut group = test_group(&stage, prefix + id, 16, &cells);
+                    group.meta.members = vec![id];
+                    group.fallback = vec![(id as u32, cells[0])];
+                    group
+                })
+                .collect()
+        };
+        let width = transpose(make(0), ColumnOrder::Width).unwrap().remove(0);
+        let compression = transpose(make(1000), ColumnOrder::Compression)
+            .unwrap()
+            .remove(0);
+        assert_eq!(width.data.len(), compression.data.len());
+        for (index, group) in compression.meta.groups.iter().enumerate() {
+            let id = group.members[0];
+            assert_eq!(compression.fallback[index], width.fallback[id]);
+            for slot in 0..slots {
+                let row = &compression.data[slot * 128..(slot + 1) * 128];
+                assert_eq!(
+                    get_bits(row, group.offset, group.width),
+                    get_bits(&width.data[slot * 128..(slot + 1) * 128], id * 16, 16)
+                );
+            }
+        }
+        let old_size = zstd::bulk::compress(&width.data, 3).unwrap().len();
+        let new_size = zstd::bulk::compress(&compression.data, 3).unwrap().len();
+        assert!(
+            new_size < old_size,
+            "width={old_size}, compression={new_size}"
+        );
+        eprintln!("repeated-column fixture zstd bytes: {old_size} -> {new_size}");
+    }
+    #[test]
+    fn bit_slices_cross_bytes_and_words_without_wasting_payload_bits() {
+        let mut row = vec![0; 48];
+        let mut offset = 0;
+        for width in [8, 18, 19, 64, 9, 63, 16] {
+            let value = if width == 64 {
+                u64::MAX
+            } else {
+                splitmix64(width as u64) & ((1u64 << width) - 1)
+            };
+            put_bits(&mut row, offset, width, value);
+            assert_eq!(get_bits(&row, offset, width), value);
+            offset += width;
+        }
+    }
+
+    fn union_index(key: u64, recovered: &[u32]) -> Index {
+        let seed = 69;
+        let group = GroupMeta {
+            members: vec![0, 1],
+            width: 10,
+            offset: 0,
+            union_cardinality: 1,
+            fallback_keys: usize::from(!recovered.is_empty()),
+            abandoned_keys: Some(usize::from(!recovered.is_empty())),
+        };
+        let meta = BankMeta {
+            file: "bank-2.zorbank.zst".into(),
+            fingerprint_first: false,
+            slots: 4,
+            row_bits: 10,
+            groups: vec![group],
+        };
+        let mut data = vec![0; 8];
+        let mut slots = [0; 2];
+        positions(key, 4, 2, seed, &mut slots);
+        // Arrange for the XOR filter to return only dataset 0.
+        put_bits(
+            &mut data[slots[0] * 2..(slots[0] + 1) * 2],
+            0,
+            10,
+            fingerprint(key, seed, 8) | (1 << 8),
+        );
+        let abandoned = if recovered.is_empty() {
+            None
+        } else {
+            let mut map = OriginMap::default();
+            map.push(abandoned::hash(key, seed), recovered).unwrap();
+            map.finish().unwrap();
+            Some(map)
+        };
+        let manifest = Manifest {
+            version: 2,
+            abandoned_recovery: !recovered.is_empty(),
+            abandoned_file: (!recovered.is_empty()).then(|| ABANDONED_FILE.into()),
+            abandoned_hashes: usize::from(!recovered.is_empty()),
+            abandoned_origins: recovered.len(),
+            backend: Backend::Zor,
+            k: 31,
+            hashes: 2,
+            seed,
+            fingerprint_bits: 8,
+            index_mode: IndexMode::Kmers.as_u8(),
+            minimizer_size: 31,
+            modimizer_sampling: 10,
+            findere_z: 10,
+            sketch_size: 64,
+            sketch_method: "test".into(),
+            merge_planner: MergePlanner::Streaming,
+            column_order: ColumnOrder::Width,
+            planning_pair_evaluations: 0,
+            planning_possible_pair_evaluations: 0,
+            merge_reverts_enabled: false,
+            construction_cell_storage: "temporary-disk-u64".into(),
+            slot_scale: 1.0,
+            singleton_logical_bits: 64,
+            predicted_logical_bits: 40,
+            planned_groups: 1,
+            rejected_groups: 0,
+            exact_group_verifications: 1,
+            sketch_seconds: 0.0,
+            plan_seconds: 0.0,
+            build_seconds: 0.0,
+            colors: ["a", "b"]
+                .into_iter()
+                .map(|name| Color {
+                    name: name.into(),
+                    path: name.into(),
+                    occurrences: 1,
+                    unique_kmers: 1,
+                })
+                .collect(),
+            banks: vec![meta.clone()],
+        };
+        Index {
+            manifest,
+            banks: vec![Bank {
+                meta,
+                data,
+                fallback: Vec::new(),
+            }],
+            abandoned,
+            row_scratch_bytes: 2,
+        }
+    }
+
+    #[test]
+    fn fingerprint_planes_preserve_legacy_lookup_and_abandoned_union() {
+        let mut legacy = union_index(123, &[1]);
+        let mut next = 0;
+        let mut offset = 0;
+        let groups: Vec<_> = (0..40)
+            .map(|i| {
+                let count = i % 3 + 1;
+                let members = (next..next + count).collect();
+                next += count;
+                let width = 8 + if count == 1 { 0 } else { count };
+                let group = GroupMeta {
+                    members,
+                    width,
+                    offset,
+                    union_cardinality: 0,
+                    fallback_keys: 0,
+                    abandoned_keys: Some(0),
+                };
+                offset += width;
+                group
+            })
+            .collect();
+        let stride = offset.div_ceil(8);
+        legacy.banks[0].meta.groups = groups;
+        legacy.banks[0].meta.row_bits = offset;
+        legacy.banks[0].data = vec![0; 4 * stride];
+        legacy.row_scratch_bytes = stride;
+        let mut planes = union_index(123, &[1]);
+        planes.banks[0].meta = legacy.banks[0].meta.clone();
+        planes.banks[0].meta.fingerprint_first = true;
+        planes.banks[0].data = vec![0; 4 * stride];
+        planes.row_scratch_bytes = 40;
+        let groups = legacy.banks[0].meta.groups.clone();
+        for slot in 0..4 {
+            for (i, g) in groups.iter().enumerate() {
+                let value = splitmix64((slot * 40 + i) as u64) & ((1 << g.width) - 1);
+                let old_row = &mut legacy.banks[0].data[slot * stride..(slot + 1) * stride];
+                let new_row = &mut planes.banks[0].data[slot * stride..(slot + 1) * stride];
+                put_bits(old_row, g.offset, g.width, value);
+                put_bits(new_row, i * 8, 8, value & 255);
+                if g.width > 8 {
+                    put_bits(new_row, 320 + g.offset - i * 8, g.width - 8, value >> 8);
+                }
+            }
+        }
+        let mut old_scratch = Vec::new();
+        let mut new_scratch = Vec::new();
+        for key in 0..20000 {
+            let mut old = vec![0; next];
+            let mut new = vec![0; next];
+            legacy.lookup(key, &mut old, &mut old_scratch);
+            planes.lookup(key, &mut new, &mut new_scratch);
+            assert_eq!(old, new, "key {key}");
+        }
+    }
+
+    #[test]
+    fn recovery_adds_origins_never_overwrites_and_counts_each_origin_once() {
+        for (recovered, expected) in [
+            (&[][..], [1, 0]),
+            (&[0][..], [1, 0]),
+            (&[1][..], [1, 1]),
+            (&[0, 1][..], [1, 1]),
+        ] {
+            let index = union_index(123, recovered);
+            let mut scores = [0; 2];
+            let mut scratch = Vec::new();
+            index.lookup(123, &mut scores, &mut scratch);
+            assert_eq!(scores, expected);
+            index.lookup(123, &mut scores, &mut scratch);
+            assert_eq!(scores, expected.map(|n| n * 2));
+        }
+    }
+
+    #[test]
+    fn hash_collisions_union_origins_across_groups_and_deduplicate() {
+        // Two distinct input keys with the same *actual* 32-bit hash at seed 69.
+        let a = 83_843;
+        let b = 95_900;
+        let hash = abandoned::hash(a, 69);
+        assert_eq!(hash, abandoned::hash(b, 69));
+        let mut records = vec![(hash, 0, 1), (hash, 1, 1), (hash, 0, 1), (hash, 0, 2)];
+        let mut map = OriginMap::default();
+        let stats = visit_abandoned(&mut records, &[vec![2, 0], vec![1]], |hash, origins| {
+            map.push(hash, origins)
+        })
+        .unwrap();
+        map.finish().unwrap();
+        assert_eq!(stats, (1, 3));
+        assert_eq!(map.get(abandoned::hash(a, 69)), [0, 1, 2]);
+        assert_eq!(map.get(abandoned::hash(b, 69)), [0, 1, 2]);
+        // There is no original 64-bit key check gating recovery.
+        let mut index = union_index(a, &[]);
+        let mut colliding_map = OriginMap::default();
+        colliding_map.push(abandoned::hash(b, 69), &[1]).unwrap();
+        colliding_map.finish().unwrap();
+        index.abandoned = Some(colliding_map);
+        let mut scores = [0; 2];
+        index.lookup(a, &mut scores, &mut Vec::new());
+        assert_eq!(scores, [1, 1]);
+    }
+
+    #[test]
+    fn global_map_roundtrip_and_skip_loading() {
+        let stage = temporary_stage();
+        let key = 123;
+        let mut index = union_index(key, &[1]);
+        index.banks[0].fallback = vec![vec![(abandoned::hash(key, 69), 2)]];
+        let stats = save_abandoned(&mut index.banks, &stage.0).unwrap();
+        assert_eq!(stats, (1, 1));
+        assert!(index.banks[0].fallback.is_empty());
+        save_bank(&index.banks[0], &stage.0).unwrap();
+        serde_json::to_writer(
+            File::create(stage.0.join("manifest.json")).unwrap(),
+            &index.manifest,
+        )
+        .unwrap();
+        let bytes = zstd::decode_all(File::open(stage.0.join(ABANDONED_FILE)).unwrap()).unwrap();
+        assert_eq!(bytes.len(), 8 + 4 + 4 + 4); // magic, hash32, count32, dataset32
+        assert_eq!(&bytes[8..12], &abandoned::hash(key, 69).to_le_bytes());
+        let loaded = Index::load(&stage.0).unwrap();
+        assert!(loaded.banks.iter().all(|bank| bank.fallback.is_empty()));
+        let mut scores = [0; 2];
+        loaded.lookup(key, &mut scores, &mut Vec::new());
+        assert_eq!(scores, [1, 1]);
+        fs::remove_file(stage.0.join(ABANDONED_FILE)).unwrap();
+        let skipped = Index::load_with_recovery(&stage.0, false).unwrap();
+        assert!(skipped.abandoned.is_none());
+        let mut scores = [0; 2];
+        skipped.lookup(key, &mut scores, &mut Vec::new());
+        assert_eq!(scores, [1, 0]);
+        assert!(Index::load(&stage.0).is_err());
+    }
+
+    #[test]
+    fn map_postings_are_checked_for_invalid_or_duplicate_dataset_ids() {
+        let stage = temporary_stage();
+        let mut index = union_index(123, &[1]);
+        save_bank(&index.banks[0], &stage.0).unwrap();
+        let corrupt_origins: [&[u32]; 4] = [&[2], &[1, 1], &[1, 0], &[]];
+        for origins in corrupt_origins {
+            index.manifest.abandoned_origins = origins.len();
+            serde_json::to_writer(
+                File::create(stage.0.join("manifest.json")).unwrap(),
+                &index.manifest,
+            )
+            .unwrap();
+            let mut writer = create_index_writer(&stage.0.join(ABANDONED_FILE)).unwrap();
+            writer.write_all(ABANDONED_MAGIC).unwrap();
+            writer
+                .write_all(&abandoned::hash(123, 69).to_le_bytes())
+                .unwrap();
+            writer
+                .write_all(&(origins.len() as u32).to_le_bytes())
+                .unwrap();
+            for &origin in origins {
+                writer.write_all(&origin.to_le_bytes()).unwrap();
+            }
+            finish_index_writer(writer).unwrap();
+            assert!(Index::load(&stage.0).is_err(), "origins={origins:?}");
+        }
+    }
+
+    #[test]
+    fn one_map_recovers_across_banks_with_different_row_widths() {
+        let stage = temporary_stage();
+        let key = 123;
+        let mut index = union_index(key, &[1]);
+        index.banks[0].fallback = vec![vec![(abandoned::hash(key, 69), 2)]];
+        let meta = BankMeta {
+            file: "bank-3.zorbank.zst".into(),
+            fingerprint_first: false,
+            slots: 8,
+            row_bits: 8,
+            groups: vec![GroupMeta {
+                members: vec![2],
+                width: 8,
+                offset: 0,
+                union_cardinality: 1,
+                fallback_keys: 1,
+                abandoned_keys: Some(1),
+            }],
+        };
+        let mut slots = [0; 2];
+        positions(key, 8, 2, 69, &mut slots);
+        let mut data = vec![0; 8];
+        data[slots[0]] = fingerprint(key, 69, 8) as u8;
+        index.banks.push(Bank {
+            meta: meta.clone(),
+            data,
+            fallback: vec![vec![(abandoned::hash(key, 69), 1)]],
+        });
+        index.manifest.banks.push(meta);
+        index.manifest.colors.push(Color {
+            name: "c".into(),
+            path: "c".into(),
+            occurrences: 1,
+            unique_kmers: 1,
+        });
+        let (hashes, origins) = save_abandoned(&mut index.banks, &stage.0).unwrap();
+        assert_eq!((hashes, origins), (1, 2));
+        index.manifest.abandoned_hashes = hashes;
+        index.manifest.abandoned_origins = origins;
+        for bank in &index.banks {
+            save_bank(bank, &stage.0).unwrap();
+        }
+        serde_json::to_writer(
+            File::create(stage.0.join("manifest.json")).unwrap(),
+            &index.manifest,
+        )
+        .unwrap();
+        let loaded = Index::load(&stage.0).unwrap();
+        assert_eq!(
+            loaded
+                .abandoned
+                .as_ref()
+                .unwrap()
+                .get(abandoned::hash(key, 69)),
+            [1, 2]
+        );
+        let mut scores = [0; 3];
+        let mut scratch = Vec::new();
+        loaded.lookup(key, &mut scores, &mut scratch);
+        assert_eq!(scores, [1, 1, 1]);
+        loaded.lookup(key, &mut scores, &mut scratch);
+        assert_eq!(scores, [2, 2, 2]);
+        let skipped = Index::load_with_recovery(&stage.0, false).unwrap();
+        let mut raw = [0; 3];
+        skipped.lookup(key, &mut raw, &mut scratch);
+        assert_eq!(raw, [1, 0, 1]);
+    }
+
+    #[test]
+    fn legacy_per_group_fallback_is_converted_to_one_32_bit_map() {
+        let stage = temporary_stage();
+        let key = 123;
+        let mut index = union_index(key, &[1]);
+        index.manifest.version = 1;
+        index.manifest.abandoned_file = None;
+        index.manifest.abandoned_hashes = 0;
+        index.manifest.abandoned_origins = 0;
+        index.manifest.banks[0].groups[0].abandoned_keys = None;
+        let bank = &index.banks[0];
+        let mut writer = create_index_writer(&stage.0.join(&bank.meta.file)).unwrap();
+        writer.write_all(MAGIC).unwrap();
+        for n in [
+            bank.meta.slots,
+            bank.meta.row_bits,
+            bank.meta.groups.len(),
+            bank.data.len(),
+        ] {
+            writer.write_all(&(n as u64).to_le_bytes()).unwrap();
+        }
+        writer.write_all(&bank.data).unwrap();
+        writer.write_all(&1u64.to_le_bytes()).unwrap();
+        writer.write_all(&key.to_le_bytes()).unwrap();
+        writer
+            .write_all(&(fingerprint(key, 69, 8) | (2 << 8)).to_le_bytes())
+            .unwrap();
+        finish_index_writer(writer).unwrap();
+        serde_json::to_writer(
+            File::create(stage.0.join("manifest.json")).unwrap(),
+            &index.manifest,
+        )
+        .unwrap();
+        let loaded = Index::load(&stage.0).unwrap();
+        assert_eq!(
+            loaded
+                .abandoned
+                .as_ref()
+                .unwrap()
+                .get(abandoned::hash(key, 69)),
+            [1]
+        );
+        assert!(loaded.banks[0].fallback.is_empty());
+        let mut scores = [0; 2];
+        loaded.lookup(key, &mut scores, &mut Vec::new());
+        assert_eq!(scores, [1, 1]);
+        let skipped = Index::load_with_recovery(&stage.0, false).unwrap();
+        assert!(skipped.abandoned.is_none());
+    }
+}

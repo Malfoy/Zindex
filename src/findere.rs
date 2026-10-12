@@ -331,9 +331,9 @@ mod tests {
                             Ordering::Relaxed,
                         );
                         calls.fetch_add(1, Ordering::Relaxed);
-                            let probed = *local % 2 == 0;
-                            hits[0] = u64::from(probed);
-                            probed
+                        let probed = *local % 2 == 0;
+                        hits[0] = u64::from(probed);
+                        probed
                     },
                 )
                 .unwrap()

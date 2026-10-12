@@ -10,6 +10,7 @@ use helicase::{Config, FastxParser, HelicaseParser, ParserOptions};
 use simd_minimizers::packed_seq::{PackedSeqVec, SeqVec};
 
 pub mod findere;
+pub mod power_merge;
 
 pub const MAX_HASHES: usize = 32;
 pub const DEFAULT_MINIMIZER_SIZE: usize = 21;
@@ -158,7 +159,8 @@ pub fn color_name_from_path(path: &Path) -> String {
         .unwrap_or("color")
         .to_string();
     for ext in [
-        ".zstd", ".zst", ".gzip", ".gz", ".fasta", ".fastq", ".fna", ".fa", ".fq", ".fas",
+        ".zstd", ".zst", ".gzip", ".gz", ".xz", ".bz2", ".bz", ".bzip2", ".fasta", ".fastq",
+        ".fna", ".fa", ".fq", ".fas",
     ] {
         if let Some(stripped) = name.strip_suffix(ext) {
             name = stripped.to_string();
@@ -259,7 +261,7 @@ pub fn is_compressed_path(path: &Path) -> bool {
         .map(|extension| {
             matches!(
                 extension.to_ascii_lowercase().as_str(),
-                "gz" | "gzip" | "zst" | "zstd"
+                "gz" | "gzip" | "zst" | "zstd" | "xz" | "bz2" | "bz" | "bzip2"
             )
         })
         .unwrap_or(false)
@@ -503,6 +505,10 @@ mod tests {
         };
     }
 
+    compressed_path_case!(compressed_xz, "a.fa.xz", true);
+    compressed_path_case!(compressed_bz2, "a.fa.bz2", true);
+    compressed_path_case!(compressed_bz, "a.fa.bz", true);
+    compressed_path_case!(compressed_bzip2, "a.fa.bzip2", true);
     compressed_path_case!(compressed_gz, "a.fa.gz", true);
     compressed_path_case!(compressed_gzip, "a.fa.gzip", true);
     compressed_path_case!(compressed_zst, "a.fa.zst", true);

@@ -1,0 +1,39 @@
+1024 bacterial genomes, minimizers k=49/m=31, scale=1.0, 32 threads
+Two sequential builds per version; five queries per workload after warmup; alternating order.
+All atomic membership and aggregate count outputs identical.
+build seconds: before=24.775000, after=20.255000, change=-18.24%
+present seconds: before=3.335796, after=2.743087, change=-17.77%
+absent seconds: before=0.306521, after=0.231731, change=-24.40%
+before: build peak RSS KiB=4780296.0, index bytes=547295883, logical bits=4521197568
+after: build peak RSS KiB=2362932.0, index bytes=542417917, logical bits=4521197568
+present end-to-end seconds (including index loading): before=3.940000, after=3.540000, change=-10.15%
+absent end-to-end seconds (including index loading): before=0.930000, after=1.020000, change=9.68%
+Query kernel timings include gzip parsing/feature extraction, but exclude index loading.
+The short negative-query process time regressed; startup/loading overhead outweighed its faster query kernel.
+
+Collection: 1,024 bacterial genomes, 3,737,742,181 bases; 369,752,271 summed distinct minimizers.
+Minimizer occurrences/base: 0.0998445679 (approximately one in ten).
+Positive workload: 102,400 x 1kb reads, 9,838,509 minimizer probes.
+Negative workload: 10,000 x 1kb random reads, 960,888 minimizer probes.
+Atomic comparison: 85,536 feature probes x 1,024 origins = 87,588,864 membership outputs, all identical.
+Abandoned-key global multimap compressed bytes are identical (SHA256 6b5b7d6648df9b8928362680cc5675b383c5899d6d7563342a17461c60e05854).
+Peak build RSS: 4.558846 GiB -> 2.253468 GiB (-50.57%).
+Stored index size: 521.942027 MiB -> 517.290036 MiB (-0.89%).
+Logical filter bit budget is unchanged: 4,521,197,568 bits.
+Query RAM is effectively unchanged (approximately 715 MiB positive, 626 MiB negative).
+The timings measure the four optimizations together; no per-optimization attribution is claimed.
+
+Stored power-of-two subindexes (same before and after):
+2^18: 69 groups, 145 datasets
+2^19: 178 groups, 459 datasets
+2^20: 91 groups, 312 datasets
+2^21: 13 groups, 108 datasets
+Total: 4 subindexes, 351 groups, 1,024 datasets.
+
+Source snapshots, binary hashes, input SHA256 identities, exact commands, individual timing samples,
+per-feature matrices and output counts are retained locally under
+experiments/implementation_optimizations/run-20261009-mhfTTd/ (not included in Git).
+New indexes use layout version 3; the updated reader accepts old versions 1 and 2.
+Validation: 200 current production tests and 45 frozen-after benchmark adapter tests passed.
+Two additional tests and documentation updates were added after freezing the after-source;
+the measured production implementation is unchanged.
