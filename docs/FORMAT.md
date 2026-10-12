@@ -107,7 +107,9 @@ count each color at most once per feature.
 
 ## Zindex power-of-two merged directory
 
-`--power-of-two-merge` writes a new directory rather than a `.zoridx` file.
+Zindex builds a new merged directory by default, regardless of the output
+extension. `--plain` selects the legacy single-file `.zoridx` layout;
+`--power-of-two-merge` remains an optional compatibility flag.
 `manifest.json` contains version `3`, feature/hash settings, dataset identities,
 group members and widths, bank sizes and abandoned-key map metadata.
 

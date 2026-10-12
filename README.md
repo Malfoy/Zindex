@@ -3,7 +3,8 @@
 ZORINDEX contains two Rust command-line indexes for approximate colored
 k-mer queries over many FASTA/FASTQ datasets:
 
-- `zorindex`: Zindex, an interleaved stack of per-color pure ZOR filters.
+- `zorindex`: Zindex, merged colored power-of-two ZOR banks by default;
+  `--plain` selects the legacy interleaved per-color stack.
 - `bloomindex`: Bindex, a matching interleaved stack of per-color Bloom filters.
 
 Both binaries use the same input format, DNA feature extraction code, canonical
@@ -95,14 +96,15 @@ length is 21. The canonical SIMD minimizer backend requires odd `k`.
 Examples:
 
 ```bash
-zorindex build --fof samples.fof --k 31 --output samples.zoridx
+zorindex build --fof samples.fof --k 31 --output samples.zindex
 zorindex build --fof samples.fof --k 63 --index-mode minimizers \
-  --minimizer-size 21 --output samples.m21.zoridx
+  --minimizer-size 21 --output samples.m21.zindex
 zorindex build --fof samples.fof --k 31 --index-mode modimizers \
-  --modimizer-sampling 16 --output samples.mod16.zoridx
+  --modimizer-sampling 16 --output samples.mod16.zindex
 ```
 
-The feature mode is stored in the index and reused by `query` and `append`.
+The feature mode is stored in the index and reused by `query`. Legacy `--plain`
+indexes also support `append`; merged directories currently require a rebuild.
 
 ### Findere
 
@@ -113,12 +115,12 @@ For example, `--k 31` indexes 21-mers and requires 11 consecutive 21-mer hits
 in the **same dataset** to report one 31-mer match.
 
 ```bash
-zorindex build --fof samples.fof --k 31 --index-mode findere --output samples.findere.zoridx
+zorindex build --fof samples.fof --k 31 --index-mode findere --output samples.findere.zindex
 bloomindex build --fof samples.fof --k 31 --index-mode findere --output samples.findere.blmidx
 
-# Override z; query and append automatically reuse the stored setting.
-zorindex build --fof samples.fof --k 31 --index-mode findere --findere-z 3 --output samples.z3.zoridx
-zorindex query --index samples.findere.zoridx --query reads.fa
+# Override z; query automatically reuses the stored setting.
+zorindex build --fof samples.fof --k 31 --index-mode findere --findere-z 3 --output samples.z3.zindex
+zorindex query --index samples.findere.zindex --query reads.fa
 bloomindex query --index samples.findere.blmidx --query reads.fa
 ```
 
@@ -155,8 +157,21 @@ and ZOR repack operations.
 
 ## Zindex
 
-Zindex builds one pure ZOR filter per color and stores the color filters in a
-slot-major interleaved layout:
+Zindex builds merged colored power-of-two banks by default, using streaming
+planning, compression column ordering, sizing factor **1.0**, `most-deg2` cycle
+breaking and `tie-scan=8`. Four hash locations are the default. These settings
+do not need to be repeated on the command line:
+
+```bash
+zorindex build --fof samples.fof --output samples.zindex \
+  --k 49 --index-mode minimizers --minimizer-size 31 --fingerprint-bits 16
+zorindex query --index samples.zindex --query reads.fa.gz
+zorindex info --index samples.zindex
+```
+
+`--output` must name a new directory, regardless of its extension. To use the
+legacy single-stack layout instead, pass **`--plain`**. This builds one pure ZOR
+filter per color and stores them in a slot-major interleaved layout:
 
 ```text
 slot 0: color 0 fingerprint, color 1 fingerprint, ...
@@ -171,13 +186,10 @@ the later SIMD/chunked XOR path straightforward.
 
 ```bash
 zorindex build \
+  --plain \
   --fof samples.fof \
   --k 31 \
-  --hashes 4 \
   --fingerprint-bits 16 \
-  --slot-scale 1.0 \
-  --cycle-break most-deg2 \
-  --tie-scan 8 \
   --output samples.zoridx
 ```
 
@@ -195,8 +207,7 @@ Important options:
 
 ```bash
 zorindex append --index samples.zoridx --fof more_samples.fof \
-  --output samples.extended.zoridx \
-  --cycle-break most-deg2
+  --output samples.extended.zoridx
 ```
 
 Append reuses the original `k`, hash count, seed, layout, fingerprint width,
@@ -224,11 +235,10 @@ color_name  hits  total_features  hit_ratio
 zorindex info --index samples.zoridx
 ```
 
-### Zindex: merge-only power-of-two banks (experimental)
+### Zindex: default merged power-of-two banks
 
 ```bash
-zorindex build --fof samples.fof --k 31 --fingerprint-bits 16 \
-  --slot-scale 1.0 --power-of-two-merge --output samples.pow2
+zorindex build --fof samples.fof --k 31 --fingerprint-bits 16 --output samples.pow2
 zorindex info --index samples.pow2
 zorindex query --threads 4 --index samples.pow2 --query query.fa.gz
 ```
@@ -294,7 +304,7 @@ datasets (packed 32-bit IDs). Its open-addressed directory is queried once per
 feature, not once per group. Hash collisions union the originating dataset lists;
 there is no full-key collision check. Recovery adds to the filter's hits and never
 overwrites them; each dataset is counted once per queried feature.
-`build --power-of-two-merge --drop-abandoned` omits both recovery storage and lookup,
+`build --drop-abandoned` omits both recovery storage and lookup,
 accepting missing abandoned features. `query --ignore-abandoned` skips loading and
 querying the map of an existing merged index. Recovery is enabled by default.
 Version-1 and version-2 merged indexes remain readable. Version-1 fallback records are

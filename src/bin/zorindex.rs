@@ -67,6 +67,10 @@ struct BuildArgs {
     #[command(flatten)]
     merge: zorindex::power_merge::MergeArgs,
 
+    /// Use the legacy single-stack index instead of the default merged power-of-two banks.
+    #[arg(long, conflicts_with_all = ["power_of_two_merge", "drop_abandoned", "disabled"])]
+    plain: bool,
+
     /// File containing one input FASTA/FASTQ path per line, or name<TAB>path.
     #[arg(long)]
     fof: PathBuf,
@@ -121,11 +125,11 @@ struct BuildArgs {
     segment_length: Option<usize>,
 
     /// Cycle-breaking heuristic used when the pure ZOR peel reaches a core.
-    #[arg(long, value_enum, default_value = "no-heuristic")]
+    #[arg(long, value_enum, default_value = "most-deg2")]
     cycle_break: CycleBreakHeuristic,
 
     /// Number of tied min-degree cells to scan for heuristic cycle breaking.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 8)]
     tie_scan: usize,
 
     /// Add a separate union pure ZOR filter for graph/topology negative checks.
@@ -172,11 +176,11 @@ struct AppendArgs {
     output: Option<PathBuf>,
 
     /// Cycle-breaking heuristic used for newly appended color layers.
-    #[arg(long, value_enum, default_value = "no-heuristic")]
+    #[arg(long, value_enum, default_value = "most-deg2")]
     cycle_break: CycleBreakHeuristic,
 
     /// Number of tied min-degree cells to scan for heuristic cycle breaking.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 8)]
     tie_scan: usize,
 
     /// Override stack compression for the output index.
@@ -548,22 +552,22 @@ fn main() -> Result<()> {
 
 fn build_command(args: BuildArgs) -> Result<()> {
     validate_build_args(&args)?;
-    if args.merge.power_of_two_merge {
+    if args.merge.power_of_two_merge && !args.plain {
         ensure!(
             args.technical_layout == TechnicalLayoutMode::Flat,
-            "power-of-two merging cannot be combined with --technical-layout split-large"
+            "power-of-two merging cannot be combined with --technical-layout split-large; use --plain for the legacy layout"
         );
         ensure!(
             !args.union_graph,
-            "power-of-two banks do not yet support --union-graph"
+            "power-of-two banks do not yet support --union-graph; use --plain for the legacy layout"
         );
         ensure!(
             args.stack_compression == StackCompression::None,
-            "power-of-two banks currently support plain slices only (files are zstd compressed)"
+            "power-of-two banks currently support plain slices only (files are zstd compressed); use --plain for legacy stack codecs"
         );
         ensure!(
             args.segment_length.is_none(),
-            "power-of-two banks select their segment length automatically"
+            "power-of-two banks select their segment length automatically; use --plain for manual segment lengths"
         );
         let config = zorindex::power_merge::BuildConfig {
             backend: zorindex::power_merge::Backend::Zor,
@@ -4543,6 +4547,104 @@ mod tests {
     use zorindex::{scan_canonical_kmers, ZSTD_FRAME_MAGIC};
 
     #[test]
+    fn cli_defaults_choose_optimized_merged_layout_and_allow_plain_opt_out() {
+        let base = [
+            "zorindex",
+            "build",
+            "--fof",
+            "samples.fof",
+            "--output",
+            "samples.zindex",
+            "--k",
+            "49",
+        ];
+        let Command::Build(defaults) = Cli::try_parse_from(base).unwrap().command else {
+            panic!()
+        };
+        assert!(defaults.merge.power_of_two_merge);
+        assert!(!defaults.plain);
+        assert_eq!(
+            defaults.merge.planner,
+            zorindex::power_merge::MergePlanner::Streaming
+        );
+        assert_eq!(
+            defaults.merge.column_order,
+            zorindex::power_merge::ColumnOrder::Compression
+        );
+        assert_eq!(defaults.slot_scale, 1.0);
+        assert_eq!(defaults.cycle_break, CycleBreakHeuristic::MostDeg2);
+        assert_eq!(defaults.tie_scan, 8);
+
+        let Command::Build(plain) = Cli::try_parse_from(base.into_iter().chain(["--plain"]))
+            .unwrap()
+            .command
+        else {
+            panic!()
+        };
+        assert!(plain.plain);
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain(["--plain", "--power-of-two-merge"]))
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain(["--plain", "--drop-abandoned"])).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain(["--plain", "--merge-disabled"])).is_err()
+        );
+        let Command::Build(dropped) =
+            Cli::try_parse_from(base.into_iter().chain(["--drop-abandoned"]))
+                .unwrap()
+                .command
+        else {
+            panic!()
+        };
+        assert!(dropped.merge.drop_abandoned);
+
+        let Command::Build(custom) = Cli::try_parse_from(base.into_iter().chain([
+            "--merge-planner",
+            "all-pairs",
+            "--merge-column-order",
+            "width",
+            "--cycle-break",
+            "no-heuristic",
+            "--tie-scan",
+            "1",
+        ]))
+        .unwrap()
+        .command
+        else {
+            panic!()
+        };
+        assert_eq!(
+            custom.merge.planner,
+            zorindex::power_merge::MergePlanner::AllPairs
+        );
+        assert_eq!(
+            custom.merge.column_order,
+            zorindex::power_merge::ColumnOrder::Width
+        );
+        assert_eq!(custom.cycle_break, CycleBreakHeuristic::NoHeuristic);
+        assert_eq!(custom.tie_scan, 1);
+
+        let Command::Append(append) = Cli::try_parse_from([
+            "zorindex",
+            "append",
+            "--index",
+            "old.zoridx",
+            "--fof",
+            "more.fof",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!()
+        };
+        assert_eq!(append.cycle_break, CycleBreakHeuristic::MostDeg2);
+        assert_eq!(append.tie_scan, 8);
+    }
+
+    #[test]
     fn compact_graph_preserves_lazy_heap_decisions() {
         for n in [0usize, 17, 129, 513] {
             let keys: Vec<_> = (0..n).map(|i| splitmix64(i as u64)).collect();
@@ -4922,6 +5024,7 @@ mod tests {
 
         build_command(BuildArgs {
             merge: zorindex::power_merge::MergeArgs::default(),
+            plain: true,
             fof: build_fof,
             k: 5,
             output: index_path.clone(),

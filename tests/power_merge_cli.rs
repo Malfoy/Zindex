@@ -97,6 +97,108 @@ fn build(fof: &str, output: &str, extra: &[&str]) {
 }
 
 #[test]
+fn short_default_command_matches_explicit_optimized_settings() {
+    let f = Fixture::new();
+    let shared = dna(1100, 42);
+    let mut inputs = String::new();
+    for id in 0..4 {
+        let private = dna(100, id + 69);
+        let path = f.write(
+            &format!("default-{id}.fa"),
+            format!(">shared\n{shared}\n>private\n{private}\n"),
+        );
+        inputs.push_str(&format!("{id}\t{path}\n"));
+    }
+    let fof = f.write("defaults.fof", inputs);
+    let query = f.write("query.fa", format!(">query\n{shared}\n"));
+    let explicit = [
+        "--power-of-two-merge",
+        "--merge-planner",
+        "streaming",
+        "--merge-column-order",
+        "compression",
+        "--hashes",
+        "4",
+        "--slot-scale",
+        "1.0",
+        "--cycle-break",
+        "most-deg2",
+        "--tie-scan",
+        "8",
+    ];
+    let mut indexes = Vec::new();
+    let mut outputs = Vec::new();
+    for (label, settings) in [("default", &[][..]), ("explicit", &explicit[..])] {
+        let index = f.path(label);
+        let mut args = vec![
+            "build",
+            "--fof",
+            &fof,
+            "--output",
+            &index,
+            "--k",
+            "49",
+            "--index-mode",
+            "minimizers",
+            "--minimizer-size",
+            "31",
+            "--fingerprint-bits",
+            "16",
+        ];
+        args.extend(settings);
+        ok(&args, "4");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(Path::new(&index).join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["merge_planner"], "streaming");
+        assert_eq!(manifest["column_order"], "compression");
+        assert_eq!(manifest["abandoned_recovery"], true);
+        assert_eq!(manifest["rejected_groups"], 0);
+        let result = ok(&["query", "--index", &index, "--query", &query], "4");
+        outputs.push(
+            result
+                .lines()
+                .filter(|line| !line.starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        indexes.push(index);
+    }
+    assert_eq!(outputs[0], outputs[1]);
+    for entry in fs::read_dir(&indexes[0]).unwrap() {
+        let name = entry.unwrap().file_name();
+        if name == "manifest.json" {
+            continue;
+        }
+        assert_eq!(
+            fs::read(Path::new(&indexes[0]).join(&name)).unwrap(),
+            fs::read(Path::new(&indexes[1]).join(&name)).unwrap(),
+            "{name:?}"
+        );
+    }
+
+    let dropped = f.path("drop-default");
+    ok(
+        &[
+            "build",
+            "--fof",
+            &fof,
+            "--output",
+            &dropped,
+            "--k",
+            "31",
+            "--drop-abandoned",
+        ],
+        "4",
+    );
+    let m: serde_json::Value =
+        serde_json::from_slice(&fs::read(Path::new(&dropped).join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(m["abandoned_recovery"], false);
+    assert!(!Path::new(&dropped).join("abandoned.zormap.zst").exists());
+}
+
+#[test]
 fn merged_origins_and_serialized_size_classes_query_correctly() {
     let f = Fixture::new();
     let common = dna(700, 17);

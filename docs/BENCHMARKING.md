@@ -31,17 +31,18 @@ sample_0002	/path/to/genome_0002.fa.zst
   --k 63 \
   --index-mode minimizers \
   --minimizer-size 21 \
-  --hashes 4 \
-  --fingerprint-bits 8 \
-  --cycle-break most-deg2 \
-  --tie-scan 8 \
-  --stack-compression none \
-  --output results/samples.zoridx
+  --output results/samples.zindex
 ```
 
-Compressed-stack example:
+This uses merged power-of-two banks, streaming planning, compression column
+ordering, slot-scale 1.0, most-deg2 and tie-scan 8 by default.
+
+Compressed-stack example (requires the legacy single-stack layout):
 
 ```bash
+target/release/zorindex build --plain --fof samples.fof \
+  --k 63 --index-mode minimizers --minimizer-size 21 \
+  --output results/samples.zoridx
 /usr/bin/time -v target/release/zorindex --threads "$(nproc)" repack \
   --index results/samples.zoridx \
   --stack-compression lz4-hc \
@@ -82,7 +83,7 @@ Use the same query file for every index:
 
 ```bash
 /usr/bin/time -v target/release/zorindex --threads "$(nproc)" query \
-  --index results/samples.zoridx \
+  --index results/samples.zindex \
   --query queries.fa.zst \
   --min-ratio 0 > results/zor.query.tsv
 

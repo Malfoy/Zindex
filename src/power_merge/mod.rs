@@ -1,4 +1,4 @@
-//! Opt-in merge-only colored indexes with one slot-major bank per power of two.
+//! Merge-only colored indexes with one slot-major bank per power of two.
 mod abandoned;
 mod graph;
 mod planner;
@@ -55,8 +55,8 @@ impl MergePlanner {
 
 #[derive(Args, Clone, Debug)]
 pub struct MergeArgs {
-    /// Build a directory containing one merged index bank per power-of-two cell count.
-    #[arg(long)]
+    /// Compatibility flag: merged power-of-two banks are already the default.
+    #[arg(long, action = clap::ArgAction::SetTrue, default_value_t = true)]
     pub power_of_two_merge: bool,
     /// Streaming uses lossless size/origin pruning; streaming-unpruned retains the original scan.
     #[arg(long = "merge-planner", value_enum, default_value_t = MergePlanner::Streaming)]
@@ -78,13 +78,13 @@ pub struct MergeArgs {
     pub disabled: bool,
     /// Omit abandoned-key recovery storage and lookup (merged indexes only).
     /// Abandoned features may then be missed.
-    #[arg(long, requires = "power_of_two_merge")]
+    #[arg(long, conflicts_with = "plain")]
     pub drop_abandoned: bool,
 }
 impl Default for MergeArgs {
     fn default() -> Self {
         Self {
-            power_of_two_merge: false,
+            power_of_two_merge: true,
             planner: MergePlanner::Streaming,
             column_order: ColumnOrder::Compression,
             sketch_size: 4096,

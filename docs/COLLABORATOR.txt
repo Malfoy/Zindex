@@ -19,22 +19,23 @@ Example:
 Recommended merged Zindex minimizer build (approximately one minimizer per
 ten valid sequence positions, depending on the input):
   ./target/release/zorindex build --fof samples.fof --output samples.zindex \
-    --power-of-two-merge --merge-planner streaming --merge-column-order compression \
     --k 49 --index-mode minimizers --minimizer-size 31 \
-    --hashes 4 --fingerprint-bits 16 --slot-scale 1.0 \
-    --cycle-break most-deg2 --tie-scan 8
+    --fingerprint-bits 16
   ./target/release/zorindex query --index samples.zindex --query reads.fasta.gz
   ./target/release/zorindex info --index samples.zindex
+
+Zindex defaults to merged power-of-two banks, streaming planning, compression
+column ordering, slot-scale 1.0, most-deg2 cycle breaking, tie-scan 8 and 4 hashes.
+The old --power-of-two-merge flag still works but is unnecessary.
 
 All-pairs planner comparison: run the same build command with
 --merge-planner all-pairs and a different --output directory. The old streaming
 planner is available as --merge-planner streaming-unpruned. No merge reverts.
 
 Plain Zindex baseline, using the same feature and graph settings:
-  ./target/release/zorindex build --fof samples.fof --output samples.plain.zoridx \
+  ./target/release/zorindex build --plain --fof samples.fof --output samples.plain.zoridx \
     --k 49 --index-mode minimizers --minimizer-size 31 \
-    --hashes 4 --fingerprint-bits 16 --slot-scale 1.0 \
-    --cycle-break most-deg2 --tie-scan 8
+    --fingerprint-bits 16
   ./target/release/zorindex query --index samples.plain.zoridx --query reads.fasta.gz
 
 Bindex minimizer baseline (Bloom backend, without Zindex merging):

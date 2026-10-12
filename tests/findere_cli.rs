@@ -73,7 +73,7 @@ fn build(bin: &str, fof: &str, output: &str, k: &str, z: Option<&str>, extra: &[
         args.extend(["--findere-z", z]);
     }
     if is_zor(bin) {
-        args.extend(["--slot-scale", "8", "--fingerprint-bits", "16"]);
+        args.extend(["--plain", "--slot-scale", "8", "--fingerprint-bits", "16"]);
     } else {
         args.extend(["--bit-count", "65536"]);
     }
@@ -281,7 +281,11 @@ fn rejects_invalid_parameters_and_supports_z_alias() {
             ],
         );
         assert!(ok(bin, &["info", "--index", &index]).contains("findere_z\t4\n"));
-        fs::remove_file(&index).unwrap();
+        if Path::new(&index).is_dir() {
+            fs::remove_dir_all(&index).unwrap();
+        } else {
+            fs::remove_file(&index).unwrap();
+        }
     }
 }
 
