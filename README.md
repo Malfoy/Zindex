@@ -196,7 +196,7 @@ zorindex build \
 Important options:
 
 - `--hashes`: number of ZOR locations per key.
-- `--fingerprint-bits`: `8` or `16`.
+- `--fingerprint-bits`: `1`, `8` (default), or `16`. The 1-bit option is bit-packed and has approximately 50% false positives per absent indexed feature; sequence-level thresholds still apply.
 - `--slot-scale`: multiplier applied to the largest color cardinality.
 - `--slot-count`: explicit slot budget before segmented layout rounding.
 - `--segment-length`: explicit power-of-two segment length.

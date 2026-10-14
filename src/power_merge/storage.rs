@@ -873,7 +873,7 @@ impl Index {
             "invalid hash count"
         );
         ensure!(
-            [8, 16].contains(&manifest.fingerprint_bits),
+            [1, 8, 16].contains(&manifest.fingerprint_bits),
             "invalid fingerprint width"
         );
         ensure!(
@@ -1087,7 +1087,7 @@ impl Index {
             .iter()
             .map(|bank| {
                 if bank.meta.fingerprint_first {
-                    bank.meta.groups.len() * manifest.fingerprint_bits / 8
+                    (bank.meta.groups.len() * manifest.fingerprint_bits).div_ceil(8)
                 } else {
                     bank.meta.row_bits.div_ceil(8)
                 }
@@ -1127,7 +1127,7 @@ impl Index {
         for bank in &self.banks {
             let row_bytes = bank.meta.row_bits.div_ceil(8);
             let lookup_bytes = if bank.meta.fingerprint_first {
-                bank.meta.groups.len() * self.manifest.fingerprint_bits / 8
+                (bank.meta.groups.len() * self.manifest.fingerprint_bits).div_ceil(8)
             } else {
                 row_bytes
             };
@@ -1148,29 +1148,35 @@ impl Index {
                 );
             }
             if bank.meta.fingerprint_first {
-                fingerprint_matches(row, self.manifest.fingerprint_bits, fp, |i| {
-                    let group = &bank.meta.groups[i];
-                    if group.members.len() == 1 {
-                        scores[group.members[0]] += 1;
-                    } else {
-                        let offset = bank.meta.groups.len() * self.manifest.fingerprint_bits
-                            + group.offset
-                            - i * self.manifest.fingerprint_bits;
-                        let mut mask = 0;
-                        for &slot in &slots[..self.manifest.hashes] {
-                            mask ^= get_bits(
-                                &bank.data[slot * row_bytes..(slot + 1) * row_bytes],
-                                offset,
-                                group.width - self.manifest.fingerprint_bits,
-                            );
+                fingerprint_matches(
+                    row,
+                    self.manifest.fingerprint_bits,
+                    fp,
+                    bank.meta.groups.len(),
+                    |i| {
+                        let group = &bank.meta.groups[i];
+                        if group.members.len() == 1 {
+                            scores[group.members[0]] += 1;
+                        } else {
+                            let offset = bank.meta.groups.len() * self.manifest.fingerprint_bits
+                                + group.offset
+                                - i * self.manifest.fingerprint_bits;
+                            let mut mask = 0;
+                            for &slot in &slots[..self.manifest.hashes] {
+                                mask ^= get_bits(
+                                    &bank.data[slot * row_bytes..(slot + 1) * row_bytes],
+                                    offset,
+                                    group.width - self.manifest.fingerprint_bits,
+                                );
+                            }
+                            while mask != 0 {
+                                let bit = mask.trailing_zeros() as usize;
+                                scores[group.members[bit]] += 1;
+                                mask &= mask - 1;
+                            }
                         }
-                        while mask != 0 {
-                            let bit = mask.trailing_zeros() as usize;
-                            scores[group.members[bit]] += 1;
-                            mask &= mask - 1;
-                        }
-                    }
-                });
+                    },
+                );
                 continue;
             }
             for group in &bank.meta.groups {
@@ -1206,7 +1212,28 @@ fn fingerprint(key: u64, seed: u64, bits: usize) -> u64 {
     splitmix64(key ^ seed ^ FINGERPRINT_SEED) & ((1u64 << bits) - 1)
 }
 
-fn fingerprint_matches(row: &[u8], bits: usize, fp: u64, mut hit: impl FnMut(usize)) {
+fn fingerprint_matches(row: &[u8], bits: usize, fp: u64, count: usize, mut hit: impl FnMut(usize)) {
+    if bits == 1 {
+        // Each XORed bit is already a comparison result. Screen 64 groups at
+        // once, and never treat padding or adjacent origin bits as groups.
+        for (chunk, bytes) in row.chunks(8).enumerate() {
+            let mut word = [0u8; 8];
+            word[..bytes.len()].copy_from_slice(bytes);
+            let value = u64::from_le_bytes(word);
+            let remaining = count.saturating_sub(chunk * 64).min(64);
+            let valid = if remaining == 64 {
+                u64::MAX
+            } else {
+                (1u64 << remaining) - 1
+            };
+            let mut mask = (if fp == 1 { value } else { !value }) & valid;
+            while mask != 0 {
+                hit(chunk * 64 + mask.trailing_zeros() as usize);
+                mask &= mask - 1;
+            }
+        }
+        return;
+    }
     #[cfg(target_arch = "x86_64")]
     if std::is_x86_feature_detected!("avx2") {
         // Runtime dispatch keeps indexes portable to machines without AVX2.
@@ -1549,6 +1576,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn one_bit_screening_ignores_padding_and_adjacent_origin_bits() {
+        for count in [1usize, 7, 8, 9, 63, 64, 65, 257] {
+            for padding in [0u8, 255] {
+                let mut row = vec![padding; count.div_ceil(8)];
+                for i in 0..count {
+                    let mask = 1 << (i % 8);
+                    row[i / 8] =
+                        (row[i / 8] & !mask) | (((splitmix64(i as u64) & 1) as u8) << (i % 8));
+                }
+                for fp in [0, 1] {
+                    let mut actual = Vec::new();
+                    fingerprint_matches(&row, 1, fp, count, |i| actual.push(i));
+                    let expected: Vec<_> = (0..count)
+                        .filter(|&i| splitmix64(i as u64) & 1 == fp)
+                        .collect();
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn simd_screening_matches_scalar_including_zero_and_tails() {
         for bits in [8, 16] {
             for count in [1, 15, 16, 17, 31, 32, 33, 257] {
@@ -1559,11 +1608,11 @@ mod tests {
                     let mut scalar = Vec::new();
                     fingerprint_matches_scalar(&row, bits, fp, 0, &mut |i| scalar.push(i));
                     let mut simd = Vec::new();
-                    fingerprint_matches(&row, bits, fp, |i| simd.push(i));
+                    fingerprint_matches(&row, bits, fp, count, |i| simd.push(i));
                     assert_eq!(scalar, simd);
                 }
                 let mut hits = Vec::new();
-                fingerprint_matches(&vec![0; row.len()], bits, 0, |i| hits.push(i));
+                fingerprint_matches(&vec![0; row.len()], bits, 0, count, |i| hits.push(i));
                 assert_eq!(hits, (0..count).collect::<Vec<_>>());
             }
         }
@@ -1672,7 +1721,7 @@ mod tests {
 
     #[test]
     fn tiled_planes_preserve_every_payload_across_banks() {
-        for fp_bits in [8, 16] {
+        for fp_bits in [1, 8, 16] {
             let stage = temporary_stage();
             let mut groups = Vec::new();
             for (id, count) in [1, 2, 3, 64 - fp_bits].into_iter().enumerate() {
@@ -1897,7 +1946,14 @@ mod tests {
 
     #[test]
     fn fingerprint_planes_preserve_legacy_lookup_and_abandoned_union() {
+        for bits in [1usize, 8, 16] {
+            check_fingerprint_planes(bits);
+        }
+    }
+
+    fn check_fingerprint_planes(bits: usize) {
         let mut legacy = union_index(123, &[1]);
+        legacy.manifest.fingerprint_bits = bits;
         let mut next = 0;
         let mut offset = 0;
         let groups: Vec<_> = (0..40)
@@ -1905,7 +1961,7 @@ mod tests {
                 let count = i % 3 + 1;
                 let members = (next..next + count).collect();
                 next += count;
-                let width = 8 + if count == 1 { 0 } else { count };
+                let width = bits + if count == 1 { 0 } else { count };
                 let group = GroupMeta {
                     members,
                     width,
@@ -1924,10 +1980,11 @@ mod tests {
         legacy.banks[0].data = vec![0; 4 * stride];
         legacy.row_scratch_bytes = stride;
         let mut planes = union_index(123, &[1]);
+        planes.manifest.fingerprint_bits = bits;
         planes.banks[0].meta = legacy.banks[0].meta.clone();
         planes.banks[0].meta.fingerprint_first = true;
         planes.banks[0].data = vec![0; 4 * stride];
-        planes.row_scratch_bytes = 40;
+        planes.row_scratch_bytes = (40 * bits).div_ceil(8);
         let groups = legacy.banks[0].meta.groups.clone();
         for slot in 0..4 {
             for (i, g) in groups.iter().enumerate() {
@@ -1935,9 +1992,14 @@ mod tests {
                 let old_row = &mut legacy.banks[0].data[slot * stride..(slot + 1) * stride];
                 let new_row = &mut planes.banks[0].data[slot * stride..(slot + 1) * stride];
                 put_bits(old_row, g.offset, g.width, value);
-                put_bits(new_row, i * 8, 8, value & 255);
-                if g.width > 8 {
-                    put_bits(new_row, 320 + g.offset - i * 8, g.width - 8, value >> 8);
+                put_bits(new_row, i * bits, bits, value & ((1 << bits) - 1));
+                if g.width > bits {
+                    put_bits(
+                        new_row,
+                        40 * bits + g.offset - i * bits,
+                        g.width - bits,
+                        value >> bits,
+                    );
                 }
             }
         }
