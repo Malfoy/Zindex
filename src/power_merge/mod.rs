@@ -80,6 +80,10 @@ pub struct MergeArgs {
     /// Abandoned features may then be missed.
     #[arg(long, conflicts_with = "plain")]
     pub drop_abandoned: bool,
+    /// Use temporary key/cell files instead of the default scratch-free two-pass build.
+    /// The default keeps completed filters bit-packed in RAM until compression.
+    #[arg(long, conflicts_with = "plain")]
+    pub disk_backed: bool,
 }
 impl Default for MergeArgs {
     fn default() -> Self {
@@ -92,6 +96,7 @@ impl Default for MergeArgs {
             min_saving: 0.0,
             disabled: false,
             drop_abandoned: false,
+            disk_backed: false,
         }
     }
 }

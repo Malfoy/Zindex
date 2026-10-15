@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     create_index_writer, finish_index_writer, open_index_reader, parse_features_from_file,
-    read_fof, splitmix64, FeatureConfig, IndexMode, MAX_HASHES,
+    read_fof, splitmix64, ColorInput, FeatureConfig, IndexMode, MAX_HASHES,
 };
 use anyhow::{ensure, Context, Result};
 use rayon::prelude::*;
@@ -15,6 +15,7 @@ use std::{
     cmp::Reverse,
     collections::{BTreeMap, BinaryHeap},
     fs::{self, File},
+    hash::{DefaultHasher, Hash, Hasher},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -126,10 +127,115 @@ impl Manifest {
 struct BuiltGroup {
     meta: GroupMeta,
     slots: usize,
-    cells: PathBuf,
+    cells: CompletedCells,
     // Construction-only 32-bit hashes and origin masks. Converted to the single
     // global dataset multimap before publication, never consulted during queries.
     fallback: Vec<(u32, u64)>,
+}
+
+enum CompletedCells {
+    Disk(PathBuf),
+    Packed {
+        data: Vec<u8>,
+        width: usize,
+        slots: usize,
+    },
+}
+
+impl CompletedCells {
+    fn packed(cells: &[u64], width: usize) -> Result<Self> {
+        let bits = cells
+            .len()
+            .checked_mul(width)
+            .context("filter size overflow")?;
+        let mut data = vec![0; bits.div_ceil(8)];
+        for (slot, &value) in cells.iter().enumerate() {
+            put_bits(&mut data, slot * width, width, value);
+        }
+        Ok(Self::Packed {
+            data,
+            width,
+            slots: cells.len(),
+        })
+    }
+
+    fn validate(&self, slots: usize, width: usize) -> Result<()> {
+        match self {
+            Self::Disk(path) => ensure!(
+                fs::metadata(path)?.len()
+                    == (slots as u64)
+                        .checked_mul(8)
+                        .context("cell size overflow")?,
+                "invalid completed filter cell cache"
+            ),
+            Self::Packed {
+                data,
+                width: stored_width,
+                slots: stored_slots,
+            } => ensure!(
+                *stored_width == width
+                    && *stored_slots == slots
+                    && data.len()
+                        == slots
+                            .checked_mul(width)
+                            .context("filter size overflow")?
+                            .div_ceil(8),
+                "invalid packed completed filter"
+            ),
+        }
+        Ok(())
+    }
+
+    fn open(&self) -> std::io::Result<Option<File>> {
+        match self {
+            Self::Disk(path) => File::open(path).map(Some),
+            Self::Packed { .. } => Ok(None),
+        }
+    }
+
+    // Recreate the original little-endian u64 stream so both storage modes
+    // use identical ordering samples and exactly the same final bank packer.
+    fn read_block(&self, start: usize, output: &mut [u8], file: Option<&mut File>) -> Result<()> {
+        ensure!(output.len() % 8 == 0, "unaligned cell read");
+        match self {
+            Self::Disk(path) => {
+                let mut reopened;
+                let reader = if let Some(file) = file {
+                    file
+                } else {
+                    reopened = File::open(path)?;
+                    &mut reopened
+                };
+                reader.seek(SeekFrom::Start(
+                    (start as u64)
+                        .checked_mul(8)
+                        .context("cell offset overflow")?,
+                ))?;
+                reader.read_exact(output)?;
+            }
+            Self::Packed { data, width, slots } => {
+                ensure!(
+                    start
+                        .checked_add(output.len() / 8)
+                        .is_some_and(|end| end <= *slots),
+                    "cell read out of bounds"
+                );
+                for (i, bytes) in output.chunks_exact_mut(8).enumerate() {
+                    bytes.copy_from_slice(
+                        &get_bits(data, (start + i) * width, *width).to_le_bytes(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn remove(self) -> Result<()> {
+        if let Self::Disk(path) = self {
+            fs::remove_file(path)?;
+        }
+        Ok(())
+    }
 }
 struct Bank {
     meta: BankMeta,
@@ -201,8 +307,10 @@ pub fn build(
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let stage = Staging(parent.join(format!(".zor-pow2-building-{}-{stamp}", std::process::id())));
     fs::create_dir(&stage.0)?;
-    fs::create_dir(stage.0.join("features"))?;
-    fs::create_dir(stage.0.join("cells"))?;
+    if config.merge.disk_backed {
+        fs::create_dir(stage.0.join("features"))?;
+        fs::create_dir(stage.0.join("cells"))?;
+    }
     eprintln!(
         "sketching {} datasets with {} mergeable full-minimum buckets",
         inputs.len(),
@@ -214,6 +322,7 @@ pub fn build(
     let mut singleton_logical_bits = 0u128;
     let mut plan_seconds = 0.0;
     let mut sketch_seconds = 0.0;
+    let mut input_signatures = Vec::with_capacity(inputs.len());
     for (chunk_id, chunk) in inputs.chunks(config.build_jobs).enumerate() {
         let parsed = chunk
             .par_iter()
@@ -237,7 +346,12 @@ pub fn build(
                 let sketch_start = Instant::now();
                 let sketch = Sketch::new(&keys, config.merge.sketch_size, config.seed);
                 let sketch_sec = sketch_start.elapsed().as_secs_f64();
-                cache_write(&cache_path(&stage.0, id), &keys)?;
+                let signature = if config.merge.disk_backed {
+                    cache_write(&cache_path(&stage.0, id), &keys)?;
+                    0
+                } else {
+                    feature_signature(&keys, occurrences)
+                };
                 let color = Color {
                     name: input.name.clone(),
                     path: input.path.to_string_lossy().into_owned(),
@@ -248,10 +362,12 @@ pub fn build(
                     color,
                     planner::singleton(keys.len(), sketch, id, &config)?,
                     sketch_sec,
+                    signature,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
-        for (color, group, seconds) in parsed {
+        for (color, group, seconds, signature) in parsed {
+            input_signatures.push(signature);
             colors.push(color);
             singleton_logical_bits += planner::cost(group.slots, group.width);
             if config.merge.planner.is_streaming() {
@@ -282,6 +398,11 @@ pub fn build(
             .sum::<u128>(),
     )?;
     let planned_groups = planned.len();
+    let projected_banks = planned
+        .iter()
+        .map(|g| g.slots)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
     eprintln!(
         "merge plan ({}; no reverts): {} datasets -> {} groups, predicted bits {} -> {}, planning {:.3}s, pair evaluations {}",
         config.merge.planner.label(),
@@ -292,13 +413,24 @@ pub fn build(
         plan_seconds,
         planning_pair_evaluations
     );
+    if !config.merge.disk_backed {
+        eprintln!("two-pass construction: projected {} power-of-two banks, {} logical bits; rereading inputs, no temporary key/cell files; completed filters stay bit-packed in RAM", projected_banks, predicted_logical_bits);
+    }
     let mut built = Vec::new();
     let rejected_groups = 0;
     let mut exact_group_verifications = 0;
     for chunk in planned.chunks(config.build_jobs) {
         let results = chunk
             .par_iter()
-            .map(|group| build_group(group, &stage.0, &config, &graph))
+            .map(|group| {
+                if config.merge.disk_backed {
+                    build_group(group, &stage.0, &config, &graph)
+                } else {
+                    let (keys, values) =
+                        union_input_features(group, &inputs, &colors, &input_signatures, &config)?;
+                    construct_group(group, keys, values, None, &config, &graph)
+                }
+            })
             .collect::<Result<Vec<_>>>()?;
         for (group, verified) in results {
             built.push(group);
@@ -316,8 +448,10 @@ pub fn build(
         config.fingerprint_bits,
         &stage.0,
     )?;
-    fs::remove_dir(stage.0.join("cells"))?;
-    fs::remove_dir(stage.0.join("features"))?;
+    if config.merge.disk_backed {
+        fs::remove_dir(stage.0.join("cells"))?;
+        fs::remove_dir(stage.0.join("features"))?;
+    }
     let mut manifest = Manifest {
         version: 3,
         abandoned_recovery: !config.merge.drop_abandoned,
@@ -340,7 +474,12 @@ pub fn build(
         planning_pair_evaluations,
         planning_possible_pair_evaluations,
         merge_reverts_enabled: false,
-        construction_cell_storage: "temporary-disk-u64-tiled-packing".into(),
+        construction_cell_storage: if config.merge.disk_backed {
+            "temporary-disk-u64-tiled-packing"
+        } else {
+            "two-pass-memory-packed-no-scratch"
+        }
+        .into(),
         slot_scale: config.slot_scale,
         singleton_logical_bits,
         predicted_logical_bits,
@@ -411,13 +550,111 @@ fn union_features(group: &planner::Group, stage: &Path) -> Result<(Vec<u64>, Vec
     Ok((keys, memberships))
 }
 
+fn feature_signature(keys: &[u64], occurrences: u64) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    occurrences.hash(&mut hasher);
+    keys.hash(&mut hasher);
+    hasher.finish()
+}
+
+// Merge backwards in-place, retaining only the current union and one dataset.
+// Dataset origin bits and sorted key order match the disk-cache heap union.
+fn extend_union(
+    keys: &mut Vec<u64>,
+    origins: &mut Vec<u64>,
+    incoming: &[u64],
+    mask: u64,
+) -> Result<()> {
+    let mut i = keys.len();
+    let mut j = incoming.len();
+    let total = i.checked_add(j).context("union size overflow")?;
+    keys.resize(total, 0);
+    origins.resize(total, 0);
+    let mut write = total;
+    while i != 0 || j != 0 {
+        let (key, value) = if j == 0 || (i != 0 && keys[i - 1] > incoming[j - 1]) {
+            i -= 1;
+            (keys[i], origins[i])
+        } else if i == 0 || incoming[j - 1] > keys[i - 1] {
+            j -= 1;
+            (incoming[j], mask)
+        } else {
+            i -= 1;
+            j -= 1;
+            (keys[i], origins[i] | mask)
+        };
+        write -= 1;
+        keys[write] = key;
+        origins[write] = value;
+    }
+    let length = total - write;
+    keys.copy_within(write..total, 0);
+    origins.copy_within(write..total, 0);
+    keys.truncate(length);
+    origins.truncate(length);
+    Ok(())
+}
+
+fn union_input_features(
+    group: &planner::Group,
+    inputs: &[ColorInput],
+    colors: &[Color],
+    signatures: &[u64],
+    config: &BuildConfig,
+) -> Result<(Vec<u64>, Vec<u64>)> {
+    let mut keys = Vec::new();
+    let mut origins = Vec::new();
+    for (bit, &id) in group.members.iter().enumerate() {
+        let mut incoming = Vec::new();
+        let mut occurrences = 0;
+        parse_features_from_file(
+            &inputs[id].path,
+            config.k,
+            config.seed,
+            config.feature_config,
+            |key| {
+                occurrences += 1;
+                incoming.push(key);
+            },
+        )
+        .with_context(|| format!("second-pass extraction of {}", inputs[id].path.display()))?;
+        incoming.sort_unstable();
+        incoming.dedup();
+        ensure!(
+            incoming.len() == colors[id].unique_kmers
+                && occurrences == colors[id].occurrences
+                && feature_signature(&incoming, occurrences) == signatures[id],
+            "indexed features changed between passes for {}",
+            inputs[id].path.display()
+        );
+        extend_union(&mut keys, &mut origins, &incoming, 1u64 << bit)?;
+    }
+    Ok((keys, origins))
+}
+
 fn build_group(
     group: &planner::Group,
     stage: &Path,
     config: &BuildConfig,
     graph: &(impl Fn(&[u64], usize) -> Result<PeelGraph> + Sync),
 ) -> Result<(BuiltGroup, u64)> {
-    let (keys, mut values) = union_features(group, stage)?;
+    let (keys, values) = union_features(group, stage)?;
+    let result = construct_group(group, keys, values, Some(stage), config, graph)?;
+    // The immutable plan partitions datasets: no other group needs these keys.
+    for &id in &group.members {
+        fs::remove_file(cache_path(stage, id))?;
+    }
+    Ok(result)
+}
+
+fn construct_group(
+    group: &planner::Group,
+    keys: Vec<u64>,
+    mut values: Vec<u64>,
+    cache_stage: Option<&Path>,
+    config: &BuildConfig,
+    graph: &(impl Fn(&[u64], usize) -> Result<PeelGraph> + Sync),
+) -> Result<(BuiltGroup, u64)> {
     let slots = config.slots(keys.len() as f64)?;
     for (&key, value) in keys.iter().zip(&mut values) {
         *value = fingerprint(key, config.seed, config.fingerprint_bits)
@@ -463,26 +700,25 @@ fn build_group(
         } else {
             0
         }) as u64;
-    // Completed groups do not remain resident until all graph builds finish.
-    // Every cell is persisted losslessly; packing still uses the same order and
-    // bit layout. Release graph/union workspaces before writing the cell cache.
+    // Release graph/union workspaces before retaining completed cells, either
+    // bit-packed in RAM (default) or in the opt-in disk cache.
     drop(peeled);
     drop(values);
     drop(keys);
-    let cell_path = stage
-        .join("cells")
-        .join(format!("{}.u64", group.members[0]));
-    cache_write(&cell_path, &cells)?;
-    // The immutable plan partitions datasets, so no other group will consume
-    // these feature caches. Free them as soon as this group's cells are safe.
-    for &id in &group.members {
-        fs::remove_file(cache_path(stage, id))?;
-    }
+    let cells = if let Some(stage) = cache_stage {
+        let path = stage
+            .join("cells")
+            .join(format!("{}.u64", group.members[0]));
+        cache_write(&path, &cells)?;
+        CompletedCells::Disk(path)
+    } else {
+        CompletedCells::packed(&cells, group.width)?
+    };
     Ok((
         BuiltGroup {
             meta,
             slots,
-            cells: cell_path,
+            cells,
             fallback,
         },
         verified,
@@ -493,14 +729,8 @@ fn build_group(
 // This bounds ordering memory/I/O independently of filter capacity. Using the
 // actual assigned cells avoids assuming Jaccard predicts XOR solution similarity.
 fn column_sample(group: &BuiltGroup) -> Result<Vec<u8>> {
-    let mut file = File::open(&group.cells)?;
-    ensure!(
-        file.metadata()?.len()
-            == (group.slots as u64)
-                .checked_mul(8)
-                .context("cell size overflow")?,
-        "invalid completed filter cell cache"
-    );
+    group.cells.validate(group.slots, group.meta.width)?;
+    let mut file = group.cells.open()?;
     let window = group.slots.min(16);
     let windows = if group.slots <= 16 { 1 } else { 8 };
     let mut sample = vec![0; windows * window * 8];
@@ -510,8 +740,11 @@ fn column_sample(group: &BuiltGroup) -> Result<Vec<u8>> {
         } else {
             ((group.slots - window) as u128 * i as u128 / (windows - 1) as u128) as u64
         };
-        file.seek(SeekFrom::Start(slot * 8))?;
-        file.read_exact(&mut sample[i * window * 8..(i + 1) * window * 8])?;
+        group.cells.read_block(
+            slot as usize,
+            &mut sample[i * window * 8..(i + 1) * window * 8],
+            file.as_mut(),
+        )?;
     }
     Ok(sample)
 }
@@ -559,7 +792,17 @@ fn transpose(groups: Vec<BuiltGroup>, order: ColumnOrder) -> Result<Vec<Bank>> {
         let row_bytes = row_bits.div_ceil(8);
         let mut data = vec![0; slots.checked_mul(row_bytes).context("bank size overflow")?];
         for group in &groups {
-            let cells = cache_read(&group.cells)?;
+            let cells = match &group.cells {
+                CompletedCells::Disk(path) => cache_read(path)?,
+                CompletedCells::Packed { .. } => {
+                    let mut bytes = vec![0; slots * 8];
+                    group.cells.read_block(0, &mut bytes, None)?;
+                    bytes
+                        .chunks_exact(8)
+                        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                        .collect()
+                }
+            };
             ensure!(cells.len() == slots, "invalid completed filter cell cache");
             for (slot, &value) in cells.iter().enumerate() {
                 put_bits(
@@ -569,7 +812,9 @@ fn transpose(groups: Vec<BuiltGroup>, order: ColumnOrder) -> Result<Vec<Bank>> {
                     value,
                 );
             }
-            fs::remove_file(&group.cells)?;
+            if let CompletedCells::Disk(path) = &group.cells {
+                fs::remove_file(path)?;
+            }
         }
         let meta = BankMeta {
             file: format!("bank-{}.zorbank.zst", slots.ilog2()),
@@ -606,10 +851,7 @@ fn pack_banks_streaming(
             row_bits = row_bits
                 .checked_add(group.meta.width)
                 .context("row width overflow")?;
-            ensure!(
-                fs::metadata(&group.cells)?.len() == slots as u64 * 8,
-                "invalid completed filter cell cache"
-            );
+            group.cells.validate(slots, group.meta.width)?;
         }
         let meta = BankMeta {
             file: format!("bank-{}.zorbank.zst", slots.ilog2()),
@@ -634,7 +876,7 @@ fn pack_banks_streaming(
         // discard partial opens and read one file/block at a time instead.
         let mut files = groups
             .iter()
-            .map(|g| File::open(&g.cells))
+            .map(|g| g.cells.open())
             .collect::<std::io::Result<Vec<_>>>()
             .ok();
         let fp_mask = (1u64 << fp_bits) - 1;
@@ -644,13 +886,8 @@ fn pack_banks_streaming(
             output.fill(0);
             for (index, group) in groups.iter().enumerate() {
                 let block = &mut input[..rows * 8];
-                if let Some(files) = &mut files {
-                    files[index].read_exact(block)?;
-                } else {
-                    let mut file = File::open(&group.cells)?;
-                    file.seek(SeekFrom::Start(start as u64 * 8))?;
-                    file.read_exact(block)?;
-                }
+                let file = files.as_mut().and_then(|files| files[index].as_mut());
+                group.cells.read_block(start, block, file)?;
                 let origin_offset = groups.len() * fp_bits + group.meta.offset - index * fp_bits;
                 for (row, bytes) in output
                     .chunks_exact_mut(row_bytes)
@@ -673,7 +910,7 @@ fn pack_banks_streaming(
         finish_index_writer(writer)?;
         drop(files);
         for group in groups {
-            fs::remove_file(group.cells)?;
+            group.cells.remove()?;
         }
         banks.push(meta);
     }
@@ -1576,6 +1813,175 @@ mod tests {
     use super::*;
 
     #[test]
+    fn in_place_union_matches_exact_origin_map() {
+        let mut keys = Vec::new();
+        let mut masks = Vec::new();
+        let mut expected = BTreeMap::<u64, u64>::new();
+        for bit in 0..63 {
+            let mut incoming: Vec<_> = (0..bit * 3).map(|i| splitmix64(i) % 500).collect();
+            incoming.extend([0, u64::MAX]);
+            incoming.sort_unstable();
+            incoming.dedup();
+            let mask = 1u64 << bit;
+            for &key in &incoming {
+                *expected.entry(key).or_default() |= mask;
+            }
+            extend_union(&mut keys, &mut masks, &incoming, mask).unwrap();
+            assert_eq!(keys, expected.keys().copied().collect::<Vec<_>>());
+            assert_eq!(masks, expected.values().copied().collect::<Vec<_>>());
+        }
+        extend_union(&mut keys, &mut masks, &[], 1).unwrap();
+        assert_eq!(keys, expected.keys().copied().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn packed_cells_preserve_samples_and_reads_for_all_payload_widths() {
+        let stage = temporary_stage();
+        for width in 1..=64 {
+            for slots in [4, 17, 65] {
+                let mask = if width == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << width) - 1
+                };
+                let cells: Vec<_> = (0..slots).map(|i| splitmix64(i as u64) & mask).collect();
+                let mut group = test_group(&stage, width * 100 + slots, width, &cells);
+                let expected_sample = column_sample(&group).unwrap();
+                group.cells.remove().unwrap();
+                group.cells = CompletedCells::packed(&cells, width).unwrap();
+                if let CompletedCells::Packed { data, .. } = &group.cells {
+                    assert_eq!(data.len(), (width * slots).div_ceil(8));
+                }
+                assert_eq!(column_sample(&group).unwrap(), expected_sample);
+                let mut block = vec![0; (slots - 1) * 8];
+                group.cells.read_block(1, &mut block, None).unwrap();
+                let actual: Vec<_> = block
+                    .chunks_exact(8)
+                    .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                    .collect();
+                assert_eq!(actual, cells[1..]);
+                assert!(group.cells.read_block(slots, &mut [0; 8], None).is_err());
+            }
+        }
+    }
+
+    fn scratch_free_config() -> BuildConfig {
+        BuildConfig {
+            backend: Backend::Zor,
+            k: 3,
+            hashes: 2,
+            seed: 69,
+            fingerprint_bits: 8,
+            feature_config: FeatureConfig::legacy_kmers(),
+            slot_scale: 1.0,
+            minimum_slots: None,
+            merge: super::super::MergeArgs {
+                disabled: true,
+                sketch_size: 64,
+                ..Default::default()
+            },
+            build_jobs: 1,
+        }
+    }
+
+    fn dropped_test_graph(keys: &[u64], slots: usize) -> PeelGraph {
+        let mut mapped = Vec::new();
+        for &key in keys {
+            let mut p = [0; 2];
+            positions(key, slots, 2, 69, &mut p);
+            mapped.extend(p.map(|v| v as u32));
+        }
+        PeelGraph::Compact(super::super::TypedPeelGraph {
+            positions: mapped,
+            order: Vec::new(),
+            dropped: (0..keys.len() as u32).collect(),
+        })
+    }
+
+    #[test]
+    fn default_two_pass_never_creates_scratch_files_during_construction() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = temporary_stage();
+        let first = root.0.join("a.fa");
+        let second = root.0.join("b.fa");
+        fs::write(&first, ">a\nACGTACGT\n").unwrap();
+        fs::write(&second, ">b\nAAAAAAAA\n").unwrap();
+        let fof = root.0.join("inputs.fof");
+        fs::write(
+            &fof,
+            format!("a\t{}\nb\t{}\n", first.display(), second.display()),
+        )
+        .unwrap();
+        let output = root.0.join("index");
+        let calls = AtomicUsize::new(0);
+        build(&fof, &output, scratch_free_config(), |keys, slots| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            let stages: Vec<_> = fs::read_dir(&root.0)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| {
+                    p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(".zor-pow2-building-")
+                })
+                .collect();
+            assert_eq!(stages.len(), 1);
+            // Before final packing, the publication directory must be empty:
+            // no features/, cells/, cache files or other construction artifacts.
+            assert_eq!(fs::read_dir(&stages[0]).unwrap().count(), 0);
+            Ok(dropped_test_graph(keys, slots))
+        })
+        .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let index = Index::load(&output).unwrap();
+        assert_eq!(
+            index.manifest.construction_cell_storage,
+            "two-pass-memory-packed-no-scratch"
+        );
+        for entry in fs::read_dir(&output).unwrap() {
+            let entry = entry.unwrap();
+            assert!(entry.file_type().unwrap().is_file());
+            let name = entry.file_name().to_str().unwrap().to_owned();
+            assert!(
+                name == "manifest.json" || name == ABANDONED_FILE || name.ends_with(".zorbank.zst")
+            );
+        }
+    }
+
+    #[test]
+    fn two_pass_rejects_changed_features_and_removes_unpublished_output() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = temporary_stage();
+        let first = root.0.join("a.fa");
+        let second = root.0.join("b.fa");
+        fs::write(&first, ">a\nACGTACGT\n").unwrap();
+        fs::write(&second, ">b\nAAAAAAAA\n").unwrap();
+        let fof = root.0.join("inputs.fof");
+        fs::write(
+            &fof,
+            format!("a\t{}\nb\t{}\n", first.display(), second.display()),
+        )
+        .unwrap();
+        let calls = AtomicUsize::new(0);
+        let output = root.0.join("index");
+        let result = build(&fof, &output, scratch_free_config(), |keys, slots| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            // Change the next dataset after planning, retaining its cardinality
+            // and occurrence count so the feature signature must detect it.
+            fs::write(&second, ">b\nCCCCCCCC\n").unwrap();
+            Ok(dropped_test_graph(keys, slots))
+        });
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("changed between passes"));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(!output.exists());
+        assert_eq!(fs::read_dir(&root.0).unwrap().count(), 3);
+    }
+
+    #[test]
     fn one_bit_screening_ignores_padding_and_adjacent_origin_bits() {
         for count in [1usize, 7, 8, 9, 63, 64, 65, 257] {
             for padding in [0u8, 255] {
@@ -1661,7 +2067,7 @@ mod tests {
                 abandoned_keys: Some(1),
             },
             slots: cells.len(),
-            cells: path,
+            cells: CompletedCells::Disk(path),
             fallback: vec![(id as u32, cells[0])],
         }
     }

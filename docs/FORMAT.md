@@ -129,6 +129,14 @@ groups have no origin bits. Group offsets in the manifest describe the original
 complete-payload prefix; the origin-plane offset for group `i` is
 `group_count * fingerprint_bits + group.offset - i * fingerprint_bits`.
 
+Construction mode does not change the bank encoding or query layout. The default
+two-pass builder records `construction_cell_storage` as
+`two-pass-memory-packed-no-scratch`; `--disk-backed` records
+`temporary-disk-u64-tiled-packing`. The two-pass publication directory contains
+only final index files, with verified cells retained bit-packed in RAM until
+bank compression. First-pass projected capacities may differ from exact final
+capacities; this does not change the planned dataset membership partition.
+
 `abandoned.zormap.zst` expands to magic `ZORABN1\0`, followed by records:
 32-bit abandoned-key hash, 32-bit origin count, then that many 32-bit origin IDs.
 All integers are little-endian. This is one global multimap across all banks;
