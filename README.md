@@ -196,7 +196,7 @@ zorindex build \
 Important options:
 
 - `--hashes`: number of ZOR locations per key.
-- `--fingerprint-bits`: `8` or `16`.
+- `--fingerprint-bits`: `1`, `8` (default), or `16`. The 1-bit option is bit-packed and has approximately 50% false positives per absent indexed feature; sequence-level thresholds still apply.
 - `--slot-scale`: multiplier applied to the largest color cardinality.
 - `--slot-count`: explicit slot budget before segmented layout rounding.
 - `--segment-length`: explicit power-of-two segment length.
@@ -314,23 +314,41 @@ New indexes use manifest/bank layout version 3 and require an updated reader.
 reverted**, even when exact union cardinalities, byte padding or fallback entries
 erase the estimated savings. Actual capacity is computed from exact union keys
 and remains a power of two; the planned membership partition is unchanged.
-Temporary feature caches keep the initial pass bounded by `--build-jobs`.
-Completed groups' verified `u64` cells are written to temporary disk files rather
-than retained in RAM; their feature caches are then removed. Bank packing reads
-small blocks of completed filters into bounded row tiles and writes each tile
-directly to the compressor; no complete packed banks are retained during construction.
-Sorted feature caches are unioned through bounded readers directly into key/payload
-vectors. Graph positions, adjacency, offsets and peel records use checked 32-bit
-indices where possible, with a wide fallback. A mutable indexed degree heap avoids
-stale priority entries while retaining the original tie-breaking and peel decisions.
-Construction still needs memory for active groups' final keys/payloads/graphs and
-uses extra temporary disk I/O. Fingerprints, origin assignments, hash positions,
-false positives and query counts are unchanged.
+Construction defaults to **two input passes without temporary key or cell files**:
+
+1. Extract each dataset's exact cardinality and mergeable sketch, decide merges,
+   and project the power-of-two bank layout. Only sketches, counts, feature
+   signatures and the plan are retained; extracted keys are discarded.
+2. Reread the inputs for each planned group, form its exact union and origin
+   masks, and build its filter. Actual union cardinalities determine the final
+   power-of-two sizes; estimates are not hard capacities and merges are never
+   reverted. Changed indexed features between passes cause a clean error.
+
+Completed filters are retained **bit-packed at their actual payload width in
+RAM**, not as 64-bit cells. The existing compression-aware column ordering is
+preserved using exactly the same cell samples. Bank packing uses bounded row
+tiles and writes directly to zstd; banks already written are released from RAM.
+The atomic publication directory contains only the final index files, not
+construction caches. Disk space is needed for the output, but not collection-wide
+key/cell scratch files. Both passes use `--build-jobs` to bound concurrent work.
+
+RAM must fit the completed packed filters, planning metadata and active groups'
+keys/payloads/graphs. To trade RAM for scratch disk, explicitly add `--disk-backed`:
+that mode retains the previous single-extraction builder, using temporary `u64`
+feature and cell caches followed by tiled bank packing. Both modes produce
+identical bank files and the same global abandoned-key map for unchanged inputs,
+settings and column order; only construction metadata and timings differ.
+
+Graph positions, adjacency, offsets and peel records use checked 32-bit indices
+where possible, with a wide fallback. A mutable indexed degree heap avoids stale
+priority entries while retaining the original tie-breaking and peel decisions.
+Fingerprints, origin assignments, hash positions, false positives and query
+counts are unchanged by construction mode.
 
 Options: `--merge-sketch-size` (4096 buckets), `--merge-max-colors` (48 datasets),
 `--merge-min-saving` (0; a fractional safety margin), and `--merge-disabled`
 (power-of-two singleton banks for comparisons). Payloads currently fit at most
-64 bits, including the 8- or 16-bit fingerprint. `--slot-count` acts as a minimum
+64 bits, including the 1-, 8- or 16-bit fingerprint. `--slot-count` acts as a minimum
 per-group cell budget before rounding.
 
 Query supports all feature modes and uses Rayon for ordinary and findere queries.
