@@ -511,7 +511,7 @@ mod tests {
             .build()
             .unwrap();
         pool.install(|| {
-            for fingerprint_bits in [8, 16] {
+            for fingerprint_bits in [1, 8, 16] {
                 for max_colors in [2, 5, 16] {
                     for min_saving in [0.0, 0.05, 0.5] {
                         for minimum_slots in [None, Some(256)] {

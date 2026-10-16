@@ -88,7 +88,7 @@ struct BuildArgs {
     #[arg(long, default_value_t = 4)]
     hashes: usize,
 
-    /// Fingerprint width in bits. Supported values: 8 or 16.
+    /// Fingerprint width in bits: 1 (~50% false positives), 8 or 16.
     #[arg(long, default_value_t = 8)]
     fingerprint_bits: u8,
 
@@ -652,9 +652,7 @@ fn build_command(args: BuildArgs) -> Result<()> {
         make_color_build_plan(&summaries, &technical_plan);
     let color_count = colors.len();
     let technical_bin_count = technical_bins.len();
-    let row_bytes = technical_bin_count
-        .checked_mul(fingerprint_bytes)
-        .context("row width overflow")?;
+    let row_bytes = packed_row_bytes(technical_bin_count, fingerprint_bytes)?;
     let total_bytes = layout
         .array_length
         .checked_mul(row_bytes)
@@ -889,11 +887,7 @@ fn append_command(args: AppendArgs) -> Result<()> {
             .unwrap_or(0);
         index.split_target_features = index.split_target_features.max(max_appended);
     }
-    let row_bytes = index
-        .technical_bins
-        .len()
-        .checked_mul(fingerprint_bytes)
-        .context("row width overflow")?;
+    let row_bytes = packed_row_bytes(index.technical_bins.len(), fingerprint_bytes)?;
     index.stack = StackStorage::from_plain(
         interlaced,
         output_compression,
@@ -944,11 +938,7 @@ fn repack_command(args: RepackArgs) -> Result<()> {
     let mut index =
         ZorIndex::load(&args.index).with_context(|| format!("loading {}", args.index.display()))?;
     let fingerprint_bytes = fingerprint_bytes(index.fingerprint_bits)?;
-    let row_bytes = index
-        .technical_bins
-        .len()
-        .checked_mul(fingerprint_bytes)
-        .context("row width overflow")?;
+    let row_bytes = packed_row_bytes(index.technical_bins.len(), fingerprint_bytes)?;
     let original_codec = index.stack.compression();
     let original_stored = index.stack.stored_bytes();
     let plain = index.stack.to_plain_vec()?;
@@ -1132,7 +1122,7 @@ fn validate_build_args(args: &BuildArgs) -> Result<()> {
         .with_findere_z(args.findere_z),
     )?;
     fingerprint_bytes(args.fingerprint_bits)
-        .with_context(|| "--fingerprint-bits must be 8 or 16")?;
+        .with_context(|| "--fingerprint-bits must be 1, 8 or 16")?;
     ensure!(
         args.slot_scale.is_finite() && args.slot_scale > 0.0,
         "--slot-scale must be finite and > 0"
@@ -1205,10 +1195,33 @@ fn validate_feature_config(k: usize, config: FeatureConfig) -> Result<()> {
 
 fn fingerprint_bytes(fingerprint_bits: u8) -> Result<usize> {
     match fingerprint_bits {
+        // Zero denotes packed single-bit cells, never byte-per-fingerprint.
+        1 => Ok(0),
         8 => Ok(1),
         16 => Ok(2),
         _ => anyhow::bail!("unsupported fingerprint width {}", fingerprint_bits),
     }
+}
+
+fn packed_row_bytes(cells: usize, fingerprint_bytes: usize) -> Result<usize> {
+    if fingerprint_bytes == 0 {
+        Ok(cells.div_ceil(8))
+    } else {
+        cells
+            .checked_mul(fingerprint_bytes)
+            .context("row width overflow")
+    }
+}
+
+#[inline(always)]
+fn read_cell_bit(cells: &[u8], slot: usize) -> u8 {
+    (cells[slot / 8] >> (slot % 8)) & 1
+}
+
+#[inline(always)]
+fn write_cell_bit(cells: &mut [u8], slot: usize, value: u8) {
+    let mask = 1 << (slot % 8);
+    cells[slot / 8] = (cells[slot / 8] & !mask) | ((value & 1) << (slot % 8));
 }
 
 impl StackStorage {
@@ -1219,6 +1232,8 @@ impl StackStorage {
         fingerprint_bytes: usize,
         rows: usize,
     ) -> Result<Self> {
+        // Packed bits are compressed as bytes, using the existing codecs.
+        let fingerprint_bytes = fingerprint_bytes.max(1);
         ensure!(row_bytes > 0, "stack row width must be greater than 0");
         ensure!(
             fingerprint_bytes == 1 || fingerprint_bytes == 2,
@@ -1959,19 +1974,15 @@ fn append_interlaced(
     let total_color_count = old_color_count
         .checked_add(new_color_count)
         .context("color count overflow")?;
-    let old_row_bytes = old_color_count
-        .checked_mul(fingerprint_bytes)
-        .context("row width overflow")?;
-    let new_row_bytes = total_color_count
-        .checked_mul(fingerprint_bytes)
-        .context("row width overflow")?;
+    let old_row_bytes = packed_row_bytes(old_color_count, fingerprint_bytes)?;
+    let new_row_bytes = packed_row_bytes(total_color_count, fingerprint_bytes)?;
     ensure!(
         existing.len() == layout.array_length * old_row_bytes,
         "existing interlaced data length does not match layout"
     );
     for build in builds {
         ensure!(
-            build.cells.len() == layout.array_length * fingerprint_bytes,
+            build.cells.len() == packed_row_bytes(layout.array_length, fingerprint_bytes)?,
             "new build cell length does not match layout"
         );
     }
@@ -1984,6 +1995,14 @@ fn append_interlaced(
             let old_src = slot * old_row_bytes;
             row[..old_row_bytes].copy_from_slice(&existing[old_src..old_src + old_row_bytes]);
             for (new_color_id, build) in builds.iter().enumerate() {
+                if fingerprint_bytes == 0 {
+                    write_cell_bit(
+                        row,
+                        old_color_count + new_color_id,
+                        read_cell_bit(&build.cells, slot),
+                    );
+                    continue;
+                }
                 let src = slot * fingerprint_bytes;
                 let dst = (old_color_count + new_color_id) * fingerprint_bytes;
                 row[dst..dst + fingerprint_bytes]
@@ -2121,8 +2140,7 @@ fn choose_zor_technical_layout(
         let layout = calculate_layout(target_slots, args.hashes, args.segment_length)?;
         let estimated_bytes = layout
             .array_length
-            .checked_mul(technical_bin_count)
-            .and_then(|bytes| bytes.checked_mul(fingerprint_bytes))
+            .checked_mul(packed_row_bytes(technical_bin_count, fingerprint_bytes)?)
             .context("technical layout size overflow")?;
         let technical_bin_penalty = technical_bin_count as f64 / color_count as f64;
         let estimated_cost = estimated_bytes as f64 * technical_bin_penalty;
@@ -2378,21 +2396,27 @@ fn write_layer_into_interlaced(
     cells: &[u8],
 ) -> Result<()> {
     ensure!(
-        cells.len() == layout.array_length * fingerprint_bytes,
+        cells.len() == packed_row_bytes(layout.array_length, fingerprint_bytes)?,
         "build cell length does not match layout"
     );
     ensure!(
         technical_bin_id < technical_bin_count,
         "technical bin id out of bounds"
     );
-    let row_bytes = technical_bin_count
-        .checked_mul(fingerprint_bytes)
-        .context("row width overflow")?;
+    let row_bytes = packed_row_bytes(technical_bin_count, fingerprint_bytes)?;
     ensure!(
         interlaced.len() == layout.array_length * row_bytes,
         "interlaced stack length does not match layout"
     );
     for slot in 0..layout.array_length {
+        if fingerprint_bytes == 0 {
+            write_cell_bit(
+                &mut interlaced[slot * row_bytes..(slot + 1) * row_bytes],
+                technical_bin_id,
+                read_cell_bit(cells, slot),
+            );
+            continue;
+        }
         let src = slot * fingerprint_bytes;
         let dst = slot * row_bytes + technical_bin_id * fingerprint_bytes;
         interlaced[dst..dst + fingerprint_bytes]
@@ -2998,6 +3022,22 @@ fn assign_cells<I: GraphIndex>(
     fingerprint_bits: u8,
 ) -> Result<Vec<u8>> {
     match fingerprint_bits {
+        1 => {
+            let mut cells = vec![0u8; layout.array_length.div_ceil(8)];
+            for &(edge, pivot) in peel_order.iter().rev() {
+                let edge = edge.as_usize();
+                let pivot = pivot.as_usize();
+                let mut value = fingerprint8(keys[edge], seed) & 1;
+                for &slot in &edge_slots[edge * hashes..edge * hashes + hashes] {
+                    let slot = slot.as_usize();
+                    if slot != pivot {
+                        value ^= read_cell_bit(&cells, slot);
+                    }
+                }
+                write_cell_bit(&mut cells, pivot, value);
+            }
+            Ok(cells)
+        }
         8 => {
             let mut cells = vec![0u8; layout.array_length];
             for &(edge, pivot) in peel_order.iter().rev() {
@@ -3393,6 +3433,13 @@ fn contains_raw(
     let mut slots = [0usize; MAX_HASHES];
     fill_positions(key, layout, hashes, seed, &mut slots[..hashes]);
     match fingerprint_bits {
+        1 => {
+            let mut value = 0;
+            for &slot in &slots[..hashes] {
+                value ^= read_cell_bit(cells, slot);
+            }
+            value == fingerprint8(key, seed) & 1
+        }
         8 => {
             let mut value = 0u8;
             for &slot in &slots[..hashes] {
@@ -3575,6 +3622,10 @@ impl ZorIndex {
         scratch: &mut QueryScratch,
     ) {
         debug_assert_eq!(scores.len(), self.colors.len());
+        if self.fingerprint_bits == 1 {
+            self.query_kmer_into_1(key, scores, scratch);
+            return;
+        }
         if !self.is_flat_technical_layout() {
             match self.fingerprint_bits {
                 8 => self.query_kmer_into_mapped_8(key, scores, scratch),
@@ -3587,6 +3638,65 @@ impl ZorIndex {
             8 => self.query_kmer_into_8(key, scores, scratch),
             16 => self.query_kmer_into_16(key, scores, scratch),
             _ => unreachable!("invalid fingerprint width in loaded index"),
+        }
+    }
+
+    fn query_kmer_into_1(&self, key: u64, scores: &mut [u64], scratch: &mut QueryScratch) {
+        let mut slots = [0usize; MAX_HASHES];
+        fill_positions(
+            key,
+            self.layout,
+            self.hashes,
+            self.seed,
+            &mut slots[..self.hashes],
+        );
+        let count = self.technical_bin_count();
+        let row_bytes = count.div_ceil(8);
+        scratch.ensure(row_bytes);
+        scratch.acc.fill(0);
+        for &slot in &slots[..self.hashes] {
+            if let Some(data) = self.stack.as_plain() {
+                xor_bytes_into(
+                    &mut scratch.acc,
+                    &data[slot * row_bytes..(slot + 1) * row_bytes],
+                );
+            } else {
+                self.stack
+                    .xor_row_into(slot, &mut scratch.acc, &mut scratch.row_codec)
+                    .expect("failed to decode compressed stack slice");
+            }
+        }
+        let target = fingerprint8(key, self.seed) & 1;
+        let flat = self.is_flat_technical_layout();
+        let epoch = if flat {
+            0
+        } else {
+            scratch.next_epoch(self.colors.len())
+        };
+        for (chunk, bytes) in scratch.acc.chunks(8).enumerate() {
+            let mut word = [0u8; 8];
+            word[..bytes.len()].copy_from_slice(bytes);
+            let value = u64::from_le_bytes(word);
+            let remaining = (count - chunk * 64).min(64);
+            let valid = if remaining == 64 {
+                u64::MAX
+            } else {
+                (1u64 << remaining) - 1
+            };
+            let mut hits = (if target == 1 { value } else { !value }) & valid;
+            while hits != 0 {
+                let technical_id = chunk * 64 + hits.trailing_zeros() as usize;
+                if flat {
+                    scores[technical_id] += 1;
+                } else {
+                    let id = self.technical_bins[technical_id].color_id;
+                    if scratch.seen_users[id] != epoch {
+                        scratch.seen_users[id] = epoch;
+                        scores[id] += 1;
+                    }
+                }
+                hits &= hits - 1;
+            }
         }
     }
 
@@ -4206,7 +4316,7 @@ impl ZorIndex {
             let abandoned = read_u64(&mut reader)?;
             let cell_len = read_u64(&mut reader)? as usize;
             ensure!(
-                cell_len == union_layout.array_length * fingerprint_bytes,
+                cell_len == packed_row_bytes(union_layout.array_length, fingerprint_bytes)?,
                 "corrupt index: union cells length does not match slots"
             );
             let mut cells = vec![0u8; cell_len];
@@ -4268,9 +4378,8 @@ fn read_stack<R: Read>(
     color_count: usize,
     fingerprint_bytes: usize,
 ) -> Result<StackStorage> {
-    let row_bytes = color_count
-        .checked_mul(fingerprint_bytes)
-        .context("index dimensions overflow")?;
+    let row_bytes = packed_row_bytes(color_count, fingerprint_bytes)?;
+    let fingerprint_bytes = fingerprint_bytes.max(1);
     let expected_len = layout
         .array_length
         .checked_mul(row_bytes)
@@ -4690,7 +4799,7 @@ mod tests {
                             old.dropped,
                             new.dropped.iter().map(|&i| i as usize).collect::<Vec<_>>()
                         );
-                        for bits in [8, 16] {
+                        for bits in [1, 8, 16] {
                             assert_eq!(
                                 assign_cells(
                                     &keys,

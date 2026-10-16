@@ -152,6 +152,10 @@ fn short_default_command_matches_explicit_optimized_settings() {
                 .unwrap();
         assert_eq!(manifest["merge_planner"], "streaming");
         assert_eq!(manifest["column_order"], "compression");
+        assert_eq!(
+            manifest["construction_cell_storage"],
+            "two-pass-memory-packed-no-scratch"
+        );
         assert_eq!(manifest["abandoned_recovery"], true);
         assert_eq!(manifest["rejected_groups"], 0);
         let result = ok(&["query", "--index", &index, "--query", &query], "4");
@@ -219,7 +223,7 @@ fn merged_origins_and_serialized_size_classes_query_correctly() {
     let index = f.path("merged");
     build(&inputs, &index, &[]);
     let info = ok(&["info", "--index", &index], "1");
-    assert!(info.contains("construction_cell_storage\ttemporary-disk-u64"));
+    assert!(info.contains("construction_cell_storage\ttwo-pass-memory-packed-no-scratch"));
     assert!(info.contains("merge_planner\tstreaming"));
     assert!(info.contains("merge_column_order\tcompression"));
     assert!(!Path::new(&index).join("cells").exists());
@@ -790,6 +794,172 @@ fn full_64_bit_membership_payload_survives_unaligned_slice_serialization() {
             assert_eq!(matches(&query, &format!("b{id}")), 0);
         }
     }
+}
+
+#[test]
+fn two_pass_and_disk_backed_build_identical_filters_and_queries() {
+    let f = Fixture::new();
+    let shared = dna(1024, 17);
+    let mut inputs = String::new();
+    for id in 0..10 {
+        let seq = if id < 6 {
+            shared.clone()
+        } else {
+            dna([100, 300, 600, 1200][id - 6], id as u64)
+        };
+        let private = dna(45 + id * 7, id as u64 + 111);
+        let path = f.write(
+            &format!("d{id}.fa"),
+            format!(">r\n{seq}\n>private\n{private}\n"),
+        );
+        inputs.push_str(&format!("d{id}\t{path}\n"));
+    }
+    let fof = f.write("inputs.fof", inputs);
+    let query = f.write(
+        "query.fa",
+        format!(">present\n{shared}\n>absent\n{}\n", dna(300, 999)),
+    );
+    for planner in ["streaming", "streaming-unpruned", "all-pairs"] {
+        for fp in ["1", "8", "16"] {
+            for order in ["width", "compression"] {
+                let mut outputs = Vec::new();
+                let mut manifests = Vec::new();
+                let mut results = Vec::new();
+                for disk in [false, true] {
+                    let path = f.path(&format!("{planner}-{fp}-{order}-{disk}"));
+                    let mut args = vec![
+                        "--fingerprint-bits",
+                        fp,
+                        "--merge-planner",
+                        planner,
+                        "--merge-column-order",
+                        order,
+                    ];
+                    if disk {
+                        args.push("--disk-backed");
+                    }
+                    build(&fof, &path, &args);
+                    let mut json: serde_json::Value = serde_json::from_slice(
+                        &fs::read(Path::new(&path).join("manifest.json")).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        json["construction_cell_storage"],
+                        if disk {
+                            "temporary-disk-u64-tiled-packing"
+                        } else {
+                            "two-pass-memory-packed-no-scratch"
+                        }
+                    );
+                    for key in [
+                        "construction_cell_storage",
+                        "sketch_seconds",
+                        "plan_seconds",
+                        "build_seconds",
+                    ] {
+                        json.as_object_mut().unwrap().remove(key);
+                    }
+                    manifests.push(json);
+                    let output = ok(
+                        &["query", "--index", &path, "--query", &query],
+                        if disk { "1" } else { "4" },
+                    );
+                    results.push(
+                        output
+                            .lines()
+                            .filter(|l| !l.starts_with('#'))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    );
+                    outputs.push(path);
+                }
+                assert_eq!(manifests[0], manifests[1]);
+                assert_eq!(results[0], results[1]);
+                for entry in fs::read_dir(&outputs[0]).unwrap() {
+                    let name = entry.unwrap().file_name();
+                    if name == "manifest.json" {
+                        continue;
+                    }
+                    assert_eq!(
+                        fs::read(Path::new(&outputs[0]).join(&name)).unwrap(),
+                        fs::read(Path::new(&outputs[1]).join(&name)).unwrap(),
+                        "{name:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn scratch_free_mode_preserves_all_feature_extractors() {
+    let f = Fixture::new();
+    let sequence = dna(500, 42);
+    let a = f.write("a.fa", format!(">a\n{sequence}\n"));
+    let fof = f.write("inputs.fof", format!("a\t{a}\nb\t{a}\n"));
+    let query = f.write("query.fa", format!(">r\n{sequence}\n"));
+    for (mode, settings) in [
+        (
+            "minimizers",
+            vec![
+                "--k",
+                "49",
+                "--index-mode",
+                "minimizers",
+                "--minimizer-size",
+                "31",
+            ],
+        ),
+        (
+            "findere",
+            vec!["--k", "31", "--index-mode", "findere", "--findere-z", "10"],
+        ),
+        ("modimizers", vec!["--index-mode", "modimizers"]),
+        ("no-recovery", vec!["--drop-abandoned"]),
+    ] {
+        let memory = f.path(&format!("{mode}-memory"));
+        let disk = f.path(&format!("{mode}-disk"));
+        build(&fof, &memory, &settings);
+        let mut disk_settings = settings.clone();
+        disk_settings.push("--disk-backed");
+        build(&fof, &disk, &disk_settings);
+        let one = ok(&["query", "--index", &memory, "--query", &query], "4");
+        let two = ok(&["query", "--index", &disk, "--query", &query], "1");
+        assert_eq!(
+            one.lines().skip(1).collect::<Vec<_>>(),
+            two.lines().skip(1).collect::<Vec<_>>(),
+            "{mode}"
+        );
+        for entry in fs::read_dir(&memory).unwrap() {
+            let name = entry.unwrap().file_name();
+            if name == "manifest.json" {
+                continue;
+            }
+            assert_eq!(
+                fs::read(Path::new(&memory).join(&name)).unwrap(),
+                fs::read(Path::new(&disk).join(&name)).unwrap(),
+                "{mode} {name:?}"
+            );
+        }
+    }
+    let invalid = f.path("invalid");
+    assert!(!call(
+        &[
+            "build",
+            "--plain",
+            "--disk-backed",
+            "--fof",
+            &fof,
+            "--output",
+            &invalid,
+            "--k",
+            "31"
+        ],
+        "1"
+    )
+    .status
+    .success());
+    assert!(!Path::new(&invalid).exists());
 }
 
 #[test]

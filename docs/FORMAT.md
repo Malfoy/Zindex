@@ -22,7 +22,7 @@ Header fields:
 - version
 - `k`
 - ZOR hash count
-- fingerprint width (`8` or `16`)
+- fingerprint width (`1`, `8` or `16`); single-bit fingerprints are packed eight per byte, with each stack row rounded up to a whole byte
 - flags
 - seed
 - feature mode
@@ -34,12 +34,20 @@ Header fields:
 - slot-major stack
 - optional union graph
 
+For 1-bit fingerprints, a plain stack row occupies
+`ceil(technical_bin_count / 8)` bytes and a standalone filter (including a
+union graph) occupies `ceil(array_length / 8)` bytes. Bits are least-significant
+first within each byte. Slice codecs operate on these packed bytes with a
+one-byte codec element width; the header fingerprint width remains `1`.
+Unused final-byte bits are ignored by queries. The 8- and 16-bit layouts are
+unchanged.
+
 The stack can be stored plain or compressed. Plain stacks store all rows as
-contiguous little-endian fingerprint bytes. Compressed stacks store row offsets
+contiguous little-endian fingerprint bytes (or packed bits at width 1). Compressed stacks store row offsets
 and codec payload bytes. Each compressed row expands to:
 
 ```text
-technical_bin_count * fingerprint_bytes
+ceil(technical_bin_count * fingerprint_bits / 8)
 ```
 
 The query path computes row positions once per feature. In plain mode it XORs
@@ -116,10 +124,18 @@ group members and widths, bank sizes and abandoned-key map metadata.
 Each `bank-<exponent>.zorbank.zst` expands to magic `ZORPOW3\0`, followed by
 four little-endian `u64` values: slots, bits per row, group count and data bytes.
 Rows have `ceil(bits_per_row / 8)` bytes. Each row begins with all groups'
-8- or 16-bit fingerprints, followed by their packed origin bits. Singleton
+1-, 8- or 16-bit fingerprints, followed immediately by their packed origin bits. Singleton
 groups have no origin bits. Group offsets in the manifest describe the original
 complete-payload prefix; the origin-plane offset for group `i` is
 `group_count * fingerprint_bits + group.offset - i * fingerprint_bits`.
+
+Construction mode does not change the bank encoding or query layout. The default
+two-pass builder records `construction_cell_storage` as
+`two-pass-memory-packed-no-scratch`; `--disk-backed` records
+`temporary-disk-u64-tiled-packing`. The two-pass publication directory contains
+only final index files, with verified cells retained bit-packed in RAM until
+bank compression. First-pass projected capacities may differ from exact final
+capacities; this does not change the planned dataset membership partition.
 
 `abandoned.zormap.zst` expands to magic `ZORABN1\0`, followed by records:
 32-bit abandoned-key hash, 32-bit origin count, then that many 32-bit origin IDs.
