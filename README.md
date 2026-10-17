@@ -314,7 +314,7 @@ New indexes use manifest/bank layout version 3 and require an updated reader.
 reverted**, even when exact union cardinalities, byte padding or fallback entries
 erase the estimated savings. Actual capacity is computed from exact union keys
 and remains a power of two; the planned membership partition is unchanged.
-Construction defaults to **two input passes without temporary key or cell files**:
+Construction defaults to **two input passes without temporary key files**:
 
 1. Extract each dataset's exact cardinality and mergeable sketch, decide merges,
    and project the power-of-two bank layout. Only sketches, counts, feature
@@ -324,20 +324,24 @@ Construction defaults to **two input passes without temporary key or cell files*
    power-of-two sizes; estimates are not hard capacities and merges are never
    reverted. Changed indexed features between passes cause a clean error.
 
-Completed filters are retained **bit-packed at their actual payload width in
-RAM**, not as 64-bit cells. The existing compression-aware column ordering is
-preserved using exactly the same cell samples. Bank packing uses bounded row
-tiles and writes directly to zstd; banks already written are released from RAM.
-The atomic publication directory contains only the final index files, not
-construction caches. Disk space is needed for the output, but not collection-wide
-key/cell scratch files. Both passes use `--build-jobs` to bound concurrent work.
+Completed filters are **bit-packed at their actual payload width**, not stored
+as 64-bit cells, and staged by default as temporary cell files inside the
+construction directory next to the output, so the scratch footprint is about the
+uncompressed size of the final banks and RAM holds only planning metadata and
+the active groups' keys/payloads/graphs. The existing compression-aware column
+ordering is preserved using exactly the same cell samples. Bank packing reads
+bounded row tiles from the staged cells and writes directly to zstd; each bank's
+cell files are removed once it is written. The atomic publication directory
+contains only the final index files. Both passes use `--build-jobs` to bound
+concurrent work.
 
-RAM must fit the completed packed filters, planning metadata and active groups'
-keys/payloads/graphs. To trade RAM for scratch disk, explicitly add `--disk-backed`:
-that mode retains the previous single-extraction builder, using temporary `u64`
-feature and cell caches followed by tiled bank packing. Both modes produce
-identical bank files and the same global abandoned-key map for unchanged inputs,
-settings and column order; only construction metadata and timings differ.
+To build without any scratch disk, add `--low-disk`: the same packed filters are
+then retained in RAM until bank compression, so RAM must also fit every
+completed packed filter. `--disk-backed` retains the previous single-extraction
+builder, using temporary `u64` feature and cell caches followed by tiled bank
+packing. All modes produce identical bank files and the same global
+abandoned-key map for unchanged inputs, settings and column order; only
+construction metadata and timings differ.
 
 Graph positions, adjacency, offsets and peel records use checked 32-bit indices
 where possible, with a wide fallback. A mutable indexed degree heap avoids stale

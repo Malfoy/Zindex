@@ -131,11 +131,13 @@ complete-payload prefix; the origin-plane offset for group `i` is
 
 Construction mode does not change the bank encoding or query layout. The default
 two-pass builder records `construction_cell_storage` as
-`two-pass-memory-packed-no-scratch`; `--disk-backed` records
-`temporary-disk-u64-tiled-packing`. The two-pass publication directory contains
-only final index files, with verified cells retained bit-packed in RAM until
-bank compression. First-pass projected capacities may differ from exact final
-capacities; this does not change the planned dataset membership partition.
+`two-pass-temporary-disk-packed-tiled-packing` (verified cells staged as files
+bit-packed at the group's payload width until bank compression); `--low-disk`
+records `two-pass-memory-packed-no-scratch` (the same packed cells retained in
+RAM); `--disk-backed` records `temporary-disk-u64-tiled-packing`. The two-pass
+publication directory contains only final index files. First-pass projected
+capacities may differ from exact final capacities; this does not change the
+planned dataset membership partition.
 
 `abandoned.zormap.zst` expands to magic `ZORABN1\0`, followed by records:
 32-bit abandoned-key hash, 32-bit origin count, then that many 32-bit origin IDs.

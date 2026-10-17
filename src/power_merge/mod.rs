@@ -84,6 +84,11 @@ pub struct MergeArgs {
     /// The default keeps completed filters bit-packed in RAM until compression.
     #[arg(long, conflicts_with = "plain")]
     pub disk_backed: bool,
+    /// Keep completed filters bit-packed in RAM until bank compression instead of
+    /// staging them as bit-packed cell files next to the output. Needs no scratch
+    /// disk, but RAM must then hold every completed filter.
+    #[arg(long, conflicts_with_all = ["plain", "disk_backed"])]
+    pub low_disk: bool,
 }
 impl Default for MergeArgs {
     fn default() -> Self {
@@ -97,6 +102,7 @@ impl Default for MergeArgs {
             disabled: false,
             drop_abandoned: false,
             disk_backed: false,
+            low_disk: false,
         }
     }
 }

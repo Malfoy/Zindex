@@ -140,7 +140,17 @@ enum CompletedCells {
         width: usize,
         slots: usize,
     },
+    // The bytes of `Packed` staged in a file (default mode).
+    PackedDisk {
+        path: PathBuf,
+        width: usize,
+        slots: usize,
+    },
 }
+
+// Slots per write when staging packed cells: a multiple of 8, so every chunk is
+// byte-aligned and the chunks concatenate into exactly the `Packed` byte image.
+const STAGED_CHUNK_SLOTS: usize = 1 << 20;
 
 impl CompletedCells {
     fn packed(cells: &[u64], width: usize) -> Result<Self> {
@@ -154,6 +164,23 @@ impl CompletedCells {
         }
         Ok(Self::Packed {
             data,
+            width,
+            slots: cells.len(),
+        })
+    }
+
+    // Pack and write a chunk of slots at a time, so staging never needs a
+    // second full-size buffer next to the u64 cells.
+    fn packed_disk(cells: &[u64], width: usize, path: PathBuf) -> Result<Self> {
+        let mut writer = BufWriter::new(File::create(&path)?);
+        for chunk in cells.chunks(STAGED_CHUNK_SLOTS) {
+            if let Self::Packed { data, .. } = Self::packed(chunk, width)? {
+                writer.write_all(&data)?;
+            }
+        }
+        writer.flush()?;
+        Ok(Self::PackedDisk {
+            path,
             width,
             slots: cells.len(),
         })
@@ -182,13 +209,27 @@ impl CompletedCells {
                             .div_ceil(8),
                 "invalid packed completed filter"
             ),
+            Self::PackedDisk {
+                path,
+                width: stored_width,
+                slots: stored_slots,
+            } => ensure!(
+                *stored_width == width
+                    && *stored_slots == slots
+                    && fs::metadata(path)?.len()
+                        == slots
+                            .checked_mul(width)
+                            .context("filter size overflow")?
+                            .div_ceil(8) as u64,
+                "invalid packed completed filter cache"
+            ),
         }
         Ok(())
     }
 
     fn open(&self) -> std::io::Result<Option<File>> {
         match self {
-            Self::Disk(path) => File::open(path).map(Some),
+            Self::Disk(path) | Self::PackedDisk { path, .. } => File::open(path).map(Some),
             Self::Packed { .. } => Ok(None),
         }
     }
@@ -226,12 +267,40 @@ impl CompletedCells {
                     );
                 }
             }
+            Self::PackedDisk { path, width, slots } => {
+                let rows = output.len() / 8;
+                ensure!(
+                    start
+                        .checked_add(rows)
+                        .is_some_and(|end| end <= *slots),
+                    "cell read out of bounds"
+                );
+                // Read only the bytes covering the requested slots, then unpack
+                // them exactly as the in-RAM `Packed` arm does.
+                let first_bit = start * width;
+                let first_byte = first_bit / 8;
+                let mut window = vec![0; ((start + rows) * width).div_ceil(8) - first_byte];
+                let mut reopened;
+                let reader = if let Some(file) = file {
+                    file
+                } else {
+                    reopened = File::open(path)?;
+                    &mut reopened
+                };
+                reader.seek(SeekFrom::Start(first_byte as u64))?;
+                reader.read_exact(&mut window)?;
+                for (i, bytes) in output.chunks_exact_mut(8).enumerate() {
+                    bytes.copy_from_slice(
+                        &get_bits(&window, first_bit % 8 + i * width, *width).to_le_bytes(),
+                    );
+                }
+            }
         }
         Ok(())
     }
 
     fn remove(self) -> Result<()> {
-        if let Self::Disk(path) = self {
+        if let Self::Disk(path) | Self::PackedDisk { path, .. } = self {
             fs::remove_file(path)?;
         }
         Ok(())
@@ -309,6 +378,8 @@ pub fn build(
     fs::create_dir(&stage.0)?;
     if config.merge.disk_backed {
         fs::create_dir(stage.0.join("features"))?;
+    }
+    if !config.merge.low_disk {
         fs::create_dir(stage.0.join("cells"))?;
     }
     eprintln!(
@@ -428,7 +499,8 @@ pub fn build(
                 } else {
                     let (keys, values) =
                         union_input_features(group, &inputs, &colors, &input_signatures, &config)?;
-                    construct_group(group, keys, values, None, &config, &graph)
+                    let stage = (!config.merge.low_disk).then_some(stage.0.as_path());
+                    construct_group(group, keys, values, stage, &config, &graph)
                 }
             })
             .collect::<Result<Vec<_>>>()?;
@@ -449,8 +521,10 @@ pub fn build(
         &stage.0,
     )?;
     if config.merge.disk_backed {
-        fs::remove_dir(stage.0.join("cells"))?;
         fs::remove_dir(stage.0.join("features"))?;
+    }
+    if !config.merge.low_disk {
+        fs::remove_dir(stage.0.join("cells"))?;
     }
     let mut manifest = Manifest {
         version: 3,
@@ -476,8 +550,10 @@ pub fn build(
         merge_reverts_enabled: false,
         construction_cell_storage: if config.merge.disk_backed {
             "temporary-disk-u64-tiled-packing"
-        } else {
+        } else if config.merge.low_disk {
             "two-pass-memory-packed-no-scratch"
+        } else {
+            "two-pass-temporary-disk-packed-tiled-packing"
         }
         .into(),
         slot_scale: config.slot_scale,
@@ -700,19 +776,28 @@ fn construct_group(
         } else {
             0
         }) as u64;
-    // Release graph/union workspaces before retaining completed cells, either
-    // bit-packed in RAM (default) or in the opt-in disk cache.
+    // Release graph/union workspaces before retaining completed cells: bit-packed
+    // in a staged file (default), bit-packed in RAM (--low-disk), or in the
+    // --disk-backed u64 cell cache.
     drop(peeled);
     drop(values);
     drop(keys);
-    let cells = if let Some(stage) = cache_stage {
-        let path = stage
-            .join("cells")
-            .join(format!("{}.u64", group.members[0]));
-        cache_write(&path, &cells)?;
-        CompletedCells::Disk(path)
-    } else {
-        CompletedCells::packed(&cells, group.width)?
+    let cells = match cache_stage {
+        Some(stage) if config.merge.disk_backed => {
+            let path = stage
+                .join("cells")
+                .join(format!("{}.u64", group.members[0]));
+            cache_write(&path, &cells)?;
+            CompletedCells::Disk(path)
+        }
+        Some(stage) => CompletedCells::packed_disk(
+            &cells,
+            group.width,
+            stage
+                .join("cells")
+                .join(format!("{}.bits", group.members[0])),
+        )?,
+        None => CompletedCells::packed(&cells, group.width)?,
     };
     Ok((
         BuiltGroup {
@@ -794,7 +879,7 @@ fn transpose(groups: Vec<BuiltGroup>, order: ColumnOrder) -> Result<Vec<Bank>> {
         for group in &groups {
             let cells = match &group.cells {
                 CompletedCells::Disk(path) => cache_read(path)?,
-                CompletedCells::Packed { .. } => {
+                CompletedCells::Packed { .. } | CompletedCells::PackedDisk { .. } => {
                     let mut bytes = vec![0; slots * 8];
                     group.cells.read_block(0, &mut bytes, None)?;
                     bytes
@@ -1852,20 +1937,33 @@ mod tests {
                 if let CompletedCells::Packed { data, .. } = &group.cells {
                     assert_eq!(data.len(), (width * slots).div_ceil(8));
                 }
-                assert_eq!(column_sample(&group).unwrap(), expected_sample);
-                let mut block = vec![0; (slots - 1) * 8];
-                group.cells.read_block(1, &mut block, None).unwrap();
-                let actual: Vec<_> = block
-                    .chunks_exact(8)
-                    .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
-                    .collect();
-                assert_eq!(actual, cells[1..]);
-                assert!(group.cells.read_block(slots, &mut [0; 8], None).is_err());
+                let staged = stage.0.join(format!("{width}-{slots}.bits"));
+                for cells_in_file in [false, true] {
+                    if cells_in_file {
+                        group.cells =
+                            CompletedCells::packed_disk(&cells, width, staged.clone()).unwrap();
+                        assert_eq!(
+                            fs::metadata(&staged).unwrap().len(),
+                            (width * slots).div_ceil(8) as u64
+                        );
+                    }
+                    assert_eq!(column_sample(&group).unwrap(), expected_sample);
+                    let mut block = vec![0; (slots - 1) * 8];
+                    group.cells.read_block(1, &mut block, None).unwrap();
+                    let actual: Vec<_> = block
+                        .chunks_exact(8)
+                        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                        .collect();
+                    assert_eq!(actual, cells[1..]);
+                    assert!(group.cells.read_block(slots, &mut [0; 8], None).is_err());
+                }
+                group.cells.remove().unwrap();
+                assert!(!staged.exists());
             }
         }
     }
 
-    fn scratch_free_config() -> BuildConfig {
+    fn scratch_free_config(low_disk: bool) -> BuildConfig {
         BuildConfig {
             backend: Backend::Zor,
             k: 3,
@@ -1878,6 +1976,7 @@ mod tests {
             merge: super::super::MergeArgs {
                 disabled: true,
                 sketch_size: 64,
+                low_disk,
                 ..Default::default()
             },
             build_jobs: 1,
@@ -1899,7 +1998,16 @@ mod tests {
     }
 
     #[test]
-    fn default_two_pass_never_creates_scratch_files_during_construction() {
+    fn low_disk_never_creates_scratch_files_during_construction() {
+        two_pass_stages_only_packed_cells(true);
+    }
+
+    #[test]
+    fn default_two_pass_stages_only_packed_cells_during_construction() {
+        two_pass_stages_only_packed_cells(false);
+    }
+
+    fn two_pass_stages_only_packed_cells(low_disk: bool) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let root = temporary_stage();
         let first = root.0.join("a.fa");
@@ -1914,7 +2022,7 @@ mod tests {
         .unwrap();
         let output = root.0.join("index");
         let calls = AtomicUsize::new(0);
-        build(&fof, &output, scratch_free_config(), |keys, slots| {
+        build(&fof, &output, scratch_free_config(low_disk), |keys, slots| {
             calls.fetch_add(1, Ordering::Relaxed);
             let stages: Vec<_> = fs::read_dir(&root.0)
                 .unwrap()
@@ -1927,9 +2035,23 @@ mod tests {
                 })
                 .collect();
             assert_eq!(stages.len(), 1);
-            // Before final packing, the publication directory must be empty:
-            // no features/, cells/, cache files or other construction artifacts.
-            assert_eq!(fs::read_dir(&stages[0]).unwrap().count(), 0);
+            // Before final packing, the publication directory holds no
+            // features/, cache files or other construction artifacts: nothing
+            // at all with --low-disk, only packed cells of completed groups
+            // otherwise.
+            let entries: Vec<_> = fs::read_dir(&stages[0])
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            if low_disk {
+                assert!(entries.is_empty());
+            } else {
+                assert_eq!(entries, [stages[0].join("cells")]);
+                for cell in fs::read_dir(&entries[0]).unwrap() {
+                    let name = cell.unwrap().file_name();
+                    assert!(name.to_string_lossy().ends_with(".bits"), "{name:?}");
+                }
+            }
             Ok(dropped_test_graph(keys, slots))
         })
         .unwrap();
@@ -1937,7 +2059,11 @@ mod tests {
         let index = Index::load(&output).unwrap();
         assert_eq!(
             index.manifest.construction_cell_storage,
-            "two-pass-memory-packed-no-scratch"
+            if low_disk {
+                "two-pass-memory-packed-no-scratch"
+            } else {
+                "two-pass-temporary-disk-packed-tiled-packing"
+            }
         );
         for entry in fs::read_dir(&output).unwrap() {
             let entry = entry.unwrap();
@@ -1965,7 +2091,7 @@ mod tests {
         .unwrap();
         let calls = AtomicUsize::new(0);
         let output = root.0.join("index");
-        let result = build(&fof, &output, scratch_free_config(), |keys, slots| {
+        let result = build(&fof, &output, scratch_free_config(false), |keys, slots| {
             calls.fetch_add(1, Ordering::Relaxed);
             // Change the next dataset after planning, retaining its cardinality
             // and occurrence count so the feature signature must detect it.
