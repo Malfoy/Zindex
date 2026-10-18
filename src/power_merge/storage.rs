@@ -97,6 +97,9 @@ struct Manifest {
     predicted_logical_bits: u64,
     planned_groups: usize,
     rejected_groups: usize,
+    /// Groups whose exact union needed more slots than planned and were built at the next power of two.
+    #[serde(default)]
+    overflow_groups: usize,
     exact_group_verifications: u64,
     sketch_seconds: f64,
     plan_seconds: f64,
@@ -522,6 +525,11 @@ pub fn build(
             Ok(())
         },
     )?;
+    let overflow_groups = planned
+        .iter()
+        .zip(&built)
+        .filter(|(plan, group)| group.slots > plan.slots)
+        .count();
     let (abandoned_hashes, abandoned_origins) = if config.merge.drop_abandoned {
         (0, 0)
     } else {
@@ -574,6 +582,7 @@ pub fn build(
         predicted_logical_bits,
         planned_groups,
         rejected_groups,
+        overflow_groups,
         exact_group_verifications,
         sketch_seconds,
         plan_seconds,
@@ -591,9 +600,9 @@ pub fn build(
         output.display()
     );
     fs::rename(&stage.0, output)?;
-    eprintln!("built {} in {:.3}s: banks={}, groups={}, stack_bytes={}, fallback_bytes={}, rejected_groups={}",
+    eprintln!("built {} in {:.3}s: banks={}, groups={}, stack_bytes={}, fallback_bytes={}, rejected_groups={}, overflow_groups={}",
         output.display(), start.elapsed().as_secs_f64(), manifest.banks.len(), manifest.banks.iter().map(|b| b.groups.len()).sum::<usize>(),
-        manifest.banks.iter().map(|b| b.slots * b.row_bits.div_ceil(8)).sum::<usize>(), abandoned_hashes * 8 + abandoned_origins * 4, rejected_groups);
+        manifest.banks.iter().map(|b| b.slots * b.row_bits.div_ceil(8)).sum::<usize>(), abandoned_hashes * 8 + abandoned_origins * 4, rejected_groups, overflow_groups);
     Ok(())
 }
 
@@ -2518,6 +2527,7 @@ mod tests {
             predicted_logical_bits: 40,
             planned_groups: 1,
             rejected_groups: 0,
+            overflow_groups: 0,
             exact_group_verifications: 1,
             sketch_seconds: 0.0,
             plan_seconds: 0.0,

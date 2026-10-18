@@ -355,7 +355,11 @@ Fingerprints, origin assignments, hash positions, false positives and query
 counts are unchanged by construction mode.
 
 Options: `--merge-sketch-size` (4096 buckets), `--merge-max-colors` (48 datasets),
-`--merge-min-saving` (0; a fractional safety margin), and `--merge-disabled`
+`--merge-min-saving` (0; a fractional safety margin), `--merge-plan-margin`
+(0.03: each merged group is planned as if its estimated union were 3% larger,
+because the sketch estimate is noisy and an exact union that exceeds the planned
+power of two doubles the group's slots at build time; the manifest's
+`overflow_groups` counts the groups where that still happened), and `--merge-disabled`
 (power-of-two singleton banks for comparisons). Payloads currently fit at most
 64 bits, including the 1-, 8- or 16-bit fingerprint. `--slot-count` acts as a minimum
 per-group cell budget before rounding.

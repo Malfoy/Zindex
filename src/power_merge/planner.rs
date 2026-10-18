@@ -81,7 +81,8 @@ fn candidate(
         ga.cardinality.max(gb.cardinality),
         ga.cardinality + gb.cardinality,
     );
-    let slots = config.slots(cardinality)?;
+    // Size the merged group with a safety margin; the chained estimate itself stays uninflated.
+    let slots = config.slots(cardinality * (1.0 + config.merge.plan_margin))?;
     let old = cost(ga.slots, ga.width) + cost(gb.slots, gb.width);
     let new = cost(slots, config.width(count));
     if new >= old || (old - new) as f64 <= old as f64 * config.merge.min_saving {
@@ -317,7 +318,11 @@ mod tests {
             feature_config: FeatureConfig::legacy_kmers(),
             slot_scale: 1.0,
             minimum_slots: None,
-            merge: MergeArgs::default(),
+            // Exact sizes: these tests check the cost rule itself, not the sketch-noise margin.
+            merge: MergeArgs {
+                plan_margin: 0.0,
+                ..MergeArgs::default()
+            },
         }
     }
     #[test]
