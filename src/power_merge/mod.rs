@@ -73,6 +73,10 @@ pub struct MergeArgs {
     /// Require this fraction of predicted bit savings before accepting a merge.
     #[arg(long = "merge-min-saving", default_value_t = 0.0)]
     pub min_saving: f64,
+    /// Plan each merged group as if its estimated union were this fraction larger, so sketch noise does not push
+    /// the exact union past the planned power of two at build time (which doubles the group's slots).
+    #[arg(long = "merge-plan-margin", default_value_t = 0.03)]
+    pub plan_margin: f64,
     /// Keep singleton power-of-two banks, for measuring sizing independently of merging.
     #[arg(long = "merge-disabled")]
     pub disabled: bool,
@@ -99,6 +103,7 @@ impl Default for MergeArgs {
             sketch_size: 4096,
             max_colors: 48,
             min_saving: 0.0,
+            plan_margin: 0.03,
             disabled: false,
             drop_abandoned: false,
             disk_backed: false,
@@ -159,6 +164,10 @@ impl BuildConfig {
         ensure!(
             self.merge.min_saving.is_finite() && (0.0..1.0).contains(&self.merge.min_saving),
             "--merge-min-saving must be in [0, 1)"
+        );
+        ensure!(
+            self.merge.plan_margin.is_finite() && (0.0..0.5).contains(&self.merge.plan_margin),
+            "--merge-plan-margin must be in [0, 0.5)"
         );
         ensure!(
             self.merge.max_colors + self.fingerprint_bits <= 64,
