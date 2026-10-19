@@ -287,6 +287,13 @@ greedy optimizers, not globally optimal partition searches. Streaming is plannin
 only: all filters are constructed once after the batch's final plan is known.
 
 Use `--merge-planner all-pairs` to opt into the all-pairs planner.
+
+The streaming planner merges each dataset into the best existing group as it
+arrives, so the input order matters: an order that keeps related genomes
+adjacent gives smaller groups, fewer candidate evaluations and a smaller index.
+`scripts/sort_fof_by_lineage.py LINEAGE_TSV IN.fof OUT.fof` orders a FOF by
+phylum, class, order, family, genus and species from a lineage table (the
+661k-bacteria `File2_taxid_lineage` layout); datasets without a lineage go last.
 All modes default to `--merge-column-order compression`: within each bank's
 equal-width sections, lexicographically sort samples from eight short windows
 of the actual completed filter cells. This bounded-memory heuristic puts identical
@@ -314,7 +321,7 @@ New indexes use manifest/bank layout version 3 and require an updated reader.
 reverted**, even when exact union cardinalities, byte padding or fallback entries
 erase the estimated savings. Actual capacity is computed from exact union keys
 and remains a power of two; the planned membership partition is unchanged.
-Construction defaults to **two input passes without temporary key or cell files**:
+Construction defaults to **two input passes without temporary key files**:
 
 1. Extract each dataset's exact cardinality and mergeable sketch, decide merges,
    and project the power-of-two bank layout. Only sketches, counts, feature
@@ -324,20 +331,29 @@ Construction defaults to **two input passes without temporary key or cell files*
    power-of-two sizes; estimates are not hard capacities and merges are never
    reverted. Changed indexed features between passes cause a clean error.
 
-Completed filters are retained **bit-packed at their actual payload width in
-RAM**, not as 64-bit cells. The existing compression-aware column ordering is
-preserved using exactly the same cell samples. Bank packing uses bounded row
-tiles and writes directly to zstd; banks already written are released from RAM.
-The atomic publication directory contains only the final index files, not
-construction caches. Disk space is needed for the output, but not collection-wide
-key/cell scratch files. Both passes use `--build-jobs` to bound concurrent work.
+Completed filters are **bit-packed at their actual payload width**, not stored
+as 64-bit cells, and staged by default as temporary cell files inside the
+construction directory next to the output, so the scratch footprint is about the
+uncompressed size of the final banks and RAM holds only planning metadata and
+the active groups' keys/payloads/graphs. The existing compression-aware column
+ordering is preserved using exactly the same cell samples. Bank packing reads
+bounded row tiles from the staged cells and writes directly to zstd; each bank's
+cell files are removed once it is written. The atomic publication directory
+contains only the final index files. Both passes run as tasks on the
+`--threads` rayon pool, which is the only concurrency setting. Parsing and
+planning overlap: one pool thread inserts each parsed dataset into the
+streaming planner, in input order, while the other threads parse the datasets
+queued ahead of it, and the planner's own candidate scans use the same pool.
+At most 1024 datasets are parsed ahead of the planner, so the slower side sets
+the pace and memory stays bounded. Nothing is split by hand.
 
-RAM must fit the completed packed filters, planning metadata and active groups'
-keys/payloads/graphs. To trade RAM for scratch disk, explicitly add `--disk-backed`:
-that mode retains the previous single-extraction builder, using temporary `u64`
-feature and cell caches followed by tiled bank packing. Both modes produce
-identical bank files and the same global abandoned-key map for unchanged inputs,
-settings and column order; only construction metadata and timings differ.
+To build without any scratch disk, add `--low-disk`: the same packed filters are
+then retained in RAM until bank compression, so RAM must also fit every
+completed packed filter. `--disk-backed` retains the previous single-extraction
+builder, using temporary `u64` feature and cell caches followed by tiled bank
+packing. All modes produce identical bank files and the same global
+abandoned-key map for unchanged inputs, settings and column order; only
+construction metadata and timings differ.
 
 Graph positions, adjacency, offsets and peel records use checked 32-bit indices
 where possible, with a wide fallback. A mutable indexed degree heap avoids stale
@@ -346,7 +362,11 @@ Fingerprints, origin assignments, hash positions, false positives and query
 counts are unchanged by construction mode.
 
 Options: `--merge-sketch-size` (4096 buckets), `--merge-max-colors` (48 datasets),
-`--merge-min-saving` (0; a fractional safety margin), and `--merge-disabled`
+`--merge-min-saving` (0; a fractional safety margin), `--merge-plan-margin`
+(0.03: each merged group is planned as if its estimated union were 3% larger,
+because the sketch estimate is noisy and an exact union that exceeds the planned
+power of two doubles the group's slots at build time; the manifest's
+`overflow_groups` counts the groups where that still happened), and `--merge-disabled`
 (power-of-two singleton banks for comparisons). Payloads currently fit at most
 64 bits, including the 1-, 8- or 16-bit fingerprint. `--slot-count` acts as a minimum
 per-group cell budget before rounding.

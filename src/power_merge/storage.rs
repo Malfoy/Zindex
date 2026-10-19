@@ -8,7 +8,7 @@ use crate::{
     create_index_writer, finish_index_writer, open_index_reader, parse_features_from_file,
     read_fof, splitmix64, ColorInput, FeatureConfig, IndexMode, MAX_HASHES,
 };
-use anyhow::{ensure, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -17,7 +17,12 @@ use std::{
     fs::{self, File},
     hash::{DefaultHasher, Hash, Hasher},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    panic::AssertUnwindSafe,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -92,6 +97,9 @@ struct Manifest {
     predicted_logical_bits: u64,
     planned_groups: usize,
     rejected_groups: usize,
+    /// Groups whose exact union needed more slots than planned and were built at the next power of two.
+    #[serde(default)]
+    overflow_groups: usize,
     exact_group_verifications: u64,
     sketch_seconds: f64,
     plan_seconds: f64,
@@ -140,7 +148,17 @@ enum CompletedCells {
         width: usize,
         slots: usize,
     },
+    // The bytes of `Packed` staged in a file (default mode).
+    PackedDisk {
+        path: PathBuf,
+        width: usize,
+        slots: usize,
+    },
 }
+
+// Slots per write when staging packed cells: a multiple of 8, so every chunk is
+// byte-aligned and the chunks concatenate into exactly the `Packed` byte image.
+const STAGED_CHUNK_SLOTS: usize = 1 << 20;
 
 impl CompletedCells {
     fn packed(cells: &[u64], width: usize) -> Result<Self> {
@@ -154,6 +172,23 @@ impl CompletedCells {
         }
         Ok(Self::Packed {
             data,
+            width,
+            slots: cells.len(),
+        })
+    }
+
+    // Pack and write a chunk of slots at a time, so staging never needs a
+    // second full-size buffer next to the u64 cells.
+    fn packed_disk(cells: &[u64], width: usize, path: PathBuf) -> Result<Self> {
+        let mut writer = BufWriter::new(File::create(&path)?);
+        for chunk in cells.chunks(STAGED_CHUNK_SLOTS) {
+            if let Self::Packed { data, .. } = Self::packed(chunk, width)? {
+                writer.write_all(&data)?;
+            }
+        }
+        writer.flush()?;
+        Ok(Self::PackedDisk {
+            path,
             width,
             slots: cells.len(),
         })
@@ -182,13 +217,27 @@ impl CompletedCells {
                             .div_ceil(8),
                 "invalid packed completed filter"
             ),
+            Self::PackedDisk {
+                path,
+                width: stored_width,
+                slots: stored_slots,
+            } => ensure!(
+                *stored_width == width
+                    && *stored_slots == slots
+                    && fs::metadata(path)?.len()
+                        == slots
+                            .checked_mul(width)
+                            .context("filter size overflow")?
+                            .div_ceil(8) as u64,
+                "invalid packed completed filter cache"
+            ),
         }
         Ok(())
     }
 
     fn open(&self) -> std::io::Result<Option<File>> {
         match self {
-            Self::Disk(path) => File::open(path).map(Some),
+            Self::Disk(path) | Self::PackedDisk { path, .. } => File::open(path).map(Some),
             Self::Packed { .. } => Ok(None),
         }
     }
@@ -226,12 +275,40 @@ impl CompletedCells {
                     );
                 }
             }
+            Self::PackedDisk { path, width, slots } => {
+                let rows = output.len() / 8;
+                ensure!(
+                    start
+                        .checked_add(rows)
+                        .is_some_and(|end| end <= *slots),
+                    "cell read out of bounds"
+                );
+                // Read only the bytes covering the requested slots, then unpack
+                // them exactly as the in-RAM `Packed` arm does.
+                let first_bit = start * width;
+                let first_byte = first_bit / 8;
+                let mut window = vec![0; ((start + rows) * width).div_ceil(8) - first_byte];
+                let mut reopened;
+                let reader = if let Some(file) = file {
+                    file
+                } else {
+                    reopened = File::open(path)?;
+                    &mut reopened
+                };
+                reader.seek(SeekFrom::Start(first_byte as u64))?;
+                reader.read_exact(&mut window)?;
+                for (i, bytes) in output.chunks_exact_mut(8).enumerate() {
+                    bytes.copy_from_slice(
+                        &get_bits(&window, first_bit % 8 + i * width, *width).to_le_bytes(),
+                    );
+                }
+            }
         }
         Ok(())
     }
 
     fn remove(self) -> Result<()> {
-        if let Self::Disk(path) = self {
+        if let Self::Disk(path) | Self::PackedDisk { path, .. } = self {
             fs::remove_file(path)?;
         }
         Ok(())
@@ -309,6 +386,8 @@ pub fn build(
     fs::create_dir(&stage.0)?;
     if config.merge.disk_backed {
         fs::create_dir(stage.0.join("features"))?;
+    }
+    if !config.merge.low_disk {
         fs::create_dir(stage.0.join("cells"))?;
     }
     eprintln!(
@@ -323,50 +402,50 @@ pub fn build(
     let mut plan_seconds = 0.0;
     let mut sketch_seconds = 0.0;
     let mut input_signatures = Vec::with_capacity(inputs.len());
-    for (chunk_id, chunk) in inputs.chunks(config.build_jobs).enumerate() {
-        let parsed = chunk
-            .par_iter()
-            .enumerate()
-            .map(|(offset, input)| {
-                let id = chunk_id * config.build_jobs + offset;
-                let mut keys = Vec::new();
-                let mut occurrences = 0;
-                parse_features_from_file(
-                    &input.path,
-                    config.k,
-                    config.seed,
-                    config.feature_config,
-                    |key| {
-                        occurrences += 1;
-                        keys.push(key);
-                    },
-                )?;
-                keys.sort_unstable();
-                keys.dedup();
-                let sketch_start = Instant::now();
-                let sketch = Sketch::new(&keys, config.merge.sketch_size, config.seed);
-                let sketch_sec = sketch_start.elapsed().as_secs_f64();
-                let signature = if config.merge.disk_backed {
-                    cache_write(&cache_path(&stage.0, id), &keys)?;
-                    0
-                } else {
-                    feature_signature(&keys, occurrences)
-                };
-                let color = Color {
-                    name: input.name.clone(),
-                    path: input.path.to_string_lossy().into_owned(),
-                    occurrences,
-                    unique_kmers: keys.len(),
-                };
-                Ok((
-                    color,
-                    planner::singleton(keys.len(), sketch, id, &config)?,
-                    sketch_sec,
-                    signature,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        for (color, group, seconds, signature) in parsed {
+    // Every dataset is parsed as a task on the rayon pool while this loop, itself on a pool thread, inserts the
+    // results into the planner in FOF order. Idle threads take the oldest queued task first, so they parse while
+    // this thread plans, and the planner's own parallel scans split onto the same pool when it is free.
+    rayon::scope(|_| pull_jobs(
+        &inputs,
+        PLANNER_LOOKAHEAD,
+        |id, input| {
+            let mut keys = Vec::new();
+            let mut occurrences = 0;
+            parse_features_from_file(
+                &input.path,
+                config.k,
+                config.seed,
+                config.feature_config,
+                |key| {
+                    occurrences += 1;
+                    keys.push(key);
+                },
+            )?;
+            keys.sort_unstable();
+            keys.dedup();
+            let sketch_start = Instant::now();
+            let sketch = Sketch::new(&keys, config.merge.sketch_size, config.seed);
+            let sketch_sec = sketch_start.elapsed().as_secs_f64();
+            let signature = if config.merge.disk_backed {
+                cache_write(&cache_path(&stage.0, id), &keys)?;
+                0
+            } else {
+                feature_signature(&keys, occurrences)
+            };
+            let color = Color {
+                name: input.name.clone(),
+                path: input.path.to_string_lossy().into_owned(),
+                occurrences,
+                unique_kmers: keys.len(),
+            };
+            Ok((
+                color,
+                planner::singleton(keys.len(), sketch, id, &config)?,
+                sketch_sec,
+                signature,
+            ))
+        },
+        |_, (color, group, seconds, signature)| {
             input_signatures.push(signature);
             colors.push(color);
             singleton_logical_bits += planner::cost(group.slots, group.width);
@@ -378,8 +457,15 @@ pub fn build(
                 initial.push(group);
             }
             sketch_seconds += seconds;
-        }
-    }
+            Ok(())
+        },
+    ))?;
+    eprintln!(
+        "sketched {} datasets in {:.3}s; the planner was busy for {:.3}s of it",
+        colors.len(),
+        start.elapsed().as_secs_f64(),
+        plan_seconds
+    );
     let singleton_logical_bits = u64::try_from(singleton_logical_bits)?;
     let plan_start = Instant::now();
     let plan = if config.merge.planner.is_streaming() {
@@ -419,24 +505,31 @@ pub fn build(
     let mut built = Vec::new();
     let rejected_groups = 0;
     let mut exact_group_verifications = 0;
-    for chunk in planned.chunks(config.build_jobs) {
-        let results = chunk
-            .par_iter()
-            .map(|group| {
-                if config.merge.disk_backed {
-                    build_group(group, &stage.0, &config, &graph)
-                } else {
-                    let (keys, values) =
-                        union_input_features(group, &inputs, &colors, &input_signatures, &config)?;
-                    construct_group(group, keys, values, None, &config, &graph)
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        for (group, verified) in results {
+    // All groups are queued at once; the pool builds them `--threads` at a time in plan order.
+    pull_jobs(
+        &planned,
+        usize::MAX,
+        |_, group| {
+            if config.merge.disk_backed {
+                build_group(group, &stage.0, &config, &graph)
+            } else {
+                let (keys, values) =
+                    union_input_features(group, &inputs, &colors, &input_signatures, &config)?;
+                let stage = (!config.merge.low_disk).then_some(stage.0.as_path());
+                construct_group(group, keys, values, stage, &config, &graph)
+            }
+        },
+        |_, (group, verified)| {
             built.push(group);
             exact_group_verifications += verified;
-        }
-    }
+            Ok(())
+        },
+    )?;
+    let overflow_groups = planned
+        .iter()
+        .zip(&built)
+        .filter(|(plan, group)| group.slots > plan.slots)
+        .count();
     let (abandoned_hashes, abandoned_origins) = if config.merge.drop_abandoned {
         (0, 0)
     } else {
@@ -449,8 +542,10 @@ pub fn build(
         &stage.0,
     )?;
     if config.merge.disk_backed {
-        fs::remove_dir(stage.0.join("cells"))?;
         fs::remove_dir(stage.0.join("features"))?;
+    }
+    if !config.merge.low_disk {
+        fs::remove_dir(stage.0.join("cells"))?;
     }
     let mut manifest = Manifest {
         version: 3,
@@ -476,8 +571,10 @@ pub fn build(
         merge_reverts_enabled: false,
         construction_cell_storage: if config.merge.disk_backed {
             "temporary-disk-u64-tiled-packing"
-        } else {
+        } else if config.merge.low_disk {
             "two-pass-memory-packed-no-scratch"
+        } else {
+            "two-pass-temporary-disk-packed-tiled-packing"
         }
         .into(),
         slot_scale: config.slot_scale,
@@ -485,6 +582,7 @@ pub fn build(
         predicted_logical_bits,
         planned_groups,
         rejected_groups,
+        overflow_groups,
         exact_group_verifications,
         sketch_seconds,
         plan_seconds,
@@ -502,10 +600,62 @@ pub fn build(
         output.display()
     );
     fs::rename(&stage.0, output)?;
-    eprintln!("built {} in {:.3}s: banks={}, groups={}, stack_bytes={}, fallback_bytes={}, rejected_groups={}",
+    eprintln!("built {} in {:.3}s: banks={}, groups={}, stack_bytes={}, fallback_bytes={}, rejected_groups={}, overflow_groups={}",
         output.display(), start.elapsed().as_secs_f64(), manifest.banks.len(), manifest.banks.iter().map(|b| b.groups.len()).sum::<usize>(),
-        manifest.banks.iter().map(|b| b.slots * b.row_bits.div_ceil(8)).sum::<usize>(), abandoned_hashes * 8 + abandoned_origins * 4, rejected_groups);
+        manifest.banks.iter().map(|b| b.slots * b.row_bits.div_ceil(8)).sum::<usize>(), abandoned_hashes * 8 + abandoned_origins * 4, rejected_groups, overflow_groups);
     Ok(())
+}
+
+/// How many datasets parsing may run ahead of the planner; each waiting dataset holds a sketch of about 32 KiB.
+const PLANNER_LOOKAHEAD: usize = 1024;
+
+/// Runs `work` on every item as a task on the rayon pool and hands the results to `consume` in item order on the
+/// calling thread, keeping at most `in_flight` items started but not yet consumed. The pool runs the tasks in item
+/// order, as many at a time as it has threads, so one slow item never idles the others, and parallel work inside
+/// `consume` (the planner) shares those same threads. Nothing more is started after the first error.
+fn pull_jobs<T: Sync, R: Send>(
+    items: &[T],
+    in_flight: usize,
+    work: impl Fn(usize, &T) -> Result<R> + Sync,
+    mut consume: impl FnMut(usize, R) -> Result<()>,
+) -> Result<()> {
+    let failed = AtomicBool::new(false);
+    let (tx, rx) = mpsc::channel();
+    rayon::in_place_scope(|scope| {
+        let mut started = 0;
+        // Results arrive in completion order; hold them until their predecessors are consumed.
+        let mut pending = BTreeMap::new();
+        let outcome = (0..items.len()).try_for_each(|next| {
+            while started < items.len().min(next.saturating_add(in_flight)) {
+                let i = started;
+                let (tx, failed, work) = (tx.clone(), &failed, &work);
+                scope.spawn(move |_| {
+                    if failed.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    // A panic must still produce a result, or the loop below would wait for it forever.
+                    let result = std::panic::catch_unwind(AssertUnwindSafe(|| work(i, &items[i])))
+                        .unwrap_or_else(|_| Err(anyhow!("task {i} panicked")));
+                    let _ = tx.send((i, result));
+                });
+                started += 1;
+            }
+            while !pending.contains_key(&next) {
+                // On a pool thread, run queued tasks rather than wait for the other threads (there may be none).
+                let (i, result) = match rx.try_recv() {
+                    Ok(message) => message,
+                    Err(_) if rayon::yield_now() == Some(rayon::Yield::Executed) => continue,
+                    Err(_) => rx.recv()?,
+                };
+                pending.insert(i, result?);
+            }
+            consume(next, pending.remove(&next).unwrap())
+        });
+        if outcome.is_err() {
+            failed.store(true, Ordering::Relaxed);
+        }
+        outcome
+    })
 }
 
 fn union_features(group: &planner::Group, stage: &Path) -> Result<(Vec<u64>, Vec<u64>)> {
@@ -700,19 +850,28 @@ fn construct_group(
         } else {
             0
         }) as u64;
-    // Release graph/union workspaces before retaining completed cells, either
-    // bit-packed in RAM (default) or in the opt-in disk cache.
+    // Release graph/union workspaces before retaining completed cells: bit-packed
+    // in a staged file (default), bit-packed in RAM (--low-disk), or in the
+    // --disk-backed u64 cell cache.
     drop(peeled);
     drop(values);
     drop(keys);
-    let cells = if let Some(stage) = cache_stage {
-        let path = stage
-            .join("cells")
-            .join(format!("{}.u64", group.members[0]));
-        cache_write(&path, &cells)?;
-        CompletedCells::Disk(path)
-    } else {
-        CompletedCells::packed(&cells, group.width)?
+    let cells = match cache_stage {
+        Some(stage) if config.merge.disk_backed => {
+            let path = stage
+                .join("cells")
+                .join(format!("{}.u64", group.members[0]));
+            cache_write(&path, &cells)?;
+            CompletedCells::Disk(path)
+        }
+        Some(stage) => CompletedCells::packed_disk(
+            &cells,
+            group.width,
+            stage
+                .join("cells")
+                .join(format!("{}.bits", group.members[0])),
+        )?,
+        None => CompletedCells::packed(&cells, group.width)?,
     };
     Ok((
         BuiltGroup {
@@ -794,7 +953,7 @@ fn transpose(groups: Vec<BuiltGroup>, order: ColumnOrder) -> Result<Vec<Bank>> {
         for group in &groups {
             let cells = match &group.cells {
                 CompletedCells::Disk(path) => cache_read(path)?,
-                CompletedCells::Packed { .. } => {
+                CompletedCells::Packed { .. } | CompletedCells::PackedDisk { .. } => {
                     let mut bytes = vec![0; slots * 8];
                     group.cells.read_block(0, &mut bytes, None)?;
                     bytes
@@ -1852,20 +2011,33 @@ mod tests {
                 if let CompletedCells::Packed { data, .. } = &group.cells {
                     assert_eq!(data.len(), (width * slots).div_ceil(8));
                 }
-                assert_eq!(column_sample(&group).unwrap(), expected_sample);
-                let mut block = vec![0; (slots - 1) * 8];
-                group.cells.read_block(1, &mut block, None).unwrap();
-                let actual: Vec<_> = block
-                    .chunks_exact(8)
-                    .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
-                    .collect();
-                assert_eq!(actual, cells[1..]);
-                assert!(group.cells.read_block(slots, &mut [0; 8], None).is_err());
+                let staged = stage.0.join(format!("{width}-{slots}.bits"));
+                for cells_in_file in [false, true] {
+                    if cells_in_file {
+                        group.cells =
+                            CompletedCells::packed_disk(&cells, width, staged.clone()).unwrap();
+                        assert_eq!(
+                            fs::metadata(&staged).unwrap().len(),
+                            (width * slots).div_ceil(8) as u64
+                        );
+                    }
+                    assert_eq!(column_sample(&group).unwrap(), expected_sample);
+                    let mut block = vec![0; (slots - 1) * 8];
+                    group.cells.read_block(1, &mut block, None).unwrap();
+                    let actual: Vec<_> = block
+                        .chunks_exact(8)
+                        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                        .collect();
+                    assert_eq!(actual, cells[1..]);
+                    assert!(group.cells.read_block(slots, &mut [0; 8], None).is_err());
+                }
+                group.cells.remove().unwrap();
+                assert!(!staged.exists());
             }
         }
     }
 
-    fn scratch_free_config() -> BuildConfig {
+    fn scratch_free_config(low_disk: bool) -> BuildConfig {
         BuildConfig {
             backend: Backend::Zor,
             k: 3,
@@ -1878,9 +2050,9 @@ mod tests {
             merge: super::super::MergeArgs {
                 disabled: true,
                 sketch_size: 64,
+                low_disk,
                 ..Default::default()
             },
-            build_jobs: 1,
         }
     }
 
@@ -1899,7 +2071,16 @@ mod tests {
     }
 
     #[test]
-    fn default_two_pass_never_creates_scratch_files_during_construction() {
+    fn low_disk_never_creates_scratch_files_during_construction() {
+        two_pass_stages_only_packed_cells(true);
+    }
+
+    #[test]
+    fn default_two_pass_stages_only_packed_cells_during_construction() {
+        two_pass_stages_only_packed_cells(false);
+    }
+
+    fn two_pass_stages_only_packed_cells(low_disk: bool) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let root = temporary_stage();
         let first = root.0.join("a.fa");
@@ -1914,7 +2095,7 @@ mod tests {
         .unwrap();
         let output = root.0.join("index");
         let calls = AtomicUsize::new(0);
-        build(&fof, &output, scratch_free_config(), |keys, slots| {
+        build(&fof, &output, scratch_free_config(low_disk), |keys, slots| {
             calls.fetch_add(1, Ordering::Relaxed);
             let stages: Vec<_> = fs::read_dir(&root.0)
                 .unwrap()
@@ -1927,9 +2108,23 @@ mod tests {
                 })
                 .collect();
             assert_eq!(stages.len(), 1);
-            // Before final packing, the publication directory must be empty:
-            // no features/, cells/, cache files or other construction artifacts.
-            assert_eq!(fs::read_dir(&stages[0]).unwrap().count(), 0);
+            // Before final packing, the publication directory holds no
+            // features/, cache files or other construction artifacts: nothing
+            // at all with --low-disk, only packed cells of completed groups
+            // otherwise.
+            let entries: Vec<_> = fs::read_dir(&stages[0])
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            if low_disk {
+                assert!(entries.is_empty());
+            } else {
+                assert_eq!(entries, [stages[0].join("cells")]);
+                for cell in fs::read_dir(&entries[0]).unwrap() {
+                    let name = cell.unwrap().file_name();
+                    assert!(name.to_string_lossy().ends_with(".bits"), "{name:?}");
+                }
+            }
             Ok(dropped_test_graph(keys, slots))
         })
         .unwrap();
@@ -1937,7 +2132,11 @@ mod tests {
         let index = Index::load(&output).unwrap();
         assert_eq!(
             index.manifest.construction_cell_storage,
-            "two-pass-memory-packed-no-scratch"
+            if low_disk {
+                "two-pass-memory-packed-no-scratch"
+            } else {
+                "two-pass-temporary-disk-packed-tiled-packing"
+            }
         );
         for entry in fs::read_dir(&output).unwrap() {
             let entry = entry.unwrap();
@@ -1965,12 +2164,17 @@ mod tests {
         .unwrap();
         let calls = AtomicUsize::new(0);
         let output = root.0.join("index");
-        let result = build(&fof, &output, scratch_free_config(), |keys, slots| {
-            calls.fetch_add(1, Ordering::Relaxed);
-            // Change the next dataset after planning, retaining its cardinality
-            // and occurrence count so the feature signature must detect it.
-            fs::write(&second, ">b\nCCCCCCCC\n").unwrap();
-            Ok(dropped_test_graph(keys, slots))
+        // One thread builds the groups one after another, so the second group rereads its dataset after the
+        // first group's callback has changed it (retaining cardinality and occurrence count, so only the feature
+        // signature can detect the change).
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let result = pool.install(|| {
+            build(&fof, &output, scratch_free_config(false), |keys, slots| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                fs::write(&first, ">a\nTTTTTTTT\n").unwrap();
+                fs::write(&second, ">b\nCCCCCCCC\n").unwrap();
+                Ok(dropped_test_graph(keys, slots))
+            })
         });
         assert!(result
             .unwrap_err()
@@ -2323,6 +2527,7 @@ mod tests {
             predicted_logical_bits: 40,
             planned_groups: 1,
             rejected_groups: 0,
+            overflow_groups: 0,
             exact_group_verifications: 1,
             sketch_seconds: 0.0,
             plan_seconds: 0.0,
