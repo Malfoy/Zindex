@@ -81,7 +81,8 @@ fn candidate(
         ga.cardinality.max(gb.cardinality),
         ga.cardinality + gb.cardinality,
     );
-    let slots = config.slots(cardinality)?;
+    // Size the merged group with a safety margin; the chained estimate itself stays uninflated.
+    let slots = config.slots(cardinality * (1.0 + config.merge.plan_margin))?;
     let old = cost(ga.slots, ga.width) + cost(gb.slots, gb.width);
     let new = cost(slots, config.width(count));
     if new >= old || (old - new) as f64 <= old as f64 * config.merge.min_saving {
@@ -135,6 +136,10 @@ pub struct StreamingPlanner {
     buckets: BTreeMap<(u32, usize), Vec<usize>>,
     bucket_positions: Vec<usize>,
 }
+/// Smallest slice of candidate evaluations handed to a pool thread: a few thousand sketch comparisons are
+/// about a millisecond, so smaller scans run on the calling thread instead of paying for thread hand-offs.
+const CANDIDATES_PER_TASK: usize = 1024;
+
 impl StreamingPlanner {
     fn add_to_bucket(&mut self, id: usize) {
         let group = &self.groups[id];
@@ -179,6 +184,7 @@ impl StreamingPlanner {
             self.pair_evaluations += self.groups.len() as u64;
             self.groups
                 .par_iter()
+                .with_min_len(CANDIDATES_PER_TASK)
                 .enumerate()
                 .map(|(id, group)| candidate(id, self.groups.len(), group, &incoming, config))
                 .try_reduce(|| None, |a, b| Ok(a.max(b)))?
@@ -194,6 +200,7 @@ impl StreamingPlanner {
             self.pair_evaluations += eligible.len() as u64;
             eligible
                 .par_iter()
+                .with_min_len(CANDIDATES_PER_TASK)
                 .map(|&id| candidate(id, self.groups.len(), &self.groups[id], &incoming, config))
                 .try_reduce(|| None, |a, b| Ok(a.max(b)))?
         };
@@ -311,8 +318,11 @@ mod tests {
             feature_config: FeatureConfig::legacy_kmers(),
             slot_scale: 1.0,
             minimum_slots: None,
-            merge: MergeArgs::default(),
-            build_jobs: 1,
+            // Exact sizes: these tests check the cost rule itself, not the sketch-noise margin.
+            merge: MergeArgs {
+                plan_margin: 0.0,
+                ..MergeArgs::default()
+            },
         }
     }
     #[test]

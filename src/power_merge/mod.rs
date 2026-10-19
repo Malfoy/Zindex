@@ -73,6 +73,10 @@ pub struct MergeArgs {
     /// Require this fraction of predicted bit savings before accepting a merge.
     #[arg(long = "merge-min-saving", default_value_t = 0.0)]
     pub min_saving: f64,
+    /// Plan each merged group as if its estimated union were this fraction larger, so sketch noise does not push
+    /// the exact union past the planned power of two at build time (which doubles the group's slots).
+    #[arg(long = "merge-plan-margin", default_value_t = 0.03)]
+    pub plan_margin: f64,
     /// Keep singleton power-of-two banks, for measuring sizing independently of merging.
     #[arg(long = "merge-disabled")]
     pub disabled: bool,
@@ -84,6 +88,11 @@ pub struct MergeArgs {
     /// The default keeps completed filters bit-packed in RAM until compression.
     #[arg(long, conflicts_with = "plain")]
     pub disk_backed: bool,
+    /// Keep completed filters bit-packed in RAM until bank compression instead of
+    /// staging them as bit-packed cell files next to the output. Needs no scratch
+    /// disk, but RAM must then hold every completed filter.
+    #[arg(long, conflicts_with_all = ["plain", "disk_backed"])]
+    pub low_disk: bool,
 }
 impl Default for MergeArgs {
     fn default() -> Self {
@@ -94,9 +103,11 @@ impl Default for MergeArgs {
             sketch_size: 4096,
             max_colors: 48,
             min_saving: 0.0,
+            plan_margin: 0.03,
             disabled: false,
             drop_abandoned: false,
             disk_backed: false,
+            low_disk: false,
         }
     }
 }
@@ -118,7 +129,6 @@ pub struct BuildConfig {
     pub slot_scale: f64,
     pub minimum_slots: Option<usize>,
     pub merge: MergeArgs,
-    pub build_jobs: usize,
 }
 impl BuildConfig {
     pub fn validate(&self) -> Result<()> {
@@ -156,6 +166,10 @@ impl BuildConfig {
             "--merge-min-saving must be in [0, 1)"
         );
         ensure!(
+            self.merge.plan_margin.is_finite() && (0.0..0.5).contains(&self.merge.plan_margin),
+            "--merge-plan-margin must be in [0, 0.5)"
+        );
+        ensure!(
             self.merge.max_colors + self.fingerprint_bits <= 64,
             "fingerprint bits + --merge-max-colors must be <= 64"
         );
@@ -163,7 +177,6 @@ impl BuildConfig {
             (2..=crate::MAX_HASHES).contains(&self.hashes),
             "invalid hash count"
         );
-        ensure!(self.build_jobs > 0, "build jobs must be positive");
         ensure!(
             self.slot_scale.is_finite() && self.slot_scale > 0.0,
             "invalid slot scale"

@@ -156,7 +156,8 @@ struct BuildArgs {
     #[arg(long, default_value_t = 64)]
     max_split_parts: usize,
 
-    /// Maximum number of datasets parsed/built concurrently. Defaults to all Rayon workers.
+    /// Maximum number of datasets parsed/built concurrently by `count` and the plain build. Defaults to all
+    /// Rayon workers. The power-merge build runs everything on the `--threads` pool instead.
     #[arg(long)]
     build_jobs: Option<usize>,
 }
@@ -584,7 +585,6 @@ fn build_command(args: BuildArgs) -> Result<()> {
             slot_scale: args.slot_scale,
             minimum_slots: args.slot_count,
             merge: args.merge.clone(),
-            build_jobs: bounded_build_jobs(args.build_jobs)?,
         };
         return zorindex::power_merge::build(&args.fof, &args.output, config, |keys, slots| {
             let segment_length = (slots / args.hashes)
