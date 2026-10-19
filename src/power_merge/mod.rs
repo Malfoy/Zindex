@@ -124,7 +124,6 @@ pub struct BuildConfig {
     pub slot_scale: f64,
     pub minimum_slots: Option<usize>,
     pub merge: MergeArgs,
-    pub build_jobs: usize,
 }
 impl BuildConfig {
     pub fn validate(&self) -> Result<()> {
@@ -169,7 +168,6 @@ impl BuildConfig {
             (2..=crate::MAX_HASHES).contains(&self.hashes),
             "invalid hash count"
         );
-        ensure!(self.build_jobs > 0, "build jobs must be positive");
         ensure!(
             self.slot_scale.is_finite() && self.slot_scale > 0.0,
             "invalid slot scale"
