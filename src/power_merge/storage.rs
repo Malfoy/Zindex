@@ -8,7 +8,7 @@ use crate::{
     create_index_writer, finish_index_writer, open_index_reader, parse_features_from_file,
     read_fof, splitmix64, ColorInput, FeatureConfig, IndexMode, MAX_HASHES,
 };
-use anyhow::{ensure, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -17,7 +17,12 @@ use std::{
     fs::{self, File},
     hash::{DefaultHasher, Hash, Hasher},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    panic::AssertUnwindSafe,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -394,50 +399,50 @@ pub fn build(
     let mut plan_seconds = 0.0;
     let mut sketch_seconds = 0.0;
     let mut input_signatures = Vec::with_capacity(inputs.len());
-    for (chunk_id, chunk) in inputs.chunks(config.build_jobs).enumerate() {
-        let parsed = chunk
-            .par_iter()
-            .enumerate()
-            .map(|(offset, input)| {
-                let id = chunk_id * config.build_jobs + offset;
-                let mut keys = Vec::new();
-                let mut occurrences = 0;
-                parse_features_from_file(
-                    &input.path,
-                    config.k,
-                    config.seed,
-                    config.feature_config,
-                    |key| {
-                        occurrences += 1;
-                        keys.push(key);
-                    },
-                )?;
-                keys.sort_unstable();
-                keys.dedup();
-                let sketch_start = Instant::now();
-                let sketch = Sketch::new(&keys, config.merge.sketch_size, config.seed);
-                let sketch_sec = sketch_start.elapsed().as_secs_f64();
-                let signature = if config.merge.disk_backed {
-                    cache_write(&cache_path(&stage.0, id), &keys)?;
-                    0
-                } else {
-                    feature_signature(&keys, occurrences)
-                };
-                let color = Color {
-                    name: input.name.clone(),
-                    path: input.path.to_string_lossy().into_owned(),
-                    occurrences,
-                    unique_kmers: keys.len(),
-                };
-                Ok((
-                    color,
-                    planner::singleton(keys.len(), sketch, id, &config)?,
-                    sketch_sec,
-                    signature,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        for (color, group, seconds, signature) in parsed {
+    // Every dataset is parsed as a task on the rayon pool while this loop, itself on a pool thread, inserts the
+    // results into the planner in FOF order. Idle threads take the oldest queued task first, so they parse while
+    // this thread plans, and the planner's own parallel scans split onto the same pool when it is free.
+    rayon::scope(|_| pull_jobs(
+        &inputs,
+        PLANNER_LOOKAHEAD,
+        |id, input| {
+            let mut keys = Vec::new();
+            let mut occurrences = 0;
+            parse_features_from_file(
+                &input.path,
+                config.k,
+                config.seed,
+                config.feature_config,
+                |key| {
+                    occurrences += 1;
+                    keys.push(key);
+                },
+            )?;
+            keys.sort_unstable();
+            keys.dedup();
+            let sketch_start = Instant::now();
+            let sketch = Sketch::new(&keys, config.merge.sketch_size, config.seed);
+            let sketch_sec = sketch_start.elapsed().as_secs_f64();
+            let signature = if config.merge.disk_backed {
+                cache_write(&cache_path(&stage.0, id), &keys)?;
+                0
+            } else {
+                feature_signature(&keys, occurrences)
+            };
+            let color = Color {
+                name: input.name.clone(),
+                path: input.path.to_string_lossy().into_owned(),
+                occurrences,
+                unique_kmers: keys.len(),
+            };
+            Ok((
+                color,
+                planner::singleton(keys.len(), sketch, id, &config)?,
+                sketch_sec,
+                signature,
+            ))
+        },
+        |_, (color, group, seconds, signature)| {
             input_signatures.push(signature);
             colors.push(color);
             singleton_logical_bits += planner::cost(group.slots, group.width);
@@ -449,8 +454,15 @@ pub fn build(
                 initial.push(group);
             }
             sketch_seconds += seconds;
-        }
-    }
+            Ok(())
+        },
+    ))?;
+    eprintln!(
+        "sketched {} datasets in {:.3}s; the planner was busy for {:.3}s of it",
+        colors.len(),
+        start.elapsed().as_secs_f64(),
+        plan_seconds
+    );
     let singleton_logical_bits = u64::try_from(singleton_logical_bits)?;
     let plan_start = Instant::now();
     let plan = if config.merge.planner.is_streaming() {
@@ -490,25 +502,26 @@ pub fn build(
     let mut built = Vec::new();
     let rejected_groups = 0;
     let mut exact_group_verifications = 0;
-    for chunk in planned.chunks(config.build_jobs) {
-        let results = chunk
-            .par_iter()
-            .map(|group| {
-                if config.merge.disk_backed {
-                    build_group(group, &stage.0, &config, &graph)
-                } else {
-                    let (keys, values) =
-                        union_input_features(group, &inputs, &colors, &input_signatures, &config)?;
-                    let stage = (!config.merge.low_disk).then_some(stage.0.as_path());
-                    construct_group(group, keys, values, stage, &config, &graph)
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        for (group, verified) in results {
+    // All groups are queued at once; the pool builds them `--threads` at a time in plan order.
+    pull_jobs(
+        &planned,
+        usize::MAX,
+        |_, group| {
+            if config.merge.disk_backed {
+                build_group(group, &stage.0, &config, &graph)
+            } else {
+                let (keys, values) =
+                    union_input_features(group, &inputs, &colors, &input_signatures, &config)?;
+                let stage = (!config.merge.low_disk).then_some(stage.0.as_path());
+                construct_group(group, keys, values, stage, &config, &graph)
+            }
+        },
+        |_, (group, verified)| {
             built.push(group);
             exact_group_verifications += verified;
-        }
-    }
+            Ok(())
+        },
+    )?;
     let (abandoned_hashes, abandoned_origins) = if config.merge.drop_abandoned {
         (0, 0)
     } else {
@@ -582,6 +595,58 @@ pub fn build(
         output.display(), start.elapsed().as_secs_f64(), manifest.banks.len(), manifest.banks.iter().map(|b| b.groups.len()).sum::<usize>(),
         manifest.banks.iter().map(|b| b.slots * b.row_bits.div_ceil(8)).sum::<usize>(), abandoned_hashes * 8 + abandoned_origins * 4, rejected_groups);
     Ok(())
+}
+
+/// How many datasets parsing may run ahead of the planner; each waiting dataset holds a sketch of about 32 KiB.
+const PLANNER_LOOKAHEAD: usize = 1024;
+
+/// Runs `work` on every item as a task on the rayon pool and hands the results to `consume` in item order on the
+/// calling thread, keeping at most `in_flight` items started but not yet consumed. The pool runs the tasks in item
+/// order, as many at a time as it has threads, so one slow item never idles the others, and parallel work inside
+/// `consume` (the planner) shares those same threads. Nothing more is started after the first error.
+fn pull_jobs<T: Sync, R: Send>(
+    items: &[T],
+    in_flight: usize,
+    work: impl Fn(usize, &T) -> Result<R> + Sync,
+    mut consume: impl FnMut(usize, R) -> Result<()>,
+) -> Result<()> {
+    let failed = AtomicBool::new(false);
+    let (tx, rx) = mpsc::channel();
+    rayon::in_place_scope(|scope| {
+        let mut started = 0;
+        // Results arrive in completion order; hold them until their predecessors are consumed.
+        let mut pending = BTreeMap::new();
+        let outcome = (0..items.len()).try_for_each(|next| {
+            while started < items.len().min(next.saturating_add(in_flight)) {
+                let i = started;
+                let (tx, failed, work) = (tx.clone(), &failed, &work);
+                scope.spawn(move |_| {
+                    if failed.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    // A panic must still produce a result, or the loop below would wait for it forever.
+                    let result = std::panic::catch_unwind(AssertUnwindSafe(|| work(i, &items[i])))
+                        .unwrap_or_else(|_| Err(anyhow!("task {i} panicked")));
+                    let _ = tx.send((i, result));
+                });
+                started += 1;
+            }
+            while !pending.contains_key(&next) {
+                // On a pool thread, run queued tasks rather than wait for the other threads (there may be none).
+                let (i, result) = match rx.try_recv() {
+                    Ok(message) => message,
+                    Err(_) if rayon::yield_now() == Some(rayon::Yield::Executed) => continue,
+                    Err(_) => rx.recv()?,
+                };
+                pending.insert(i, result?);
+            }
+            consume(next, pending.remove(&next).unwrap())
+        });
+        if outcome.is_err() {
+            failed.store(true, Ordering::Relaxed);
+        }
+        outcome
+    })
 }
 
 fn union_features(group: &planner::Group, stage: &Path) -> Result<(Vec<u64>, Vec<u64>)> {
@@ -1979,7 +2044,6 @@ mod tests {
                 low_disk,
                 ..Default::default()
             },
-            build_jobs: 1,
         }
     }
 
@@ -2091,12 +2155,17 @@ mod tests {
         .unwrap();
         let calls = AtomicUsize::new(0);
         let output = root.0.join("index");
-        let result = build(&fof, &output, scratch_free_config(false), |keys, slots| {
-            calls.fetch_add(1, Ordering::Relaxed);
-            // Change the next dataset after planning, retaining its cardinality
-            // and occurrence count so the feature signature must detect it.
-            fs::write(&second, ">b\nCCCCCCCC\n").unwrap();
-            Ok(dropped_test_graph(keys, slots))
+        // One thread builds the groups one after another, so the second group rereads its dataset after the
+        // first group's callback has changed it (retaining cardinality and occurrence count, so only the feature
+        // signature can detect the change).
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let result = pool.install(|| {
+            build(&fof, &output, scratch_free_config(false), |keys, slots| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                fs::write(&first, ">a\nTTTTTTTT\n").unwrap();
+                fs::write(&second, ">b\nCCCCCCCC\n").unwrap();
+                Ok(dropped_test_graph(keys, slots))
+            })
         });
         assert!(result
             .unwrap_err()

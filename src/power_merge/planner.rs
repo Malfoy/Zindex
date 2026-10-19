@@ -135,6 +135,10 @@ pub struct StreamingPlanner {
     buckets: BTreeMap<(u32, usize), Vec<usize>>,
     bucket_positions: Vec<usize>,
 }
+/// Smallest slice of candidate evaluations handed to a pool thread: a few thousand sketch comparisons are
+/// about a millisecond, so smaller scans run on the calling thread instead of paying for thread hand-offs.
+const CANDIDATES_PER_TASK: usize = 1024;
+
 impl StreamingPlanner {
     fn add_to_bucket(&mut self, id: usize) {
         let group = &self.groups[id];
@@ -179,6 +183,7 @@ impl StreamingPlanner {
             self.pair_evaluations += self.groups.len() as u64;
             self.groups
                 .par_iter()
+                .with_min_len(CANDIDATES_PER_TASK)
                 .enumerate()
                 .map(|(id, group)| candidate(id, self.groups.len(), group, &incoming, config))
                 .try_reduce(|| None, |a, b| Ok(a.max(b)))?
@@ -194,6 +199,7 @@ impl StreamingPlanner {
             self.pair_evaluations += eligible.len() as u64;
             eligible
                 .par_iter()
+                .with_min_len(CANDIDATES_PER_TASK)
                 .map(|&id| candidate(id, self.groups.len(), &self.groups[id], &incoming, config))
                 .try_reduce(|| None, |a, b| Ok(a.max(b)))?
         };
@@ -312,7 +318,6 @@ mod tests {
             slot_scale: 1.0,
             minimum_slots: None,
             merge: MergeArgs::default(),
-            build_jobs: 1,
         }
     }
     #[test]

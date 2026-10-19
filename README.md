@@ -332,8 +332,13 @@ the active groups' keys/payloads/graphs. The existing compression-aware column
 ordering is preserved using exactly the same cell samples. Bank packing reads
 bounded row tiles from the staged cells and writes directly to zstd; each bank's
 cell files are removed once it is written. The atomic publication directory
-contains only the final index files. Both passes use `--build-jobs` to bound
-concurrent work.
+contains only the final index files. Both passes run as tasks on the
+`--threads` rayon pool, which is the only concurrency setting. Parsing and
+planning overlap: one pool thread inserts each parsed dataset into the
+streaming planner, in input order, while the other threads parse the datasets
+queued ahead of it, and the planner's own candidate scans use the same pool.
+At most 1024 datasets are parsed ahead of the planner, so the slower side sets
+the pace and memory stays bounded. Nothing is split by hand.
 
 To build without any scratch disk, add `--low-disk`: the same packed filters are
 then retained in RAM until bank compression, so RAM must also fit every
