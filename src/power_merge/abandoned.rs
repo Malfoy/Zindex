@@ -20,6 +20,24 @@ pub(super) struct OriginMap {
 }
 
 impl OriginMap {
+    #[inline]
+    pub(super) fn prefetch(&self, key: u32) {
+        #[cfg(target_arch = "x86_64")]
+        if !self.directory.is_empty() {
+            let slot = key as usize & (self.directory.len() - 1);
+            // Only the first directory bucket is known without doing the probe.
+            // Actual collision resolution/postings remain unchanged in get().
+            unsafe {
+                std::arch::x86_64::_mm_prefetch(
+                    self.directory.as_ptr().add(slot).cast(),
+                    std::arch::x86_64::_MM_HINT_T0,
+                );
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = key;
+    }
+
     pub(super) fn with_capacity(keys: usize, origins: usize) -> Result<Self> {
         ensure!(keys <= u32::MAX as usize, "too many abandoned hashes");
         Ok(Self {

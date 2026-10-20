@@ -1400,6 +1400,10 @@ impl BloomIndex {
         let feature_config = FeatureConfig {
             mode,
             minimizer_size,
+            minimizer_scheme: zorindex::MinimizerScheme::Simd,
+            homopolymer_compression: false,
+            seed_pattern: None,
+            randstrobemers: None,
             modimizer_sampling,
             findere_z,
         };
@@ -1666,6 +1670,10 @@ mod tests {
                 mode: IndexMode::Kmers,
                 findere_z: zorindex::findere::DEFAULT_Z,
                 minimizer_size: DEFAULT_MINIMIZER_SIZE,
+                minimizer_scheme: zorindex::MinimizerScheme::Simd,
+                homopolymer_compression: false,
+                seed_pattern: None,
+                randstrobemers: None,
                 modimizer_sampling: DEFAULT_MODIMIZER_SAMPLING,
             },
             bit_count,

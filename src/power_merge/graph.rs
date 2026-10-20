@@ -39,7 +39,92 @@ pub enum PeelGraph {
     Compact(TypedPeelGraph<u32>),
     Wide(TypedPeelGraph<usize>),
 }
+
+pub(crate) enum AssignedCells {
+    U8(Vec<u8>),
+    U16(Vec<u16>),
+    U32(Vec<u32>),
+    U64(Vec<u64>),
+}
+
+trait PayloadCell: Copy + Default + Into<u64> + std::ops::BitXorAssign {
+    fn from_payload(value: u64) -> Self;
+}
+macro_rules! payload_cells {
+    ($($t:ty),*) => { $(impl PayloadCell for $t {
+        fn from_payload(value: u64) -> Self { value as Self }
+    })* };
+}
+payload_cells!(u8, u16, u32, u64);
+
+#[cfg(test)]
+mod narrow_tests {
+    use super::*;
+    #[test]
+    fn every_payload_width_matches_u64_assignment_and_verification() {
+        for width in 1..=64 {
+            let keys: Vec<_> = (0..257).collect();
+            let mask = u64::MAX >> (64 - width);
+            let values: Vec<_> = keys.iter().map(|&k| crate::splitmix64(k) & mask).collect();
+            let make = || TypedPeelGraph::<u32> {
+                positions: (0..257).flat_map(|i| [i, i + 1]).collect(),
+                order: (0..257).map(|i| (i, i)).collect(),
+                dropped: vec![],
+            };
+            let expected = PeelGraph::Compact(make())
+                .assign_verified(&keys, &values, 258, 2)
+                .unwrap();
+            let cells = PeelGraph::Compact(make())
+                .assign_verified_narrow(&keys, &values, 258, 2, width)
+                .unwrap();
+            let actual: Vec<u64> = match cells {
+                AssignedCells::U8(v) => {
+                    assert!(width <= 8);
+                    v.into_iter().map(u64::from).collect()
+                }
+                AssignedCells::U16(v) => {
+                    assert!((9..=16).contains(&width));
+                    v.into_iter().map(u64::from).collect()
+                }
+                AssignedCells::U32(v) => {
+                    assert!((17..=32).contains(&width));
+                    v.into_iter().map(u64::from).collect()
+                }
+                AssignedCells::U64(v) => {
+                    assert!(width >= 33);
+                    v
+                }
+            };
+            assert_eq!(actual, expected);
+        }
+    }
+}
+
 impl PeelGraph {
+    pub(crate) fn assign_verified_narrow(
+        &mut self,
+        keys: &[u64],
+        values: &[u64],
+        slots: usize,
+        hashes: usize,
+        width: usize,
+    ) -> Result<AssignedCells> {
+        macro_rules! assign {
+            ($t:ty, $variant:ident) => {
+                Ok(AssignedCells::$variant(match self {
+                    Self::Compact(g) => assign_cells::<_, $t>(g, keys, values, slots, hashes)?,
+                    Self::Wide(g) => assign_cells::<_, $t>(g, keys, values, slots, hashes)?,
+                }))
+            };
+        }
+        match width {
+            1..=8 => assign!(u8, U8),
+            9..=16 => assign!(u16, U16),
+            17..=32 => assign!(u32, U32),
+            33..=64 => assign!(u64, U64),
+            _ => anyhow::bail!("invalid payload width"),
+        }
+    }
     pub fn dropped_len(&self) -> usize {
         match self {
             Self::Compact(g) => g.dropped.len(),
@@ -72,6 +157,16 @@ fn assign_verified<I: GraphIndex>(
     slots: usize,
     hashes: usize,
 ) -> Result<Vec<u64>> {
+    assign_cells::<_, u64>(graph, keys, values, slots, hashes)
+}
+
+fn assign_cells<I: GraphIndex, T: PayloadCell>(
+    graph: &mut TypedPeelGraph<I>,
+    keys: &[u64],
+    values: &[u64],
+    slots: usize,
+    hashes: usize,
+) -> Result<Vec<T>> {
     ensure!(
         keys.len() == values.len()
             && values.len().checked_mul(hashes) == Some(graph.positions.len()),
@@ -89,11 +184,11 @@ fn assign_verified<I: GraphIndex>(
             .is_none_or(|i| i.as_usize() < values.len()),
         "invalid dropped equation"
     );
-    let mut cells = vec![0; slots];
+    let mut cells = vec![T::default(); slots];
     for &(edge, pivot) in graph.order.iter().rev() {
         let edge = edge.as_usize();
         let pivot = pivot.as_usize();
-        let mut value = values[edge];
+        let mut value = T::from_payload(values[edge]);
         for &slot in &graph.positions[edge * hashes..(edge + 1) * hashes] {
             let slot = slot.as_usize();
             if slot != pivot {
@@ -110,7 +205,7 @@ fn assign_verified<I: GraphIndex>(
         }
         let actual = graph.positions[edge * hashes..(edge + 1) * hashes]
             .iter()
-            .fold(0, |value, slot| value ^ cells[slot.as_usize()]);
+            .fold(0u64, |value, slot| value ^ cells[slot.as_usize()].into());
         ensure!(
             actual == value,
             "incorrect merged payload for key {}",

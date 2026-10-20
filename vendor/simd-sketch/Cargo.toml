@@ -1,0 +1,20 @@
+[package]
+name = "simd-sketch"
+version = "0.3.0"
+edition = "2024"
+license = "MIT"
+authors = ["Ragnar Groot Koerkamp"]
+repository = "https://github.com/RagnarGrootKoerkamp/simd-sketch"
+description = "Upstream SimdSketch with ZORINDEX feature-ID/merge extensions"
+autobins = false
+
+[dependencies]
+bincode = "2.0.1"
+clap = { version = "4.5", default-features = false, features = ["std", "derive"] }
+log = "0.4"
+packed-seq = "4.1.0"
+seq-hash = "0.1.0"
+wide = "0.7.32"
+
+[dev-dependencies]
+rand = "0.9"

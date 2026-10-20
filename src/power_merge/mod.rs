@@ -1,16 +1,22 @@
 //! Merge-only colored indexes with one slot-major bank per power of two.
 mod abandoned;
 mod graph;
+mod layout;
 mod planner;
+mod records;
 mod sketch;
+mod sort;
 mod storage;
+mod union;
 
 use crate::FeatureConfig;
 use anyhow::{ensure, Context, Result};
 use clap::{Args, ValueEnum};
 pub use graph::{DegreeQueue, GraphIndex, IndexedDegreeHeap, PeelGraph, TypedPeelGraph};
 use serde::{Deserialize, Serialize};
-pub use storage::{build, info_command, query_command, query_command_with_recovery};
+pub use storage::{
+    build, info_command, query_command, query_command_with_recovery, query_records_command,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -58,14 +64,15 @@ pub struct MergeArgs {
     /// Compatibility flag: merged power-of-two banks are already the default.
     #[arg(long, action = clap::ArgAction::SetTrue, default_value_t = true)]
     pub power_of_two_merge: bool,
-    /// Streaming uses lossless size/origin pruning; streaming-unpruned retains the original scan.
+    /// Streaming uses lossless cost-bound pruning; streaming-unpruned retains the exhaustive scan.
     #[arg(long = "merge-planner", value_enum, default_value_t = MergePlanner::Streaming)]
     pub planner: MergePlanner,
     /// Physical group order within each bank; does not change planning or query output order.
     #[arg(long = "merge-column-order", value_enum, default_value_t = ColumnOrder::Compression)]
     pub column_order: ColumnOrder,
-    /// Number of full-minimum buckets in the mergeable sketch. Must be a power of two.
-    #[arg(long = "merge-sketch-size", default_value_t = 4096)]
+    /// Number of SimdSketch buckets (8-bit comparison fingerprints + 32-bit union minima).
+    /// Must be a power of two.
+    #[arg(long = "merge-sketch-size", default_value_t = 128)]
     pub sketch_size: usize,
     /// Maximum datasets sharing a ZOR payload (fingerprint + membership must fit 64 bits).
     #[arg(long = "merge-max-colors", default_value_t = 48)]
@@ -75,8 +82,12 @@ pub struct MergeArgs {
     pub min_saving: f64,
     /// Plan each merged group as if its estimated union were this fraction larger, so sketch noise does not push
     /// the exact union past the planned power of two at build time (which doubles the group's slots).
-    #[arg(long = "merge-plan-margin", default_value_t = 0.03)]
+    #[arg(long = "merge-plan-margin", default_value_t = 0.0)]
     pub plan_margin: f64,
+    /// Minimum original documents per subindex; promote smaller filters, never fold.
+    /// Collections smaller than this use one subindex. Set 1 for the legacy layout.
+    #[arg(long, default_value_t = 128)]
+    pub min_subindex_documents: usize,
     /// Keep singleton power-of-two banks, for measuring sizing independently of merging.
     #[arg(long = "merge-disabled")]
     pub disabled: bool,
@@ -88,10 +99,11 @@ pub struct MergeArgs {
     /// The default keeps completed filters bit-packed in RAM until compression.
     #[arg(long, conflicts_with = "plain")]
     pub disk_backed: bool,
-    /// Keep completed filters bit-packed in RAM until bank compression instead of
-    /// staging them as bit-packed cell files next to the output. Needs no scratch
-    /// disk, but RAM must then hold every completed filter.
-    #[arg(long, conflicts_with_all = ["plain", "disk_backed"])]
+    /// Keep completed filters bit-packed in RAM (default). Set --low-disk=false
+    /// to stage packed cells on disk instead. RAM must fit every completed filter.
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1,
+        require_equals = true, default_missing_value = "true", default_value_t = true,
+        conflicts_with_all = ["plain", "disk_backed"])]
     pub low_disk: bool,
 }
 impl Default for MergeArgs {
@@ -100,14 +112,15 @@ impl Default for MergeArgs {
             power_of_two_merge: true,
             planner: MergePlanner::Streaming,
             column_order: ColumnOrder::Compression,
-            sketch_size: 4096,
+            sketch_size: 128,
             max_colors: 48,
             min_saving: 0.0,
-            plan_margin: 0.03,
+            plan_margin: 0.0,
+            min_subindex_documents: 128,
             disabled: false,
             drop_abandoned: false,
             disk_backed: false,
-            low_disk: false,
+            low_disk: true,
         }
     }
 }
@@ -132,6 +145,10 @@ pub struct BuildConfig {
 }
 impl BuildConfig {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.merge.min_subindex_documents > 0,
+            "--min-subindex-documents must be positive"
+        );
         ensure!(
             [1, 8, 16].contains(&self.fingerprint_bits),
             "fingerprint bits must be 1, 8 or 16"

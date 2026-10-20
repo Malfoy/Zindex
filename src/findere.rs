@@ -159,11 +159,24 @@ fn flush_batch<State: Send>(
     batch.ranges.clear();
 }
 
+#[cfg(test)]
 fn query_parser<State: Send>(
+    parser: FastxParser<'_, PARSER_CONFIG>,
+    k: usize,
+    z: usize,
+    colors: usize,
+    init: impl Fn() -> State,
+    lookup: impl Fn(&mut State, u64, &mut [u64]) -> bool + Sync,
+) -> Result<QueryResult> {
+    query_parser_preprocessed(parser, k, z, colors, false, init, lookup)
+}
+
+fn query_parser_preprocessed<State: Send>(
     mut parser: FastxParser<'_, PARSER_CONFIG>,
     k: usize,
     z: usize,
     colors: usize,
+    homopolymer_compression: bool,
     init: impl Fn() -> State,
     lookup: impl Fn(&mut State, u64, &mut [u64]) -> bool + Sync,
 ) -> Result<QueryResult> {
@@ -174,6 +187,15 @@ fn query_parser<State: Send>(
         let seq = parser.get_dna_string();
         result.stats.bases += seq.len() as u64;
         result.stats.chunks += 1;
+        // Compress the complete run before partitioning: independent task
+        // compression would change windows at task boundaries.
+        let compressed;
+        let seq = if homopolymer_compression {
+            compressed = crate::homopolymer_compress(seq);
+            compressed.as_slice()
+        } else {
+            seq
+        };
         if seq.len() < k {
             continue;
         }
@@ -218,6 +240,18 @@ pub fn query_file<State: Send>(
     init: impl Fn() -> State,
     lookup: impl Fn(&mut State, u64, &mut [u64]) -> bool + Sync,
 ) -> Result<QueryResult> {
+    query_file_with_homopolymer_compression(path, k, z, colors, false, init, lookup)
+}
+
+pub fn query_file_with_homopolymer_compression<State: Send>(
+    path: &Path,
+    k: usize,
+    z: usize,
+    colors: usize,
+    homopolymer_compression: bool,
+    init: impl Fn() -> State,
+    lookup: impl Fn(&mut State, u64, &mut [u64]) -> bool + Sync,
+) -> Result<QueryResult> {
     indexed_length(k, z)?;
     if is_compressed_path(path) {
         let mut data = Vec::new();
@@ -225,11 +259,11 @@ pub fn query_file<State: Send>(
         ensure!(!data.is_empty(), "{} is empty", path.display());
         let parser = FastxParser::<PARSER_CONFIG>::from_slice(&data)
             .with_context(|| format!("parsing {}", path.display()))?;
-        query_parser(parser, k, z, colors, init, lookup)
+        query_parser_preprocessed(parser, k, z, colors, homopolymer_compression, init, lookup)
     } else {
         let parser = FastxParser::<PARSER_CONFIG>::from_file_mmap(path)
             .with_context(|| format!("parsing {}", path.display()))?;
-        query_parser(parser, k, z, colors, init, lookup)
+        query_parser_preprocessed(parser, k, z, colors, homopolymer_compression, init, lookup)
     }
 }
 
@@ -244,6 +278,57 @@ mod tests {
         hits[1] = u64::from(key % 127 != 0);
         hits[2] = u64::from(key % 7 != 0);
         true
+    }
+
+    #[test]
+    fn parallel_homopolymer_queries_compress_before_task_boundaries() {
+        let raw: Vec<_> = (0..TASK_KMERS * 4 + 97)
+            .flat_map(|i| std::iter::repeat_n(b"ACGT"[i % 4], 1 + i % 5))
+            .collect();
+        let mut fasta = b">long\n".to_vec();
+        fasta.extend_from_slice(&raw);
+        fasta.extend_from_slice(b"\n>breaks\nAAAACCCCGGGGTTTTNNNAAAACCCCGGGGTTTT\n");
+        for (k, z) in [(31, 10), (41, 10), (5, 2)] {
+            let mut reference = Scorer::new(k, z, 3).unwrap();
+            let mut parser = FastxParser::<PARSER_CONFIG>::from_slice(&fasta).unwrap();
+            let mut raw_bases = 0;
+            let mut chunks = 0;
+            while parser.next().is_some() {
+                let seq = parser.get_dna_string();
+                raw_bases += seq.len() as u64;
+                chunks += 1;
+                reference.sequence(&crate::homopolymer_compress(seq), &mut |key, hits| {
+                    synthetic_hits(key, hits);
+                });
+            }
+            let mut probes = None;
+            for threads in [1, 4] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                let result = pool.install(|| {
+                    query_parser_preprocessed(
+                        FastxParser::<PARSER_CONFIG>::from_slice(&fasta).unwrap(),
+                        k,
+                        z,
+                        3,
+                        true,
+                        || (),
+                        |_, key, hits| synthetic_hits(key, hits),
+                    )
+                    .unwrap()
+                });
+                assert_eq!(result.scores, reference.result.scores);
+                assert_eq!(result.total_kmers, reference.result.total_kmers);
+                assert_eq!(result.stats.bases, raw_bases);
+                assert_eq!(result.stats.chunks, chunks);
+                assert_eq!(
+                    *probes.get_or_insert(result.smer_queries),
+                    result.smer_queries
+                );
+            }
+        }
     }
 
     #[test]

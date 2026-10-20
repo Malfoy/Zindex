@@ -4,7 +4,13 @@ use rayon::prelude::*;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BinaryHeap},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
+        Mutex,
+    },
 };
+mod packed;
+use packed::{PackedSketches, LANES};
 
 #[derive(Clone, Debug)]
 pub struct Group {
@@ -17,7 +23,7 @@ pub struct Group {
 
 pub struct Plan {
     pub groups: Vec<Group>,
-    /// Candidate pair evaluations, including pairs rejected by the origin limit.
+    /// Candidate pairs visited, including partial SIMD scans rejected early.
     pub pair_evaluations: u64,
     /// Comparisons an unpruned planner would have considered (including origin rejects).
     pub possible_pair_evaluations: u64,
@@ -77,6 +83,18 @@ fn candidate(
         return Ok(None);
     }
     let j = ga.sketch.jaccard(&gb.sketch);
+    candidate_with_similarity(a, b, ga, gb, config, j)
+}
+
+fn candidate_with_similarity(
+    a: usize,
+    b: usize,
+    ga: &Group,
+    gb: &Group,
+    config: &BuildConfig,
+    j: f64,
+) -> Result<Option<Candidate>> {
+    let count = ga.members.len() + gb.members.len();
     let cardinality = ((ga.cardinality + gb.cardinality) / (1.0 + j)).clamp(
         ga.cardinality.max(gb.cardinality),
         ga.cardinality + gb.cardinality,
@@ -97,30 +115,114 @@ fn candidate(
     }))
 }
 
-fn merge(ga: Group, gb: Group, c: &Candidate, config: &BuildConfig) -> Group {
+fn merge(mut ga: Group, gb: Group, c: &Candidate, config: &BuildConfig) -> Group {
+    ga.sketch.merge_in_place(&gb.sketch);
     let mut members = ga.members;
     members.extend(gb.members);
     members.sort_unstable();
+    if members.len() >= config.merge.max_colors {
+        ga.sketch.release();
+    }
     Group {
         width: config.width(members.len()),
         members,
         cardinality: c.cardinality,
         slots: c.slots,
-        sketch: ga.sketch.union(&gb.sketch),
+        sketch: ga.sketch,
     }
 }
 
 /// Optimistic cost: union capacity cannot be smaller than either input's
 /// capacity. If even this lower bound cannot save bits, Jaccard cannot help.
 /// This is valid for singleton arrivals AND arrivals containing multiple origins.
+#[cfg(test)]
 fn bucket_can_save(slots: usize, origins: usize, incoming: &Group, config: &BuildConfig) -> bool {
+    bucket_max_saving(slots, origins, incoming, config).is_some()
+}
+
+fn bucket_max_saving(
+    slots: usize,
+    origins: usize,
+    incoming: &Group,
+    config: &BuildConfig,
+) -> Option<u128> {
     let count = origins + incoming.members.len();
     if count > config.merge.max_colors {
-        return false;
+        return None;
     }
     let old = cost(slots, config.width(origins)) + cost(incoming.slots, incoming.width);
     let lower_new = cost(slots.max(incoming.slots), config.width(count));
-    lower_new < old && (old - lower_new) as f64 > old as f64 * config.merge.min_saving
+    if lower_new < old && (old - lower_new) as f64 > old as f64 * config.merge.min_saving {
+        Some(old - lower_new)
+    } else {
+        None
+    }
+}
+
+/// Equality is prunable only when no earlier ID could win the existing tie.
+fn can_beat(upper: u128, first_id: usize, best: &Option<Candidate>) -> bool {
+    best.as_ref()
+        .is_none_or(|best| upper > best.saving || (upper == best.saving && first_id < best.a))
+}
+
+#[derive(Default)]
+struct Bucket {
+    blocks: Vec<usize>,
+    // Conservative earliest logical ID in each physical block. Stale-low
+    // values after removals only reduce pruning, never change tie decisions.
+    block_first: Vec<usize>,
+    len: usize,
+    first: usize,
+    // A stale lower bound after removal is conservative, never unsafe.
+    min_cardinality: f64,
+}
+
+impl Bucket {
+    fn slot(&self, position: usize) -> usize {
+        self.blocks[position / LANES] * LANES + position % LANES
+    }
+
+    /// Minimum matching bytes that could improve the incumbent. All groups in
+    /// a cost bucket have identical old cost and merged width. Its smallest
+    /// cardinality gives the most optimistic union for every possible match
+    /// count. Binary search uses the *same* rounded estimator and slot sizing
+    /// as the exact candidate calculation, including strict saving thresholds.
+    fn required_matches(
+        &self,
+        slots: usize,
+        origins: usize,
+        incoming: &Group,
+        config: &BuildConfig,
+        best: &Option<Candidate>,
+    ) -> Result<usize> {
+        let size = incoming.sketch.fingerprints().len();
+        let old = cost(slots, config.width(origins)) + cost(incoming.slots, incoming.width);
+        let width = config.width(origins + incoming.members.len());
+        let can_win = |matches| -> Result<bool> {
+            let j = Sketch::similarity_from_matches(matches, size);
+            let card = ((self.min_cardinality + incoming.cardinality) / (1.0 + j)).clamp(
+                self.min_cardinality.max(incoming.cardinality),
+                self.min_cardinality + incoming.cardinality,
+            );
+            let new = cost(
+                config.slots(card * (1.0 + config.merge.plan_margin))?,
+                width,
+            );
+            Ok(new < old
+                && (old - new) as f64 > old as f64 * config.merge.min_saving
+                && can_beat(old - new, self.first, best))
+        };
+        let (mut low, mut high) = (0, size + 1);
+        while low < high {
+            let mid = (low + high) / 2;
+            if can_win(mid)? {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        Ok(low)
+    }
 }
 
 /// Incremental planning state for one batch. Only sketches/metadata are merged;
@@ -132,9 +234,14 @@ pub struct StreamingPlanner {
     pair_evaluations: u64,
     possible_pair_evaluations: u64,
     // Sub-bucket by origin count, so both width and slot cost are constant.
-    // IDs never move; ties therefore match the original FOF-ordered scan.
-    buckets: BTreeMap<(u32, usize), Vec<usize>>,
-    bucket_positions: Vec<usize>,
+    // Logical IDs never move; physical columns swap-remove and recycle storage.
+    buckets: BTreeMap<(u32, usize), Bucket>,
+    packed: PackedSketches,
+    positions: Vec<usize>,
+    bucket_work: Vec<(u128, usize, (u32, usize))>,
+    // Short scans cannot amortize waking a large global pool. Keep their
+    // workers isolated so unused global workers sleep rather than steal/spin.
+    scan_pools: [Option<rayon::ThreadPool>; 2],
 }
 /// Smallest slice of candidate evaluations handed to a pool thread: a few thousand sketch comparisons are
 /// about a millisecond, so smaller scans run on the calling thread instead of paying for thread hand-offs.
@@ -143,10 +250,30 @@ const CANDIDATES_PER_TASK: usize = 1024;
 impl StreamingPlanner {
     fn add_to_bucket(&mut self, id: usize) {
         let group = &self.groups[id];
+        if group.sketch.is_released() {
+            return;
+        }
         let key = (group.slots.trailing_zeros(), group.members.len());
         let bucket = self.buckets.entry(key).or_default();
-        self.bucket_positions[id] = bucket.len();
-        bucket.push(id);
+        if bucket.len % LANES == 0 {
+            bucket
+                .blocks
+                .push(self.packed.allocate(group.sketch.fingerprints().len()));
+            bucket.block_first.push(id);
+        }
+        bucket.block_first[bucket.len / LANES] = bucket.block_first[bucket.len / LANES].min(id);
+        self.positions.resize(self.groups.len(), 0);
+        self.positions[id] = bucket.len;
+        self.packed
+            .write(bucket.slot(bucket.len), id, group.sketch.fingerprints());
+        if bucket.len == 0 {
+            bucket.first = id;
+            bucket.min_cardinality = group.cardinality;
+        } else {
+            bucket.first = bucket.first.min(id);
+            bucket.min_cardinality = bucket.min_cardinality.min(group.cardinality);
+        }
+        bucket.len += 1;
     }
 
     fn remove_from_bucket(&mut self, id: usize) {
@@ -156,21 +283,241 @@ impl StreamingPlanner {
             .buckets
             .get_mut(&key)
             .expect("missing streaming bucket");
-        let position = self.bucket_positions[id];
-        assert_eq!(bucket.swap_remove(position), id);
-        if position < bucket.len() {
-            self.bucket_positions[bucket[position]] = position;
+        let position = self.positions[id];
+        let moved = self
+            .packed
+            .move_slot(bucket.slot(bucket.len - 1), bucket.slot(position));
+        self.positions[moved] = position;
+        bucket.block_first[position / LANES] = bucket.block_first[position / LANES].min(moved);
+        bucket.len -= 1;
+        if bucket.len % LANES == 0 {
+            self.packed.free(bucket.blocks.pop().unwrap());
+            bucket.block_first.pop();
         }
-        if bucket.is_empty() {
+        if bucket.len == 0 {
             self.buckets.remove(&key);
+        } else if bucket.first == id {
+            bucket.first = (0..bucket.len)
+                .map(|i| self.packed.ids[bucket.slot(i)])
+                .min()
+                .unwrap();
         }
     }
 
-    pub fn insert(&mut self, incoming: Group, config: &BuildConfig) -> Result<()> {
+    fn best_bounded(
+        &mut self,
+        incoming: &Group,
+        config: &BuildConfig,
+    ) -> Result<Option<Candidate>> {
+        self.bucket_work.clear();
+        for (&key @ (exponent, origins), bucket) in &self.buckets {
+            if let Some(upper) = bucket_max_saving(1usize << exponent, origins, incoming, config) {
+                self.bucket_work.push((upper, bucket.first, key));
+            }
+        }
+        self.bucket_work
+            .sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let mut best = None;
+        for index in 0..self.bucket_work.len() {
+            let (upper, first, key) = self.bucket_work[index];
+            if !can_beat(upper, first, &best) {
+                // Sorted by decreasing bound, then increasing earliest ID:
+                // every remaining bucket is also unable to win.
+                break;
+            }
+            let bytes = self.buckets[&key].len.saturating_mul(self.packed.size);
+            let pool_index = if bytes < 16 * 1024 * 1024 {
+                Some(0)
+            } else if bytes < 32 * 1024 * 1024 {
+                Some(1)
+            } else {
+                None
+            };
+            let pool_index = pool_index.filter(|&i| rayon::current_num_threads() > (8 << i));
+            // Delay pool creation until after the cheap earliest-ID probe.
+            let bucket = &self.buckets[&key];
+            // Preserve the O(1) hot-cluster case and the earliest-ID tie.
+            self.pair_evaluations += 1;
+            best = best.max(candidate(
+                first,
+                self.groups.len(),
+                &self.groups[first],
+                incoming,
+                config,
+            )?);
+            if !can_beat(upper, first, &best) {
+                continue;
+            }
+            let required =
+                bucket.required_matches(1usize << key.0, key.1, incoming, config, &best)?;
+            if required > self.packed.size {
+                continue;
+            }
+            if bucket.blocks.len() >= 1024 {
+                if let Some(i) = pool_index {
+                    if self.scan_pools[i].is_none() {
+                        self.scan_pools[i] = Some(
+                            rayon::ThreadPoolBuilder::new()
+                                .num_threads(8 << i)
+                                .thread_name(move |n| format!("layout-{}-{n}", 8 << i))
+                                .build()
+                                .context("creating streaming scan worker pool")?,
+                        );
+                    }
+                }
+            }
+            let incumbent = Mutex::new(best.clone());
+            let revision = AtomicUsize::new(0);
+            let visited = AtomicU64::new(0);
+            let scan = |start: usize, blocks: &[usize]| -> Result<Option<Candidate>> {
+                let mut found = best.clone();
+                let mut required = required;
+                let mut observed_revision = 0;
+                let mut comparisons = 0u64;
+                let mut counts = [0u32; 4 * LANES];
+                for (offset, chunk) in blocks.chunks(4).enumerate() {
+                    let current_revision = revision.load(AtomicOrdering::Acquire);
+                    if current_revision != observed_revision {
+                        found = found.max(incumbent.lock().unwrap().clone());
+                        observed_revision = current_revision;
+                        required = bucket.required_matches(
+                            1usize << key.0,
+                            key.1,
+                            incoming,
+                            config,
+                            &found,
+                        )?;
+                    }
+                    if required > self.packed.size {
+                        break;
+                    }
+                    let chunk_start = start + offset * 4;
+                    let first_id = bucket.block_first[chunk_start..chunk_start + chunk.len()]
+                        .iter()
+                        .copied()
+                        .min()
+                        .unwrap();
+                    if !can_beat(upper, first_id, &found) {
+                        continue;
+                    }
+                    let valid =
+                        (bucket.len - (start + offset * 4) * LANES).min(chunk.len() * LANES);
+                    comparisons += valid as u64
+                        - u64::from(
+                            (chunk_start * LANES..chunk_start * LANES + valid)
+                                .contains(&self.positions[first]),
+                        );
+                    let previous = found.clone();
+                    let query = incoming.sketch.fingerprints();
+                    let mut live = if valid == 4 * LANES {
+                        packed::matches_quad(
+                            [
+                                self.packed.block(chunk[0]),
+                                self.packed.block(chunk[1]),
+                                self.packed.block(chunk[2]),
+                                self.packed.block(chunk[3]),
+                            ],
+                            query,
+                            required,
+                            &mut counts,
+                        )
+                    } else {
+                        let mut live = 0u128;
+                        for (i, &block) in chunk.iter().enumerate() {
+                            let out = (&mut counts[i * LANES..(i + 1) * LANES])
+                                .try_into()
+                                .unwrap();
+                            let mask = packed::matches(
+                                self.packed.block(block),
+                                query,
+                                required,
+                                (valid - i * LANES).min(LANES),
+                                out,
+                            );
+                            live |= (mask as u128) << (i * LANES);
+                        }
+                        live
+                    };
+                    while live != 0 {
+                        let lane = live.trailing_zeros() as usize;
+                        live &= live - 1;
+                        let id = self.packed.ids[chunk[lane / LANES] * LANES + lane % LANES];
+                        if id != first && can_beat(upper, id, &found) {
+                            let j = Sketch::similarity_from_matches(
+                                counts[lane] as usize,
+                                self.packed.size,
+                            );
+                            found = found.max(candidate_with_similarity(
+                                id,
+                                self.groups.len(),
+                                &self.groups[id],
+                                incoming,
+                                config,
+                                j,
+                            )?);
+                        }
+                    }
+                    if found != previous {
+                        required = bucket.required_matches(
+                            1usize << key.0,
+                            key.1,
+                            incoming,
+                            config,
+                            &found,
+                        )?;
+                        let mut shared = incumbent.lock().unwrap();
+                        if found > *shared {
+                            *shared = found.clone();
+                            revision.fetch_add(1, AtomicOrdering::Release);
+                        }
+                    }
+                }
+                visited.fetch_add(comparisons, AtomicOrdering::Relaxed);
+                Ok(found)
+            };
+            // One coarse dispatch, not hundreds of speculative batches. Small
+            // scans stay local to avoid making scheduling the bottleneck again.
+            let found = if bucket.blocks.len() >= 1024 {
+                // One pinned job per worker, with a small shared block queue.
+                // Fast and slow cores claim different numbers of chunks, but
+                // avoid recursively splitting/stealing millions of tiny jobs.
+                let next = AtomicUsize::new(0);
+                let worker = |_: rayon::BroadcastContext<'_>| -> Result<Option<Candidate>> {
+                    let mut found = None;
+                    loop {
+                        let start = next.fetch_add(256, AtomicOrdering::Relaxed);
+                        if start >= bucket.blocks.len() {
+                            break;
+                        }
+                        let end = (start + 256).min(bucket.blocks.len());
+                        found = found.max(scan(start, &bucket.blocks[start..end])?);
+                    }
+                    Ok(found)
+                };
+                let results = if let Some(i) = pool_index {
+                    self.scan_pools[i].as_ref().unwrap().broadcast(worker)
+                } else {
+                    rayon::broadcast(worker)
+                };
+                results
+                    .into_iter()
+                    .try_fold(None, |a, b| Ok::<_, anyhow::Error>(a.max(b?)))?
+            } else {
+                scan(0, &bucket.blocks)?
+            };
+            best = best.max(found);
+            self.pair_evaluations += visited.load(AtomicOrdering::Relaxed);
+        }
+        Ok(best)
+    }
+
+    pub fn insert(&mut self, mut incoming: Group, config: &BuildConfig) -> Result<()> {
         let unpruned = config.merge.planner == MergePlanner::StreamingUnpruned;
         if config.merge.disabled {
+            if incoming.members.len() >= config.merge.max_colors {
+                incoming.sketch.release();
+            }
             self.groups.push(incoming);
-            self.bucket_positions.push(0);
             if !unpruned {
                 self.add_to_bucket(self.groups.len() - 1);
             }
@@ -189,20 +536,7 @@ impl StreamingPlanner {
                 .map(|(id, group)| candidate(id, self.groups.len(), group, &incoming, config))
                 .try_reduce(|| None, |a, b| Ok(a.max(b)))?
         } else {
-            let eligible: Vec<usize> = self
-                .buckets
-                .iter()
-                .filter(|(&(exponent, origins), _)| {
-                    bucket_can_save(1usize << exponent, origins, &incoming, config)
-                })
-                .flat_map(|(_, ids)| ids.iter().copied())
-                .collect();
-            self.pair_evaluations += eligible.len() as u64;
-            eligible
-                .par_iter()
-                .with_min_len(CANDIDATES_PER_TASK)
-                .map(|&id| candidate(id, self.groups.len(), &self.groups[id], &incoming, config))
-                .try_reduce(|| None, |a, b| Ok(a.max(b)))?
+            self.best_bounded(&incoming, config)?
         };
         if let Some(c) = best {
             // Do not search for additional old-group merges after insertion.
@@ -218,12 +552,17 @@ impl StreamingPlanner {
                 group.width = config.width(group.members.len());
                 group.cardinality = c.cardinality;
                 group.slots = c.slots;
-                group.sketch = group.sketch.union(&incoming.sketch);
+                group.sketch.merge_in_place(&incoming.sketch);
+                if group.members.len() >= config.merge.max_colors {
+                    group.sketch.release();
+                }
                 self.add_to_bucket(c.a);
             }
         } else {
+            if incoming.members.len() >= config.merge.max_colors {
+                incoming.sketch.release();
+            }
             self.groups.push(incoming);
-            self.bucket_positions.push(0);
             if !unpruned {
                 self.add_to_bucket(self.groups.len() - 1);
             }
@@ -231,7 +570,10 @@ impl StreamingPlanner {
         Ok(())
     }
 
-    pub fn finish(self) -> Plan {
+    pub fn finish(mut self) -> Plan {
+        for group in &mut self.groups {
+            group.sketch.release();
+        }
         Plan {
             groups: self.groups,
             pair_evaluations: self.pair_evaluations,
@@ -243,7 +585,7 @@ impl StreamingPlanner {
 /// Maximum-saving agglomeration. Only candidates involving the new group need
 /// recalculation; heap entries involving retired groups are ignored. Pairwise
 /// sketch comparisons remain O(N²), and the heap can also occupy O(N²) space.
-pub fn plan(initial: Vec<Group>, config: &BuildConfig) -> Result<Plan> {
+pub fn plan(mut initial: Vec<Group>, config: &BuildConfig) -> Result<Plan> {
     if config.merge.planner.is_streaming() {
         let mut state = StreamingPlanner::default();
         for group in initial {
@@ -252,11 +594,19 @@ pub fn plan(initial: Vec<Group>, config: &BuildConfig) -> Result<Plan> {
         return Ok(state.finish());
     }
     if config.merge.disabled {
+        for group in &mut initial {
+            group.sketch.release();
+        }
         return Ok(Plan {
             groups: initial,
             pair_evaluations: 0,
             possible_pair_evaluations: 0,
         });
+    }
+    for group in &mut initial {
+        if group.members.len() >= config.merge.max_colors {
+            group.sketch.release();
+        }
     }
     let mut pair_evaluations = initial.len() as u64 * initial.len().saturating_sub(1) as u64 / 2;
     let rows = (0..initial.len())
@@ -296,6 +646,9 @@ pub fn plan(initial: Vec<Group>, config: &BuildConfig) -> Result<Plan> {
     }
     let mut result: Vec<_> = groups.into_iter().flatten().collect();
     result.sort_by_key(|g| g.members[0]);
+    for group in &mut result {
+        group.sketch.release();
+    }
     Ok(Plan {
         groups: result,
         pair_evaluations,
@@ -379,7 +732,8 @@ mod tests {
             assert_eq!(a.members, b.members);
             assert_eq!(a.slots, b.slots);
             assert_eq!(a.cardinality, b.cardinality);
-            assert_eq!(a.sketch.jaccard(&b.sketch), 1.0);
+            assert_eq!(a.sketch, b.sketch);
+            assert!(a.sketch.is_released());
         }
     }
 
@@ -515,6 +869,64 @@ mod tests {
     }
 
     #[test]
+    fn packed_columns_stay_exact_through_merges_retirement_and_reuse() {
+        for size in [64, 256, 4096] {
+            let mut c = config(Backend::Zor);
+            c.merge.sketch_size = size;
+            c.merge.max_colors = 3;
+            c.merge.disabled = true;
+            let sets: Vec<Vec<u64>> = (0..100)
+                .map(|i| (i * 8192..i * 8192 + 1000).collect())
+                .collect();
+            let mut packed = StreamingPlanner::default();
+            let mut old = StreamingPlanner::default();
+            for group in initial(&sets, &c) {
+                packed.insert(group.clone(), &c).unwrap();
+                let mut legacy = c.clone();
+                legacy.merge.planner = MergePlanner::StreamingUnpruned;
+                old.insert(group, &legacy).unwrap();
+            }
+            c.merge.disabled = false;
+            for i in 0..210 {
+                let target = (i * 37) % sets.len();
+                let group = singleton(
+                    1000,
+                    Sketch::new(&sets[target], size, c.seed),
+                    sets.len() + i,
+                    &c,
+                )
+                .unwrap();
+                let mut legacy = c.clone();
+                legacy.merge.planner = MergePlanner::StreamingUnpruned;
+                old.insert(group.clone(), &legacy).unwrap();
+                packed.insert(group, &c).unwrap();
+                assert_same_groups(&packed.groups, &old.groups);
+                let mut seen = vec![false; packed.groups.len()];
+                for bucket in packed.buckets.values() {
+                    for position in 0..bucket.len {
+                        let slot = bucket.slot(position);
+                        let id = packed.packed.ids[slot];
+                        assert!(!seen[id]);
+                        seen[id] = true;
+                        assert_eq!(packed.positions[id], position);
+                        for (row, &byte) in
+                            packed.groups[id].sketch.fingerprints().iter().enumerate()
+                        {
+                            assert_eq!(
+                                packed.packed.block(slot / LANES)[row * LANES + slot % LANES],
+                                byte
+                            );
+                        }
+                    }
+                }
+                for (group, active) in packed.groups.iter().zip(seen) {
+                    assert_eq!(active, !group.sketch.is_released());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn pruned_streaming_matches_original_across_widths_rounding_limits_and_ties() {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(4)
@@ -554,6 +966,31 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn default_sketch_size_and_optional_margin_preserve_exhaustive_streaming_decisions() {
+        let sets: Vec<Vec<u64>> = (0..48)
+            .map(|i| {
+                let start = (i % 4) * 40_000;
+                let count = [8000, 8192, 8500, 16000, 16384, 17000][i as usize % 6];
+                (start..start + count).collect()
+            })
+            .collect();
+        for plan_margin in [0.0, 0.03, 0.1, 0.49] {
+            let mut c = config(Backend::Zor);
+            assert_eq!(c.merge.sketch_size, 128);
+            c.merge.plan_margin = plan_margin;
+            c.merge.max_colors = 5;
+            let groups = initial(&sets, &c);
+            c.merge.planner = MergePlanner::StreamingUnpruned;
+            let old = plan(groups.clone(), &c).unwrap();
+            c.merge.planner = MergePlanner::Streaming;
+            let new = plan(groups, &c).unwrap();
+            assert_same_groups(&old.groups, &new.groups);
+            assert_eq!(new.possible_pair_evaluations, old.pair_evaluations);
+            assert!(new.pair_evaluations <= old.pair_evaluations);
+        }
     }
 
     #[test]
@@ -620,5 +1057,204 @@ mod tests {
         c.merge.planner = MergePlanner::Streaming;
         let new = plan(groups, &c).unwrap();
         assert_same_groups(&old.groups, &new.groups);
+    }
+
+    #[test]
+    fn saturating_match_skips_the_rest_of_a_hot_bucket_without_changing_ties() {
+        let mut c = config(Backend::Zor);
+        c.merge.sketch_size = 64;
+        c.merge.disabled = true;
+        let keys: Vec<_> = (0..1000).collect();
+        let sets = vec![keys.clone(); 600];
+        let mut state = StreamingPlanner::default();
+        for g in initial(&sets, &c) {
+            state.insert(g, &c).unwrap();
+        }
+        let mut exhaustive = StreamingPlanner::default();
+        c.merge.planner = MergePlanner::StreamingUnpruned;
+        for g in initial(&sets, &c) {
+            exhaustive.insert(g, &c).unwrap();
+        }
+        c.merge.disabled = false;
+        for id in 600..603 {
+            let g = singleton(keys.len(), Sketch::new(&keys, 64, c.seed), id, &c).unwrap();
+            exhaustive.insert(g.clone(), &c).unwrap();
+            c.merge.planner = MergePlanner::Streaming;
+            state.insert(g, &c).unwrap();
+            c.merge.planner = MergePlanner::StreamingUnpruned;
+            assert_same_groups(&state.groups, &exhaustive.groups);
+        }
+        assert_eq!(state.pair_evaluations, 3);
+        assert_eq!(exhaustive.pair_evaluations, 1800);
+        assert_eq!(state.groups[0].members, [0, 600, 601, 602]);
+    }
+
+    #[test]
+    fn late_optimal_candidate_prunes_later_blocks_without_losing_earlier_ties() {
+        let mut c = config(Backend::Zor);
+        c.merge.disabled = true;
+        let sets: Vec<Vec<u64>> = (0..1024)
+            .map(|id| (id * 2000..id * 2000 + 1000).collect())
+            .collect();
+        let mut fast = StreamingPlanner::default();
+        let mut old = StreamingPlanner::default();
+        for group in initial(&sets, &c) {
+            fast.insert(group.clone(), &c).unwrap();
+            c.merge.planner = MergePlanner::StreamingUnpruned;
+            old.insert(group, &c).unwrap();
+            c.merge.planner = MergePlanner::Streaming;
+        }
+        c.merge.disabled = false;
+        let incoming = singleton(
+            1000,
+            Sketch::new(&sets[128], c.merge.sketch_size, c.seed),
+            1024,
+            &c,
+        )
+        .unwrap();
+        fast.insert(incoming.clone(), &c).unwrap();
+        c.merge.planner = MergePlanner::StreamingUnpruned;
+        old.insert(incoming, &c).unwrap();
+        assert_same_groups(&fast.groups, &old.groups);
+        assert_eq!(fast.groups[128].members, [128, 1024]);
+        assert!(fast.pair_evaluations < old.pair_evaluations / 2);
+    }
+
+    #[test]
+    fn sketches_are_freed_at_the_cap_and_all_are_freed_at_finish() {
+        let mut c = config(Backend::Zor);
+        c.merge.max_colors = 3;
+        c.merge.sketch_size = 64;
+        let sets = vec![(0..1000).collect(); 5];
+        let mut state = StreamingPlanner::default();
+        for g in initial(&sets, &c) {
+            state.insert(g, &c).unwrap();
+        }
+        assert!(state.groups[0].sketch.is_released());
+        assert_eq!(state.groups[0].sketch.allocated_bytes(), 0);
+        assert!(state
+            .buckets
+            .values()
+            .all(|bucket| (0..bucket.len).all(|i| state.packed.ids[bucket.slot(i)] != 0)));
+        assert!(!state.groups[1].sketch.is_released());
+        let plan = state.finish();
+        assert!(plan.groups.iter().all(|g| g.sketch.allocated_bytes() == 0));
+        c.merge.planner = MergePlanner::AllPairs;
+        assert!(super::plan(initial(&sets, &c), &c)
+            .unwrap()
+            .groups
+            .iter()
+            .all(|g| g.sketch.allocated_bytes() == 0));
+    }
+
+    #[test]
+    fn ordered_parallel_batches_match_exhaustive_before_and_after_every_arrival() {
+        let mut c = config(Backend::Zor);
+        c.merge.sketch_size = 64;
+        c.merge.disabled = true;
+        let sets: Vec<Vec<u64>> = (0..520)
+            .map(|i| (i * 4096..i * 4096 + 1000).collect())
+            .collect();
+        let mut bounded = StreamingPlanner::default();
+        let mut exhaustive = StreamingPlanner::default();
+        for g in initial(&sets, &c) {
+            bounded.insert(g.clone(), &c).unwrap();
+            c.merge.planner = MergePlanner::StreamingUnpruned;
+            exhaustive.insert(g, &c).unwrap();
+            c.merge.planner = MergePlanner::Streaming;
+        }
+        c.merge.disabled = false;
+        for (offset, target) in [400, 1, 519, 20, 400, 300, 1].into_iter().enumerate() {
+            let g = singleton(
+                sets[target].len(),
+                Sketch::new(&sets[target], 64, c.seed),
+                520 + offset,
+                &c,
+            )
+            .unwrap();
+            bounded.insert(g.clone(), &c).unwrap();
+            c.merge.planner = MergePlanner::StreamingUnpruned;
+            exhaustive.insert(g, &c).unwrap();
+            c.merge.planner = MergePlanner::Streaming;
+            assert_same_groups(&bounded.groups, &exhaustive.groups);
+        }
+    }
+
+    #[test]
+    fn parallel_cancellation_keeps_the_earliest_equal_saving_id() {
+        let mut c = config(Backend::Zor);
+        c.merge.sketch_size = 64;
+        c.merge.disabled = true;
+        let mut sets: Vec<Vec<u64>> = (0..600)
+            .map(|i| (i * 4096..i * 4096 + 1000).collect())
+            .collect();
+        sets[450] = sets[300].clone();
+        let groups = initial(&sets, &c);
+        for threads in [1, 4, 32] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let mut state = StreamingPlanner::default();
+                for group in groups.clone() {
+                    state.insert(group, &c).unwrap();
+                }
+                let mut enabled = c.clone();
+                enabled.merge.disabled = false;
+                let incoming =
+                    singleton(1000, Sketch::new(&sets[300], 64, c.seed), 600, &c).unwrap();
+                state.insert(incoming, &enabled).unwrap();
+                assert_eq!(state.groups[300].members, [300, 600]);
+                assert_eq!(state.groups[450].members, [450]);
+            });
+        }
+    }
+
+    #[test]
+    fn packed_parallel_chunks_choose_the_earliest_profitable_winner() {
+        let mut c = config(Backend::Zor);
+        c.merge.sketch_size = 64;
+        c.merge.disabled = true;
+        let ordinary = singleton(
+            1000,
+            Sketch::new(&(0..1000).collect::<Vec<_>>(), 64, c.seed),
+            0,
+            &c,
+        )
+        .unwrap();
+        let target = Sketch::new(&(100000..101000).collect::<Vec<_>>(), 64, c.seed);
+        // Exceed the coarse dispatch threshold; put equal-saving winners in
+        // different tasks, well away from the earliest-ID serial probe.
+        for threads in [1, 4, 32] {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    let mut packed = StreamingPlanner::default();
+                    let mut legacy = StreamingPlanner::default();
+                    let mut old_config = c.clone();
+                    old_config.merge.planner = MergePlanner::StreamingUnpruned;
+                    for id in 0..33000 {
+                        let mut group = ordinary.clone();
+                        group.members[0] = id;
+                        if id == 300 || id == 32900 {
+                            group.sketch = target.clone();
+                        }
+                        packed.insert(group.clone(), &c).unwrap();
+                        legacy.insert(group, &old_config).unwrap();
+                    }
+                    let mut enabled = c.clone();
+                    enabled.merge.disabled = false;
+                    old_config.merge.disabled = false;
+                    let arrival = singleton(1000, target.clone(), 33000, &enabled).unwrap();
+                    packed.insert(arrival.clone(), &enabled).unwrap();
+                    legacy.insert(arrival, &old_config).unwrap();
+                    assert_same_groups(&packed.groups, &legacy.groups);
+                    assert_eq!(packed.groups[300].members, [300, 33000]);
+                    assert_eq!(packed.groups[32900].members, [32900]);
+                });
+        }
     }
 }
