@@ -15,7 +15,10 @@ Magic:
 ZORIDX1\0
 ```
 
-Current format version: `7` (readers also accept legacy versions).
+Current format version: `10` (readers also accept versions 2, 3, 4, 5, 7, 8 and 9).
+Version 10 changes randstrobemer extraction to downstream-only construction
+and separate two-orientation querying. Version-9 custom-randstrobemer files
+are rejected with a rebuild message; other version-9 indexes remain readable.
 
 Header fields:
 
@@ -28,6 +31,14 @@ Header fields:
 - feature mode
 - minimizer size
 - modimizer sampling
+- findere z byte, only for findere mode
+- minimizer scheme byte: 0 = SIMD, 1 = open-closed mod (version 8)
+- homopolymer-compression byte: 0 = disabled, 1 = enabled (version 8)
+- seed pattern width byte, followed by that many ASCII `#`/`_` bytes;
+  width 0 disables masking (version 9)
+- randstrobemer enabled byte: 0 = disabled, 1 = enabled; when enabled,
+  followed by inclusive minimum and maximum start distances as little-endian
+  `u64` values (version 9)
 - ZOR segmented layout
 - color metadata
 - technical layout and technical-bin metadata (version 7)
@@ -41,6 +52,11 @@ first within each byte. Slice codecs operate on these packed bytes with a
 one-byte codec element width; the header fingerprint width remains `1`.
 Unused final-byte bits are ignored by queries. The 8- and 16-bit layouts are
 unchanged.
+
+Version-9 anchor settings apply to construction, queries and plain-index
+appends. Pattern syntax, symmetry and width, and randstrobemer distances are
+validated on load. Older indexes have neither masking nor randstrobemers;
+older readers reject version 9 rather than silently extracting different keys.
 
 The stack can be stored plain or compressed. Plain stacks store all rows as
 contiguous little-endian fingerprint bytes (or packed bits at width 1). Compressed stacks store row offsets
@@ -118,8 +134,25 @@ count each color at most once per feature.
 Zindex builds a new merged directory by default, regardless of the output
 extension. `--plain` selects the legacy single-file `.zoridx` layout;
 `--power-of-two-merge` remains an optional compatibility flag.
-`manifest.json` contains version `3`, feature/hash settings, dataset identities,
+`manifest.json` contains version `5` (or `6` for downstream randstrobemers), feature/hash settings, dataset identities,
 group members and widths, bank sizes and abandoned-key map metadata.
+Version 4 adds `minimizer_scheme` (`simd` or `open-closed-mod`) and
+`homopolymer_compression` (boolean). These govern both construction and queries.
+Missing legacy fields default to SIMD selection and compression disabled.
+Version 5 adds `seed_pattern` (a symmetric `#`/`_` string or null) and
+`randstrobemers` (null or an object with `min_distance` and `max_distance`).
+Missing legacy fields default to null. Distances are inclusive, in sequence
+bases between strobe starts, after optional homopolymer compression. The bank
+and abandoned-key layouts are unchanged.
+
+Version 6 adds `randstrobe_scheme`, currently
+`strobealign-popcount8-symmetric64-downstream-v1`. It uses one downstream
+seed per anchor, canonical-strobe XXH64, masked-XOR popcount with q=255,
+first-minimum tie breaking, self-pair fallback and the paper's symmetric
+`h1/2+h2/2` full-seed key. Query orientations are scored independently and
+combined by per-document maximum per record. Missing or unknown extraction
+identities on randstrobemer indexes require rebuilding. Bank payloads and the
+abandoned-key map are unchanged. Non-randstrobemer indexes remain version 5.
 
 Each `bank-<exponent>.zorbank.zst` expands to magic `ZORPOW3\0`, followed by
 four little-endian `u64` values: slots, bits per row, group count and data bytes.
@@ -131,21 +164,36 @@ complete-payload prefix; the origin-plane offset for group `i` is
 
 Construction mode does not change the bank encoding or query layout. The default
 two-pass builder records `construction_cell_storage` as
-`two-pass-temporary-disk-packed-tiled-packing` (verified cells staged as files
-bit-packed at the group's payload width until bank compression); `--low-disk`
-records `two-pass-memory-packed-no-scratch` (the same packed cells retained in
-RAM); `--disk-backed` records `temporary-disk-u64-tiled-packing`. The two-pass
+`two-pass-memory-packed-no-scratch` (verified cells retained in RAM bit-packed
+at the group's payload width until bank compression). `--low-disk=false` records
+`two-pass-temporary-disk-packed-tiled-packing` (the same packed cells staged in
+files); `--disk-backed` records `temporary-disk-u64-tiled-packing`. The two-pass
 publication directory contains only final index files. First-pass projected
 capacities may differ from exact final capacities; this does not change the
 planned dataset membership partition.
+
+The optional manifest metadata `min_subindex_documents` records the build's
+minimum original-document count per bank (new default 128, missing legacy
+field defaults to 1). `promoted_groups` records filters rebuilt at a larger
+power-of-two capacity to meet that constraint (missing legacy field defaults
+to 0). Original documents are counted through `group.members`, not by the
+number of merged groups. With fewer total documents than the requested minimum,
+all groups occupy one bank. The planner selects a minimum-padded-bit-cost
+contiguous partition of the exact slot-size buckets; only promoted filters
+require additional input reads and reconstruction. This changes neither the
+bank encoding nor document partitions and creates no temporary key/cell files.
+Fingerprint width and abandoned-key union semantics stay fixed, but changing
+capacity may change which absent keys are false positives. Setting the minimum
+to 1 preserves the old layout. Queries fuse row XOR and fingerprint comparison
+in registers where supported; this is an execution change, not a format change.
 
 `abandoned.zormap.zst` expands to magic `ZORABN1\0`, followed by records:
 32-bit abandoned-key hash, 32-bit origin count, then that many 32-bit origin IDs.
 All integers are little-endian. This is one global multimap across all banks;
 32-bit hash collisions union origin lists. It is omitted with `--drop-abandoned`.
 
-The current reader also supports manifest versions 1 and 2 and their legacy
+The current reader also supports manifest versions 1, 2, 3 and 4 and their legacy
 `ZORPOW1\0` interleaved banks. Version-1 per-group abandoned-key records are
 converted to the global 32-bit-hash multimap on load. Older readers cannot read
-new version-3 directories. Merged directories currently cannot be appended or
+new version-5 directories. Merged directories currently cannot be appended or
 repacked; rebuilding requires the complete input list.

@@ -19,12 +19,12 @@ use zorindex::power_merge::{
 use zorindex::{
     create_index_writer, finish_index_writer, is_compressed_path, mixsplit, open_index_reader,
     parse_features_from_file, read_fof, scan_index_features, splitmix64, ColorInput, FastxStats,
-    FeatureConfig, IndexMode, DEFAULT_MINIMIZER_SIZE, DEFAULT_MODIMIZER_SAMPLING, MAX_HASHES,
-    PARSER_CONFIG,
+    FeatureConfig, IndexMode, MinimizerScheme, RandstrobeConfig, SpacedSeed,
+    DEFAULT_MINIMIZER_SIZE, DEFAULT_MODIMIZER_SAMPLING, MAX_HASHES, PARSER_CONFIG,
 };
 
 const MAGIC: &[u8; 8] = b"ZORIDX1\0";
-const FORMAT_VERSION: u32 = 7;
+const FORMAT_VERSION: u32 = 10;
 const FLAG_UNION_GRAPH: u8 = 1;
 const MAX_SEGMENT_LENGTH_LOG: u32 = 12;
 const DEFAULT_STACK_BLOCK_ROWS: usize = 4096;
@@ -107,6 +107,30 @@ struct BuildArgs {
     /// Canonical minimizer length when --index-mode minimizers is used.
     #[arg(long, default_value_t = DEFAULT_MINIMIZER_SIZE)]
     minimizer_size: usize,
+
+    /// Minimizer selector; persisted for queries and updates. Legacy indexes use simd.
+    #[arg(long, value_enum, default_value = "open-closed-mod")]
+    minimizer_scheme: MinimizerScheme,
+
+    /// Collapse homopolymer runs before feature extraction (also applied to queries/updates).
+    #[arg(long, alias = "homocompress")]
+    homopolymer_compression: bool,
+
+    /// Symmetric #/_ pattern, width k (or minimizer size m); mask after minimizer selection.
+    #[arg(long, alias = "spaced-seed")]
+    seed_pattern: Option<SpacedSeed>,
+
+    /// Link two k-mers, or two already-selected minimizers, into canonical randstrobemers.
+    #[arg(long, alias = "randstrobes")]
+    randstrobemers: bool,
+
+    /// Inclusive minimum distance between strobe starts, in bases (default: k or m).
+    #[arg(long, alias = "strobe-window-min", requires = "randstrobemers")]
+    strobe_min: Option<usize>,
+
+    /// Inclusive maximum distance between strobe starts, in bases (default: 3 times k or m).
+    #[arg(long, alias = "strobe-window-max", requires = "randstrobemers")]
+    strobe_max: Option<usize>,
 
     /// Keep roughly 1/N canonical k-mers when --index-mode modimizers is used.
     #[arg(long, default_value_t = DEFAULT_MODIMIZER_SAMPLING)]
@@ -357,6 +381,14 @@ struct QueryArgs {
     #[arg(long, default_value_t = 0.0)]
     min_ratio: f64,
 
+    /// Report each FASTA record separately (merged indexes, except findere).
+    #[arg(long, alias = "bench-records")]
+    records: bool,
+
+    /// Records per parallel reporting batch. Counters are reused per worker.
+    #[arg(long, alias = "bench-batch", default_value_t = 4096)]
+    record_batch_size: usize,
+
     /// Skip the global abandoned-key recovery map for merged indexes.
     #[arg(long)]
     ignore_abandoned: bool,
@@ -576,12 +608,7 @@ fn build_command(args: BuildArgs) -> Result<()> {
             hashes: args.hashes,
             seed: args.seed,
             fingerprint_bits: args.fingerprint_bits as usize,
-            feature_config: FeatureConfig::new(
-                args.index_mode,
-                args.minimizer_size,
-                args.modimizer_sampling,
-            )
-            .with_findere_z(args.findere_z),
+            feature_config: feature_config_from_args(&args),
             slot_scale: args.slot_scale,
             minimum_slots: args.slot_count,
             merge: args.merge.clone(),
@@ -608,12 +635,7 @@ fn build_command(args: BuildArgs) -> Result<()> {
     }
     let start = Instant::now();
     let build_jobs = bounded_build_jobs(args.build_jobs)?;
-    let feature_config = FeatureConfig::new(
-        args.index_mode,
-        args.minimizer_size,
-        args.modimizer_sampling,
-    )
-    .with_findere_z(args.findere_z);
+    let feature_config = feature_config_from_args(&args);
     let inputs = read_fof(&args.fof).with_context(|| format!("reading {}", args.fof.display()))?;
     ensure!(
         !inputs.is_empty(),
@@ -967,6 +989,16 @@ fn repack_command(args: RepackArgs) -> Result<()> {
 }
 
 fn query_command(args: QueryArgs) -> Result<()> {
+    if args.records {
+        ensure!(args.index.is_dir(), "--records requires a merged index");
+        return zorindex::power_merge::query_records_command(
+            &args.index,
+            &args.query,
+            args.min_ratio,
+            !args.ignore_abandoned,
+            args.record_batch_size,
+        );
+    }
     if args.index.is_dir() {
         return zorindex::power_merge::query_command_with_recovery(
             &args.index,
@@ -1048,6 +1080,15 @@ fn info_command(args: IndexArg) -> Result<()> {
     }
     println!("minimizer_size\t{}", index.feature_config.minimizer_size);
     println!(
+        "minimizer_scheme\t{}",
+        index.feature_config.minimizer_scheme.label()
+    );
+    println!(
+        "homopolymer_compression\t{}",
+        index.feature_config.homopolymer_compression
+    );
+    zorindex::anchors::print_settings(index.feature_config);
+    println!(
         "modimizer_sampling\t{}",
         index.feature_config.modimizer_sampling
     );
@@ -1103,6 +1144,27 @@ fn info_command(args: IndexArg) -> Result<()> {
     Ok(())
 }
 
+fn feature_config_from_args(args: &BuildArgs) -> FeatureConfig {
+    let length = if args.index_mode == IndexMode::Minimizers {
+        args.minimizer_size
+    } else {
+        args.k
+    };
+    FeatureConfig::new(
+        args.index_mode,
+        args.minimizer_size,
+        args.modimizer_sampling,
+    )
+    .with_findere_z(args.findere_z)
+    .with_minimizer_scheme(args.minimizer_scheme)
+    .with_homopolymer_compression(args.homopolymer_compression)
+    .with_seed_pattern(args.seed_pattern)
+    .with_randstrobemers(args.randstrobemers.then_some(RandstrobeConfig {
+        min_distance: args.strobe_min.unwrap_or(length),
+        max_distance: args.strobe_max.unwrap_or(length * 3),
+    }))
+}
+
 fn validate_build_args(args: &BuildArgs) -> Result<()> {
     ensure!(
         (1..=u8::MAX as usize).contains(&args.k),
@@ -1112,15 +1174,7 @@ fn validate_build_args(args: &BuildArgs) -> Result<()> {
         (2..=32).contains(&args.hashes),
         "--hashes must be in 2..=32"
     );
-    validate_feature_config(
-        args.k,
-        FeatureConfig::new(
-            args.index_mode,
-            args.minimizer_size,
-            args.modimizer_sampling,
-        )
-        .with_findere_z(args.findere_z),
-    )?;
+    validate_feature_config(args.k, feature_config_from_args(args))?;
     fingerprint_bytes(args.fingerprint_bits)
         .with_context(|| "--fingerprint-bits must be 1, 8 or 16")?;
     ensure!(
@@ -1155,6 +1209,7 @@ fn validate_build_args(args: &BuildArgs) -> Result<()> {
 }
 
 fn validate_feature_config(k: usize, config: FeatureConfig) -> Result<()> {
+    config.validate_anchors(k)?;
     ensure!(
         (1..=31).contains(&config.minimizer_size),
         "--minimizer-size must be in 1..=31"
@@ -1174,10 +1229,7 @@ fn validate_feature_config(k: usize, config: FeatureConfig) -> Result<()> {
             );
         }
         IndexMode::Minimizers => {
-            ensure!(
-                k % 2 == 1,
-                "minimizer indexes require odd k with canonical SIMD minimizers"
-            );
+            ensure!(k % 2 == 1, "canonical minimizer indexes require odd k");
             ensure!(
                 (1..=k).contains(&config.minimizer_size),
                 "--minimizer-size must be in 1..=k for minimizer indexes"
@@ -2495,12 +2547,71 @@ fn query_features_from_file_parallel(
     path: &Path,
     ignore_union: bool,
 ) -> Result<QueryRunResult> {
+    if index.feature_config.randstrobemers.is_some() {
+        let mut accum = QueryAccum::new(index.colors.len());
+        let mut batch = Vec::new();
+        let mut bases = 0;
+        let mut flush = |batch: &mut Vec<Vec<u8>>| {
+            let sum = batch
+                .par_iter()
+                .map(|seq| {
+                    let mut keys = Vec::new();
+                    scan_index_features(
+                        seq,
+                        index.k,
+                        index.seed,
+                        index.feature_config,
+                        &mut |key| keys.push(key),
+                    );
+                    let mut forward = query_feature_chunk(index, &keys, ignore_union);
+                    keys.clear();
+                    let rc = zorindex::reverse_complement(seq);
+                    scan_index_features(
+                        &rc,
+                        index.k,
+                        index.seed,
+                        index.feature_config,
+                        &mut |key| keys.push(key),
+                    );
+                    let reverse = query_feature_chunk(index, &keys, ignore_union);
+                    assert_eq!(forward.total_features, reverse.total_features);
+                    for (a, b) in forward.scores.iter_mut().zip(reverse.scores) {
+                        *a = (*a).max(b);
+                    }
+                    forward.stack_queries += reverse.stack_queries;
+                    forward
+                })
+                .reduce(
+                    || QueryAccum::new(index.colors.len()),
+                    |mut a, b| {
+                        a.merge(b);
+                        a
+                    },
+                );
+            accum.merge(sum);
+            batch.clear();
+        };
+        let stats = zorindex::parse_sequences_from_file(path, |seq| {
+            bases += seq.len();
+            batch.push(seq.to_vec());
+            if bases >= 1024 * 1024 || batch.len() == 4096 {
+                flush(&mut batch);
+                bases = 0;
+            }
+        })?;
+        flush(&mut batch);
+        return Ok(QueryRunResult {
+            _stats: stats,
+            accum,
+        });
+    }
     if index.feature_config.mode == IndexMode::Findere {
-        let result = zorindex::findere::query_file(
+        let result = zorindex::findere::query_file_with_homopolymer_compression(
             path,
             index.k,
             index.feature_config.findere_z,
             index.colors.len(),
+            index.feature_config.homopolymer_compression,
             QueryScratch::default,
             |scratch, key, hits| {
                 if !ignore_union {
@@ -4172,10 +4283,29 @@ impl ZorIndex {
         write_u8(&mut writer, self.feature_config.mode.as_u8())?;
         write_u8(&mut writer, self.feature_config.minimizer_size as u8)?;
         write_u64(&mut writer, self.feature_config.modimizer_sampling)?;
-        // Mode-specific extension: legacy modes keep their original byte layout.
-        // Old readers reject mode 3 rather than misinterpreting a findere index.
+        // Findere's mode-specific extension precedes the version-8 extraction
+        // settings and version-9 anchors. Old readers reject new versions.
         if self.feature_config.mode == IndexMode::Findere {
             write_u8(&mut writer, self.feature_config.findere_z as u8)?;
+        }
+        write_u8(&mut writer, self.feature_config.minimizer_scheme.as_u8())?;
+        write_u8(
+            &mut writer,
+            u8::from(self.feature_config.homopolymer_compression),
+        )?;
+        let pattern = self
+            .feature_config
+            .seed_pattern
+            .map_or_else(String::new, |p| p.to_string());
+        write_u8(&mut writer, pattern.len() as u8)?;
+        writer.write_all(pattern.as_bytes())?;
+        write_u8(
+            &mut writer,
+            u8::from(self.feature_config.randstrobemers.is_some()),
+        )?;
+        if let Some(strobes) = self.feature_config.randstrobemers {
+            write_u64(&mut writer, strobes.min_distance as u64)?;
+            write_u64(&mut writer, strobes.max_distance as u64)?;
         }
         write_layout(&mut writer, self.layout)?;
         write_u64(&mut writer, self.colors.len() as u64)?;
@@ -4217,6 +4347,9 @@ impl ZorIndex {
                 || version == 3
                 || version == 4
                 || version == 5
+                || version == 7
+                || version == 8
+                || version == 9
                 || version == FORMAT_VERSION,
             "unsupported index version {}",
             version
@@ -4239,12 +4372,55 @@ impl ZorIndex {
             FeatureConfig {
                 mode,
                 minimizer_size,
+                minimizer_scheme: if version >= 8 {
+                    MinimizerScheme::from_u8(read_u8(&mut reader)?)?
+                } else {
+                    MinimizerScheme::Simd
+                },
+                homopolymer_compression: if version >= 8 {
+                    let value = read_u8(&mut reader)?;
+                    ensure!(value <= 1, "invalid homopolymer compression flag");
+                    value != 0
+                } else {
+                    false
+                },
+                seed_pattern: if version >= 9 {
+                    let length = read_u8(&mut reader)? as usize;
+                    ensure!(length <= 31, "invalid seed pattern width in index");
+                    if length == 0 {
+                        None
+                    } else {
+                        let mut bytes = vec![0; length];
+                        reader.read_exact(&mut bytes)?;
+                        Some(std::str::from_utf8(&bytes)?.parse()?)
+                    }
+                } else {
+                    None
+                },
+                randstrobemers: if version >= 9 {
+                    let enabled = read_u8(&mut reader)?;
+                    ensure!(enabled <= 1, "invalid randstrobemer flag in index");
+                    if enabled == 0 {
+                        None
+                    } else {
+                        Some(RandstrobeConfig {
+                            min_distance: usize::try_from(read_u64(&mut reader)?)?,
+                            max_distance: usize::try_from(read_u64(&mut reader)?)?,
+                        })
+                    }
+                } else {
+                    None
+                },
                 modimizer_sampling,
                 findere_z,
             }
         } else {
             FeatureConfig::legacy_kmers()
         };
+        ensure!(
+            version >= 10 || feature_config.randstrobemers.is_none(),
+            "legacy/custom randstrobemer extraction is incompatible; rebuild this index"
+        );
         let layout = read_layout(&mut reader)?;
         let color_count = read_u64(&mut reader)? as usize;
         ensure!(k > 0, "invalid k in index");
@@ -4681,6 +4857,11 @@ mod tests {
             zorindex::power_merge::ColumnOrder::Compression
         );
         assert_eq!(defaults.slot_scale, 1.0);
+        assert_eq!(defaults.merge.sketch_size, 128);
+        assert_eq!(zorindex::power_merge::MergeArgs::default().sketch_size, 128);
+        assert_eq!(defaults.merge.plan_margin, 0.0);
+        assert!(defaults.merge.low_disk);
+        assert!(!defaults.merge.disk_backed);
         assert_eq!(defaults.cycle_break, CycleBreakHeuristic::MostDeg2);
         assert_eq!(defaults.tie_scan, 8);
 
@@ -4715,6 +4896,11 @@ mod tests {
             "all-pairs",
             "--merge-column-order",
             "width",
+            "--merge-sketch-size",
+            "512",
+            "--merge-plan-margin",
+            "0.03",
+            "--low-disk=false",
             "--cycle-break",
             "no-heuristic",
             "--tie-scan",
@@ -4735,6 +4921,9 @@ mod tests {
         );
         assert_eq!(custom.cycle_break, CycleBreakHeuristic::NoHeuristic);
         assert_eq!(custom.tie_scan, 1);
+        assert_eq!(custom.merge.sketch_size, 512);
+        assert_eq!(custom.merge.plan_margin, 0.03);
+        assert!(!custom.merge.low_disk);
 
         let Command::Append(append) = Cli::try_parse_from([
             "zorindex",
@@ -4890,6 +5079,10 @@ mod tests {
                 mode: IndexMode::Modimizers,
                 findere_z: zorindex::findere::DEFAULT_Z,
                 minimizer_size: DEFAULT_MINIMIZER_SIZE,
+                minimizer_scheme: MinimizerScheme::Simd,
+                homopolymer_compression: false,
+                seed_pattern: None,
+                randstrobemers: None,
                 modimizer_sampling: 1,
             },
             &mut |k| sampled.push(k),
@@ -4911,6 +5104,10 @@ mod tests {
                 mode: IndexMode::Minimizers,
                 findere_z: zorindex::findere::DEFAULT_Z,
                 minimizer_size: m,
+                minimizer_scheme: MinimizerScheme::Simd,
+                homopolymer_compression: false,
+                seed_pattern: None,
+                randstrobemers: None,
                 modimizer_sampling: DEFAULT_MODIMIZER_SAMPLING,
             },
             &mut |k| minimizers.push(k),
@@ -5143,6 +5340,12 @@ mod tests {
             index_mode: IndexMode::Kmers,
             findere_z: zorindex::findere::DEFAULT_Z,
             minimizer_size: DEFAULT_MINIMIZER_SIZE,
+            minimizer_scheme: MinimizerScheme::OpenClosedMod,
+            homopolymer_compression: false,
+            seed_pattern: None,
+            randstrobemers: false,
+            strobe_min: None,
+            strobe_max: None,
             modimizer_sampling: DEFAULT_MODIMIZER_SAMPLING,
             slot_scale: 4.0,
             slot_count: None,

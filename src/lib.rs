@@ -9,8 +9,12 @@ use helicase::input::{FromMmap, FromSlice};
 use helicase::{Config, FastxParser, HelicaseParser, ParserOptions};
 use simd_minimizers::packed_seq::{PackedSeqVec, SeqVec};
 
+pub mod anchors;
 pub mod findere;
+pub mod open_closed_minimizers;
 pub mod power_merge;
+
+pub use anchors::{RandstrobeConfig, SpacedSeed};
 
 pub const MAX_HASHES: usize = 32;
 pub const DEFAULT_MINIMIZER_SIZE: usize = 21;
@@ -68,10 +72,50 @@ impl IndexMode {
     }
 }
 
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum MinimizerScheme {
+    /// Standard canonical SIMD hash minimizers (also used by legacy indexes).
+    #[default]
+    Simd,
+    /// Canonical open-closed mod minimizers, with a syncmer-prioritized anchor.
+    OpenClosedMod,
+}
+
+impl MinimizerScheme {
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Simd => 0,
+            Self::OpenClosedMod => 1,
+        }
+    }
+
+    pub fn from_u8(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Simd),
+            1 => Ok(Self::OpenClosedMod),
+            _ => anyhow::bail!("unsupported minimizer scheme {}", value),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Simd => "simd",
+            Self::OpenClosedMod => "open-closed-mod",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FeatureConfig {
     pub mode: IndexMode,
     pub minimizer_size: usize,
+    pub minimizer_scheme: MinimizerScheme,
+    pub homopolymer_compression: bool,
+    pub seed_pattern: Option<SpacedSeed>,
+    pub randstrobemers: Option<RandstrobeConfig>,
     pub modimizer_sampling: u64,
     pub findere_z: usize,
 }
@@ -81,6 +125,10 @@ impl FeatureConfig {
         Self {
             mode,
             minimizer_size,
+            minimizer_scheme: MinimizerScheme::Simd,
+            homopolymer_compression: false,
+            seed_pattern: None,
+            randstrobemers: None,
             modimizer_sampling,
             findere_z: findere::DEFAULT_Z,
         }
@@ -90,6 +138,10 @@ impl FeatureConfig {
         Self {
             mode: IndexMode::Kmers,
             minimizer_size: DEFAULT_MINIMIZER_SIZE,
+            minimizer_scheme: MinimizerScheme::Simd,
+            homopolymer_compression: false,
+            seed_pattern: None,
+            randstrobemers: None,
             modimizer_sampling: DEFAULT_MODIMIZER_SAMPLING,
             findere_z: findere::DEFAULT_Z,
         }
@@ -99,6 +151,72 @@ impl FeatureConfig {
         self.findere_z = z;
         self
     }
+
+    pub fn with_minimizer_scheme(mut self, scheme: MinimizerScheme) -> Self {
+        self.minimizer_scheme = scheme;
+        self
+    }
+
+    pub fn with_homopolymer_compression(mut self, enabled: bool) -> Self {
+        self.homopolymer_compression = enabled;
+        self
+    }
+
+    pub fn with_seed_pattern(mut self, pattern: Option<SpacedSeed>) -> Self {
+        self.seed_pattern = pattern;
+        self
+    }
+
+    pub fn with_randstrobemers(mut self, config: Option<RandstrobeConfig>) -> Self {
+        self.randstrobemers = config;
+        self
+    }
+
+    pub fn validate_anchors(self, k: usize) -> Result<()> {
+        if self.seed_pattern.is_some() || self.randstrobemers.is_some() {
+            ensure!(
+                matches!(self.mode, IndexMode::Kmers | IndexMode::Minimizers),
+                "spaced seeds and randstrobemers require --index-mode kmers or minimizers"
+            );
+        }
+        let length = if self.mode == IndexMode::Minimizers {
+            self.minimizer_size
+        } else {
+            k
+        };
+        if let Some(pattern) = self.seed_pattern {
+            ensure!(
+                pattern.width() == length,
+                "seed pattern width {} must match {} ({})",
+                pattern.width(),
+                if self.mode == IndexMode::Minimizers {
+                    "minimizer size m"
+                } else {
+                    "k"
+                },
+                length
+            );
+        }
+        if let Some(config) = self.randstrobemers {
+            config.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Collapse runs of identical DNA bases (case-insensitively). Ambiguous bases
+/// remain separators: compression never creates a feature across such a break.
+pub fn homopolymer_compress(seq: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(seq.len());
+    let mut previous = None;
+    for &base in seq {
+        let code = encode_base(base);
+        if code.is_none() || code != previous {
+            result.push(code.map_or(base, |c| b"ACGT"[c as usize]));
+        }
+        previous = code;
+    }
+    result
 }
 
 #[derive(Clone, Debug)]
@@ -255,6 +373,30 @@ where
     Ok(stats)
 }
 
+/// Visit complete FASTA/FASTQ records, including compressed input. Used when
+/// query scoring must keep the two strobemer orientations separate per read.
+pub fn parse_sequences_from_file(
+    path: &Path,
+    mut on_sequence: impl FnMut(&[u8]),
+) -> Result<FastxStats> {
+    let mut data = Vec::new();
+    let mut parser = if is_compressed_path(path) {
+        AnyDecoder::new(File::open(path)?).read_to_end(&mut data)?;
+        ensure!(!data.is_empty(), "{} is empty", path.display());
+        FastxParser::<PARSER_CONFIG>::from_slice(&data)?
+    } else {
+        FastxParser::<PARSER_CONFIG>::from_file_mmap(path)?
+    };
+    let mut stats = FastxStats::default();
+    while parser.next().is_some() {
+        let seq = parser.get_dna_string();
+        stats.bases += seq.len() as u64;
+        stats.chunks += 1;
+        on_sequence(seq);
+    }
+    Ok(stats)
+}
+
 pub fn is_compressed_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -277,11 +419,52 @@ pub fn scan_index_features<F>(
 ) where
     F: FnMut(u64),
 {
+    if feature_config.homopolymer_compression {
+        let compressed = homopolymer_compress(seq);
+        scan_features_uncompressed(&compressed, k, seed, feature_config, on_feature);
+    } else {
+        scan_features_uncompressed(seq, k, seed, feature_config, on_feature);
+    }
+}
+
+/// Reverse-complement a query without changing ambiguous-base separators.
+pub use anchors::{reverse_complement, RANDSTROBE_SCHEME};
+
+fn scan_features_uncompressed<F: FnMut(u64)>(
+    seq: &[u8],
+    k: usize,
+    seed: u64,
+    feature_config: FeatureConfig,
+    on_feature: &mut F,
+) {
+    if feature_config.seed_pattern.is_some() || feature_config.randstrobemers.is_some() {
+        anchors::scan(seq, k, seed, feature_config, on_feature);
+        return;
+    }
+    scan_plain_features_uncompressed(seq, k, seed, feature_config, on_feature);
+}
+
+pub(crate) fn scan_plain_features_uncompressed<F: FnMut(u64)>(
+    seq: &[u8],
+    k: usize,
+    seed: u64,
+    feature_config: FeatureConfig,
+    on_feature: &mut F,
+) {
     match feature_config.mode {
         IndexMode::Kmers => scan_canonical_kmers(seq, k, on_feature),
-        IndexMode::Minimizers => {
-            scan_simd_minimizers(seq, k, feature_config.minimizer_size, seed, on_feature)
-        }
+        IndexMode::Minimizers => match feature_config.minimizer_scheme {
+            MinimizerScheme::Simd => {
+                scan_simd_minimizers(seq, k, feature_config.minimizer_size, seed, on_feature)
+            }
+            MinimizerScheme::OpenClosedMod => open_closed_minimizers::scan(
+                seq,
+                k,
+                feature_config.minimizer_size,
+                seed,
+                on_feature,
+            ),
+        },
         IndexMode::Modimizers => {
             scan_modimizers(seq, k, seed, feature_config.modimizer_sampling, on_feature)
         }
@@ -337,6 +520,32 @@ pub fn scan_simd_minimizers<F>(
 ) where
     F: FnMut(u64),
 {
+    scan_simd_minimizers_positions(seq, k, minimizer_size, seed, &mut |_, key| on_kmer(key));
+}
+
+pub fn scan_simd_minimizers_positions<F: FnMut(usize, u64)>(
+    seq: &[u8],
+    k: usize,
+    minimizer_size: usize,
+    seed: u64,
+    emit: &mut F,
+) {
+    let mut offset = 0;
+    for run in seq.split(|&b| encode_base(b).is_none()) {
+        scan_simd_minimizers_run(run, k, minimizer_size, seed, &mut |position, key| {
+            emit(offset + position, key)
+        });
+        offset += run.len() + 1;
+    }
+}
+
+fn scan_simd_minimizers_run<F: FnMut(usize, u64)>(
+    seq: &[u8],
+    k: usize,
+    minimizer_size: usize,
+    seed: u64,
+    on_kmer: &mut F,
+) {
     if seq.len() < k || minimizer_size == 0 || minimizer_size > k {
         return;
     }
@@ -359,7 +568,7 @@ pub fn scan_simd_minimizers<F>(
             continue;
         }
         if let Some(encoded) = encode_full_kmer(&seq[position..end]) {
-            on_kmer(canonical_encoded(encoded, minimizer_size));
+            on_kmer(position, canonical_encoded(encoded, minimizer_size));
         }
     }
 }

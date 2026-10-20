@@ -87,6 +87,7 @@ fn build(fof: &str, output: &str, extra: &[&str]) {
         ("--k", "31"),
         ("--fingerprint-bits", "16"),
         ("--slot-scale", "1.0"),
+        ("--min-subindex-documents", "1"),
     ] {
         if !extra.contains(&flag) {
             args.extend([flag, value]);
@@ -151,10 +152,11 @@ fn short_default_command_matches_explicit_optimized_settings() {
             serde_json::from_slice(&fs::read(Path::new(&index).join("manifest.json")).unwrap())
                 .unwrap();
         assert_eq!(manifest["merge_planner"], "streaming");
+        assert_eq!(manifest["min_subindex_documents"], 128);
         assert_eq!(manifest["column_order"], "compression");
         assert_eq!(
             manifest["construction_cell_storage"],
-            "two-pass-temporary-disk-packed-tiled-packing"
+            "two-pass-memory-packed-no-scratch"
         );
         assert_eq!(manifest["abandoned_recovery"], true);
         assert_eq!(manifest["rejected_groups"], 0);
@@ -223,9 +225,7 @@ fn merged_origins_and_serialized_size_classes_query_correctly() {
     let index = f.path("merged");
     build(&inputs, &index, &[]);
     let info = ok(&["info", "--index", &index], "1");
-    assert!(info.contains(
-        "construction_cell_storage\ttwo-pass-temporary-disk-packed-tiled-packing"
-    ));
+    assert!(info.contains("construction_cell_storage\ttwo-pass-memory-packed-no-scratch"));
     assert!(info.contains("merge_planner\tstreaming"));
     assert!(info.contains("merge_column_order\tcompression"));
     assert!(!Path::new(&index).join("cells").exists());
@@ -420,7 +420,7 @@ fn global_abandoned_recovery_can_be_omitted_or_skipped_without_changing_filters(
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(Path::new(&recovery).join("manifest.json")).unwrap())
             .unwrap();
-    assert_eq!(manifest["version"], 3);
+    assert_eq!(manifest["version"], 5);
     for bank in manifest["banks"].as_array().unwrap() {
         let name = bank["file"].as_str().unwrap();
         assert_eq!(
@@ -828,8 +828,11 @@ fn all_cell_storage_modes_build_identical_filters_and_queries() {
                 let mut manifests = Vec::new();
                 let mut results = Vec::new();
                 for (mode, storage) in [
-                    (None, "two-pass-temporary-disk-packed-tiled-packing"),
-                    (Some("--low-disk"), "two-pass-memory-packed-no-scratch"),
+                    (None, "two-pass-memory-packed-no-scratch"),
+                    (
+                        Some("--low-disk=false"),
+                        "two-pass-temporary-disk-packed-tiled-packing",
+                    ),
                     (Some("--disk-backed"), "temporary-disk-u64-tiled-packing"),
                 ] {
                     let path = f.path(&format!("{planner}-{fp}-{order}-{storage}"));
@@ -914,12 +917,26 @@ fn all_cell_storage_modes_preserve_all_feature_extractors() {
             vec!["--k", "31", "--index-mode", "findere", "--findere-z", "10"],
         ),
         ("modimizers", vec!["--index-mode", "modimizers"]),
+        ("hpc", vec!["--homopolymer-compression"]),
+        ("spaced", vec!["--k", "8", "--seed-pattern", "##_##_##"]),
+        (
+            "randstrobes",
+            vec![
+                "--k",
+                "15",
+                "--randstrobemers",
+                "--strobe-min",
+                "15",
+                "--strobe-max",
+                "30",
+            ],
+        ),
         ("no-recovery", vec!["--drop-abandoned"]),
     ] {
         let staged = f.path(&format!("{mode}-staged"));
         build(&fof, &staged, &settings);
         let one = ok(&["query", "--index", &staged, "--query", &query], "4");
-        for flag in ["--low-disk", "--disk-backed"] {
+        for flag in ["--low-disk=false", "--disk-backed"] {
             let other = f.path(&format!("{mode}{flag}"));
             let mut other_settings = settings.clone();
             other_settings.push(flag);
@@ -950,14 +967,165 @@ fn all_cell_storage_modes_preserve_all_feature_extractors() {
     ] {
         let invalid = f.path("invalid");
         assert!(!call(
-            &[
-                "build", flags[0], flags[1], "--fof", &fof, "--output", &invalid, "--k", "31"
-            ],
+            &["build", flags[0], flags[1], "--fof", &fof, "--output", &invalid, "--k", "31"],
             "1"
         )
         .status
         .success());
         assert!(!Path::new(&invalid).exists());
+    }
+}
+
+#[test]
+fn minimum_subindex_documents_promotes_without_changing_document_membership() {
+    let f = Fixture::new();
+    let mut fof = String::new();
+    let mut paths = Vec::new();
+    for id in 0..12 {
+        let length = if id < 6 { 100 } else { 1000 };
+        let sequence = dna(length, id + 1234);
+        let path = f.write(&format!("minimum-{id}.fa"), format!(">r\n{sequence}\n"));
+        fof.push_str(&format!("d{id}\t{path}\n"));
+        paths.push(path);
+    }
+    let fof = f.write("minimum.fof", fof);
+    for (minimum, expected_banks) in [("1", 2), ("8", 1), ("128", 1)] {
+        let index = f.path(&format!("minimum-{minimum}"));
+        build(
+            &fof,
+            &index,
+            &["--merge-disabled", "--min-subindex-documents", minimum],
+        );
+        let m: serde_json::Value =
+            serde_json::from_slice(&fs::read(Path::new(&index).join("manifest.json")).unwrap())
+                .unwrap();
+        let banks = m["banks"].as_array().unwrap();
+        assert_eq!(banks.len(), expected_banks);
+        for bank in banks {
+            assert!(bank["slots"].as_u64().unwrap().is_power_of_two());
+            let docs: usize = bank["groups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|g| g["members"].as_array().unwrap().len())
+                .sum();
+            assert!(docs >= minimum.parse::<usize>().unwrap().min(12));
+        }
+        for (id, path) in paths.iter().enumerate() {
+            let output = ok(&["query", "--index", &index, "--query", path], "4");
+            assert_eq!(
+                matches(&output, &format!("d{id}")),
+                if id < 6 { 70 } else { 970 }
+            );
+        }
+    }
+    let invalid = f.path("minimum-invalid");
+    assert!(!call(
+        &[
+            "build",
+            "--fof",
+            &fof,
+            "--output",
+            &invalid,
+            "--min-subindex-documents",
+            "0"
+        ],
+        "1"
+    )
+    .status
+    .success());
+    assert!(!Path::new(&invalid).exists());
+}
+
+#[test]
+fn record_queries_match_aggregate_counts_and_preserve_order_across_workers() {
+    let f = Fixture::new();
+    let shared = dna(90, 41);
+    let private = dna(70, 42);
+    let a = f.write("record-a.fa", format!(">a\n{shared}\n{private}\n"));
+    let b = f.write("record-b.fa", format!(">b\n{shared}\n"));
+    let fof = f.write("records.fof", format!("a\t{a}\nb\t{b}\n"));
+    let sequences = [
+        shared[..31].to_owned(),
+        dna(31, 2026),
+        format!("{}NNN{}", shared.to_lowercase(), private),
+        "NNNN".to_owned(),
+        String::new(),
+    ];
+    let fasta: String = sequences
+        .iter()
+        .enumerate()
+        .map(|(id, seq)| format!(">q{id} description\r\n{seq}\r\n"))
+        .collect();
+    let query = f.write(
+        "records.fa.zst",
+        zstd::bulk::compress(fasta.as_bytes(), 1).unwrap(),
+    );
+    for bits in ["1", "8", "16"] {
+        let index = f.path(&format!("records-fp{bits}"));
+        build(&fof, &index, &["--fingerprint-bits", bits]);
+        for recovery in [true, false] {
+            let mut reference = Vec::new();
+            for (id, seq) in sequences.iter().enumerate() {
+                let single = f.write("single-record.fa", format!(">q{id}\n{seq}\n"));
+                let mut args = vec!["query", "--index", &index, "--query", &single];
+                if !recovery {
+                    args.push("--ignore-abandoned");
+                }
+                let aggregate = ok(&args, "1");
+                let total: u64 = aggregate
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split('\t')
+                    .find_map(|field| field.strip_prefix("total_features="))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                reference.push((total, [matches(&aggregate, "a"), matches(&aggregate, "b")]));
+            }
+            for threshold in ["0", "0.5", "1"] {
+                let min_ratio: f64 = threshold.parse().unwrap();
+                let mut expected = "query_id\tvalid_kmers\thits\n".to_owned();
+                for (id, (total, scores)) in reference.iter().enumerate() {
+                    let hits: Vec<_> = scores
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(origin, &score)| {
+                            let ratio = if *total == 0 {
+                                0.0
+                            } else {
+                                score as f64 / *total as f64
+                            };
+                            (ratio >= min_ratio).then(|| format!("{origin}:{score}"))
+                        })
+                        .collect();
+                    expected.push_str(&format!("q{id}\t{total}\t{}\n", hits.join(",")));
+                }
+                for (threads, record_flag, batch_flag, batch) in [
+                    ("1", "--records", "--record-batch-size", "1"),
+                    ("4", "--records", "--record-batch-size", "3"),
+                    ("4", "--bench-records", "--bench-batch", "4096"),
+                ] {
+                    let mut args = vec![
+                        "query",
+                        "--index",
+                        &index,
+                        "--query",
+                        &query,
+                        "--min-ratio",
+                        threshold,
+                        record_flag,
+                        batch_flag,
+                        batch,
+                    ];
+                    if !recovery {
+                        args.push("--ignore-abandoned");
+                    }
+                    assert_eq!(ok(&args, threads), expected, "fp{bits} recovery={recovery}");
+                }
+            }
+        }
     }
 }
 

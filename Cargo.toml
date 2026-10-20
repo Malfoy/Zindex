@@ -9,6 +9,11 @@ default-run = "zorindex"
 keywords = ["bioinformatics", "kmer", "debruijn", "bloom-filter"]
 categories = ["command-line-utilities", "science"]
 
+[workspace]
+members = ["vendor/simd-sketch"]
+default-members = [".", "vendor/simd-sketch"]
+resolver = "2"
+
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
@@ -22,6 +27,7 @@ rayon = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 simd-minimizers = "2.3"
+simd-sketch = { version = "0.3.0", path = "vendor/simd-sketch" }
 snap = "1.1"
 svb = { version = "0.2", features = ["simd-auto"] }
 zstd = { version = "0.13", default-features = false }

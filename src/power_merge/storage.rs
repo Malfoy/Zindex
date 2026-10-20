@@ -6,17 +6,18 @@ use super::{
 };
 use crate::{
     create_index_writer, finish_index_writer, open_index_reader, parse_features_from_file,
-    read_fof, splitmix64, ColorInput, FeatureConfig, IndexMode, MAX_HASHES,
+    read_fof, splitmix64, ColorInput, FeatureConfig, IndexMode, MinimizerScheme, MAX_HASHES,
 };
 use anyhow::{anyhow, ensure, Context, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, BinaryHeap},
+    collections::{BTreeMap, BinaryHeap, HashMap},
     fs::{self, File},
     hash::{DefaultHasher, Hash, Hasher},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    ops::Range,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     sync::{
@@ -31,6 +32,9 @@ const PLANE_MAGIC: &[u8; 8] = b"ZORPOW3\0";
 const ABANDONED_MAGIC: &[u8; 8] = b"ZORABN1\0";
 const ABANDONED_FILE: &str = "abandoned.zormap.zst";
 const FINGERPRINT_SEED: u64 = 0x8E2D_4F6A_9B13_C5D7;
+
+#[path = "record_query.rs"]
+mod record_query;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Color {
@@ -76,6 +80,16 @@ struct Manifest {
     fingerprint_bits: usize,
     index_mode: u8,
     minimizer_size: usize,
+    #[serde(default)]
+    minimizer_scheme: MinimizerScheme,
+    #[serde(default)]
+    homopolymer_compression: bool,
+    #[serde(default)]
+    seed_pattern: Option<String>,
+    #[serde(default)]
+    randstrobemers: Option<crate::RandstrobeConfig>,
+    #[serde(default)]
+    randstrobe_scheme: Option<String>,
     modimizer_sampling: u64,
     findere_z: usize,
     sketch_size: usize,
@@ -93,6 +107,10 @@ struct Manifest {
     #[serde(default = "legacy_cell_storage")]
     construction_cell_storage: String,
     slot_scale: f64,
+    #[serde(default = "legacy_min_subindex_documents")]
+    min_subindex_documents: usize,
+    #[serde(default)]
+    promoted_groups: usize,
     singleton_logical_bits: u64,
     predicted_logical_bits: u64,
     planned_groups: usize,
@@ -110,6 +128,9 @@ struct Manifest {
 fn recovery_enabled() -> bool {
     true
 }
+fn legacy_min_subindex_documents() -> usize {
+    1
+}
 fn legacy_merge_reverts_enabled() -> bool {
     true
 }
@@ -124,12 +145,20 @@ fn legacy_cell_storage() -> String {
 }
 impl Manifest {
     fn features(&self) -> Result<FeatureConfig> {
-        Ok(FeatureConfig::new(
+        ensure!(self.randstrobemers.is_none() || (self.version >= 6 && self.randstrobe_scheme.as_deref() == Some(crate::RANDSTROBE_SCHEME)),
+            "unsupported legacy/custom randstrobemer extraction; rebuild this index with the current downstream scheme");
+        let config = FeatureConfig::new(
             IndexMode::from_u8(self.index_mode)?,
             self.minimizer_size,
             self.modimizer_sampling,
         )
-        .with_findere_z(self.findere_z))
+        .with_findere_z(self.findere_z)
+        .with_minimizer_scheme(self.minimizer_scheme)
+        .with_homopolymer_compression(self.homopolymer_compression)
+        .with_seed_pattern(self.seed_pattern.as_deref().map(str::parse).transpose()?)
+        .with_randstrobemers(self.randstrobemers);
+        config.validate_anchors(self.k)?;
+        Ok(config)
     }
 }
 struct BuiltGroup {
@@ -148,7 +177,7 @@ enum CompletedCells {
         width: usize,
         slots: usize,
     },
-    // The bytes of `Packed` staged in a file (default mode).
+    // The bytes of `Packed` staged in a file (opt-in disk staging).
     PackedDisk {
         path: PathBuf,
         width: usize,
@@ -161,14 +190,14 @@ enum CompletedCells {
 const STAGED_CHUNK_SLOTS: usize = 1 << 20;
 
 impl CompletedCells {
-    fn packed(cells: &[u64], width: usize) -> Result<Self> {
+    fn packed<T: Copy + Into<u64>>(cells: &[T], width: usize) -> Result<Self> {
         let bits = cells
             .len()
             .checked_mul(width)
             .context("filter size overflow")?;
         let mut data = vec![0; bits.div_ceil(8)];
         for (slot, &value) in cells.iter().enumerate() {
-            put_bits(&mut data, slot * width, width, value);
+            put_bits(&mut data, slot * width, width, value.into());
         }
         Ok(Self::Packed {
             data,
@@ -179,7 +208,7 @@ impl CompletedCells {
 
     // Pack and write a chunk of slots at a time, so staging never needs a
     // second full-size buffer next to the u64 cells.
-    fn packed_disk(cells: &[u64], width: usize, path: PathBuf) -> Result<Self> {
+    fn packed_disk<T: Copy + Into<u64>>(cells: &[T], width: usize, path: PathBuf) -> Result<Self> {
         let mut writer = BufWriter::new(File::create(&path)?);
         for chunk in cells.chunks(STAGED_CHUNK_SLOTS) {
             if let Self::Packed { data, .. } = Self::packed(chunk, width)? {
@@ -278,9 +307,7 @@ impl CompletedCells {
             Self::PackedDisk { path, width, slots } => {
                 let rows = output.len() / 8;
                 ensure!(
-                    start
-                        .checked_add(rows)
-                        .is_some_and(|end| end <= *slots),
+                    start.checked_add(rows).is_some_and(|end| end <= *slots),
                     "cell read out of bounds"
                 );
                 // Read only the bytes covering the requested slots, then unpack
@@ -341,9 +368,12 @@ fn cache_path(stage: &Path, id: usize) -> PathBuf {
     stage.join("features").join(format!("{id}.u64"))
 }
 fn cache_write(path: &Path, keys: &[u64]) -> Result<()> {
+    cache_write_values(path, keys)
+}
+fn cache_write_values<T: Copy + Into<u64>>(path: &Path, keys: &[T]) -> Result<()> {
     let mut writer = BufWriter::new(File::create(path)?);
     for &key in keys {
-        writer.write_all(&key.to_le_bytes())?;
+        writer.write_all(&key.into().to_le_bytes())?;
     }
     writer.flush()?;
     Ok(())
@@ -365,6 +395,7 @@ pub fn build(
     graph: impl Fn(&[u64], usize) -> Result<PeelGraph> + Sync,
 ) -> Result<()> {
     config.validate()?;
+    config.feature_config.validate_anchors(config.k)?;
     ensure!(
         !output.exists(),
         "output {} already exists; choose a new directory",
@@ -387,11 +418,11 @@ pub fn build(
     if config.merge.disk_backed {
         fs::create_dir(stage.0.join("features"))?;
     }
-    if !config.merge.low_disk {
+    if config.merge.disk_backed || !config.merge.low_disk {
         fs::create_dir(stage.0.join("cells"))?;
     }
     eprintln!(
-        "sketching {} datasets with {} mergeable full-minimum buckets",
+        "sketching {} datasets with {} SimdSketch buckets (8-bit fingerprints, 32-bit union minima)",
         inputs.len(),
         config.merge.sketch_size
     );
@@ -405,61 +436,60 @@ pub fn build(
     // Every dataset is parsed as a task on the rayon pool while this loop, itself on a pool thread, inserts the
     // results into the planner in FOF order. Idle threads take the oldest queued task first, so they parse while
     // this thread plans, and the planner's own parallel scans split onto the same pool when it is free.
-    rayon::scope(|_| pull_jobs(
-        &inputs,
-        PLANNER_LOOKAHEAD,
-        |id, input| {
-            let mut keys = Vec::new();
-            let mut occurrences = 0;
-            parse_features_from_file(
-                &input.path,
-                config.k,
-                config.seed,
-                config.feature_config,
-                |key| {
-                    occurrences += 1;
-                    keys.push(key);
-                },
-            )?;
-            keys.sort_unstable();
-            keys.dedup();
-            let sketch_start = Instant::now();
-            let sketch = Sketch::new(&keys, config.merge.sketch_size, config.seed);
-            let sketch_sec = sketch_start.elapsed().as_secs_f64();
-            let signature = if config.merge.disk_backed {
-                cache_write(&cache_path(&stage.0, id), &keys)?;
-                0
-            } else {
-                feature_signature(&keys, occurrences)
-            };
-            let color = Color {
-                name: input.name.clone(),
-                path: input.path.to_string_lossy().into_owned(),
-                occurrences,
-                unique_kmers: keys.len(),
-            };
-            Ok((
-                color,
-                planner::singleton(keys.len(), sketch, id, &config)?,
-                sketch_sec,
-                signature,
-            ))
-        },
-        |_, (color, group, seconds, signature)| {
-            input_signatures.push(signature);
-            colors.push(color);
-            singleton_logical_bits += planner::cost(group.slots, group.width);
-            if config.merge.planner.is_streaming() {
-                let plan_start = Instant::now();
-                streaming.insert(group, &config)?;
-                plan_seconds += plan_start.elapsed().as_secs_f64();
-            } else {
-                initial.push(group);
-            }
-            sketch_seconds += seconds;
-            Ok(())
-        },
-    ))?;
+    rayon::scope(|_| {
+        pull_jobs(
+            &inputs,
+            PLANNER_LOOKAHEAD,
+            |id, input| {
+                let mut keys = Vec::new();
+                let mut occurrences = 0;
+                parse_features_from_file(
+                    &input.path,
+                    config.k,
+                    config.seed,
+                    config.feature_config,
+                    |key| {
+                        occurrences += 1;
+                        keys.push(key);
+                    },
+                )?;
+                super::sort::sort_unique(&mut keys);
+                let sketch_start = Instant::now();
+                let sketch = Sketch::new(&keys, config.merge.sketch_size, config.seed);
+                let sketch_sec = sketch_start.elapsed().as_secs_f64();
+                if config.merge.disk_backed {
+                    cache_write(&cache_path(&stage.0, id), &keys)?;
+                }
+                let signature = feature_signature(&keys, occurrences);
+                let color = Color {
+                    name: input.name.clone(),
+                    path: input.path.to_string_lossy().into_owned(),
+                    occurrences,
+                    unique_kmers: keys.len(),
+                };
+                Ok((
+                    color,
+                    planner::singleton(keys.len(), sketch, id, &config)?,
+                    sketch_sec,
+                    signature,
+                ))
+            },
+            |_, (color, group, seconds, signature)| {
+                input_signatures.push(signature);
+                colors.push(color);
+                singleton_logical_bits += planner::cost(group.slots, group.width);
+                if config.merge.planner.is_streaming() {
+                    let plan_start = Instant::now();
+                    streaming.insert(group, &config)?;
+                    plan_seconds += plan_start.elapsed().as_secs_f64();
+                } else {
+                    initial.push(group);
+                }
+                sketch_seconds += seconds;
+                Ok(())
+            },
+        )
+    })?;
     eprintln!(
         "sketched {} datasets in {:.3}s; the planner was busy for {:.3}s of it",
         colors.len(),
@@ -499,8 +529,10 @@ pub fn build(
         plan_seconds,
         planning_pair_evaluations
     );
-    if !config.merge.disk_backed {
+    if !config.merge.disk_backed && config.merge.low_disk {
         eprintln!("two-pass construction: projected {} power-of-two banks, {} logical bits; rereading inputs, no temporary key/cell files; completed filters stay bit-packed in RAM", projected_banks, predicted_logical_bits);
+    } else if !config.merge.disk_backed {
+        eprintln!("two-pass construction: projected {} power-of-two banks, {} logical bits; rereading inputs, completed filters staged bit-packed on disk", projected_banks, predicted_logical_bits);
     }
     let mut built = Vec::new();
     let rejected_groups = 0;
@@ -516,7 +548,7 @@ pub fn build(
                 let (keys, values) =
                     union_input_features(group, &inputs, &colors, &input_signatures, &config)?;
                 let stage = (!config.merge.low_disk).then_some(stage.0.as_path());
-                construct_group(group, keys, values, stage, &config, &graph)
+                construct_group(group, keys, values, stage, &config, &graph, None)
             }
         },
         |_, (group, verified)| {
@@ -530,6 +562,15 @@ pub fn build(
         .zip(&built)
         .filter(|(plan, group)| group.slots > plan.slots)
         .count();
+    let promoted_groups = promote_small_subindexes(
+        &mut built,
+        &planned,
+        &inputs,
+        &colors,
+        &input_signatures,
+        &config,
+        &graph,
+    )?;
     let (abandoned_hashes, abandoned_origins) = if config.merge.drop_abandoned {
         (0, 0)
     } else {
@@ -544,11 +585,15 @@ pub fn build(
     if config.merge.disk_backed {
         fs::remove_dir(stage.0.join("features"))?;
     }
-    if !config.merge.low_disk {
+    if config.merge.disk_backed || !config.merge.low_disk {
         fs::remove_dir(stage.0.join("cells"))?;
     }
     let mut manifest = Manifest {
-        version: 3,
+        version: if config.feature_config.randstrobemers.is_some() {
+            6
+        } else {
+            5
+        },
         abandoned_recovery: !config.merge.drop_abandoned,
         abandoned_file: (!config.merge.drop_abandoned).then(|| ABANDONED_FILE.into()),
         abandoned_hashes,
@@ -560,10 +605,18 @@ pub fn build(
         fingerprint_bits: config.fingerprint_bits,
         index_mode: config.feature_config.mode.as_u8(),
         minimizer_size: config.feature_config.minimizer_size,
+        minimizer_scheme: config.feature_config.minimizer_scheme,
+        homopolymer_compression: config.feature_config.homopolymer_compression,
+        seed_pattern: config.feature_config.seed_pattern.map(|p| p.to_string()),
+        randstrobemers: config.feature_config.randstrobemers,
+        randstrobe_scheme: config
+            .feature_config
+            .randstrobemers
+            .map(|_| crate::RANDSTROBE_SCHEME.into()),
         modimizer_sampling: config.feature_config.modimizer_sampling,
         findere_z: config.feature_config.findere_z,
         sketch_size: config.merge.sketch_size,
-        sketch_method: "simd-sketch-style mod-buckets, 64-bit full minima, AVX2 comparisons".into(),
+        sketch_method: "simd-sketch-0.3.0 feature-ID/union extensions; 8-bit fingerprints, 32-bit union minima, AVX2 collection/comparison/union; collision-corrected Jaccard".into(),
         merge_planner: config.merge.planner,
         column_order: config.merge.column_order,
         planning_pair_evaluations,
@@ -578,6 +631,8 @@ pub fn build(
         }
         .into(),
         slot_scale: config.slot_scale,
+        min_subindex_documents: config.merge.min_subindex_documents,
+        promoted_groups,
         singleton_logical_bits,
         predicted_logical_bits,
         planned_groups,
@@ -606,7 +661,8 @@ pub fn build(
     Ok(())
 }
 
-/// How many datasets parsing may run ahead of the planner; each waiting dataset holds a sketch of about 32 KiB.
+/// Maximum datasets parsing may run ahead of the planner. Waiting sketches use
+/// 32-bit minima and 8-bit fingerprints per configured cell.
 const PLANNER_LOOKAHEAD: usize = 1024;
 
 /// Runs `work` on every item as a task on the rayon pool and hands the results to `consume` in item order on the
@@ -709,6 +765,7 @@ fn feature_signature(keys: &[u64], occurrences: u64) -> u64 {
 
 // Merge backwards in-place, retaining only the current union and one dataset.
 // Dataset origin bits and sorted key order match the disk-cache heap union.
+#[cfg(test)]
 fn extend_union(
     keys: &mut Vec<u64>,
     origins: &mut Vec<u64>,
@@ -752,8 +809,7 @@ fn union_input_features(
     signatures: &[u64],
     config: &BuildConfig,
 ) -> Result<(Vec<u64>, Vec<u64>)> {
-    let mut keys = Vec::new();
-    let mut origins = Vec::new();
+    let mut union = super::union::Union::default();
     for (bit, &id) in group.members.iter().enumerate() {
         let mut incoming = Vec::new();
         let mut occurrences = 0;
@@ -768,8 +824,7 @@ fn union_input_features(
             },
         )
         .with_context(|| format!("second-pass extraction of {}", inputs[id].path.display()))?;
-        incoming.sort_unstable();
-        incoming.dedup();
+        super::sort::sort_unique(&mut incoming);
         ensure!(
             incoming.len() == colors[id].unique_kmers
                 && occurrences == colors[id].occurrences
@@ -777,9 +832,9 @@ fn union_input_features(
             "indexed features changed between passes for {}",
             inputs[id].path.display()
         );
-        extend_union(&mut keys, &mut origins, &incoming, 1u64 << bit)?;
+        union.push(incoming, 1u64 << bit);
     }
-    Ok((keys, origins))
+    Ok(union.finish())
 }
 
 fn build_group(
@@ -789,7 +844,7 @@ fn build_group(
     graph: &(impl Fn(&[u64], usize) -> Result<PeelGraph> + Sync),
 ) -> Result<(BuiltGroup, u64)> {
     let (keys, values) = union_features(group, stage)?;
-    let result = construct_group(group, keys, values, Some(stage), config, graph)?;
+    let result = construct_group(group, keys, values, Some(stage), config, graph, None)?;
     // The immutable plan partitions datasets: no other group needs these keys.
     for &id in &group.members {
         fs::remove_file(cache_path(stage, id))?;
@@ -804,8 +859,11 @@ fn construct_group(
     cache_stage: Option<&Path>,
     config: &BuildConfig,
     graph: &(impl Fn(&[u64], usize) -> Result<PeelGraph> + Sync),
+    slot_floor: Option<usize>,
 ) -> Result<(BuiltGroup, u64)> {
-    let slots = config.slots(keys.len() as f64)?;
+    let slots = config
+        .slots(keys.len() as f64)?
+        .max(slot_floor.unwrap_or(0));
     for (&key, value) in keys.iter().zip(&mut values) {
         *value = fingerprint(key, config.seed, config.fingerprint_bits)
             | if group.members.len() == 1 {
@@ -815,7 +873,7 @@ fn construct_group(
             };
     }
     let mut peeled = graph(&keys, slots)?;
-    let cells = peeled.assign_verified(&keys, &values, slots, config.hashes)?;
+    let cells = peeled.assign_verified_narrow(&keys, &values, slots, config.hashes, group.width)?;
     // Recover all dropped origins, including when the unconstrained cells happen
     // to match a fingerprint. Recovery adds hits; it never replaces filter hits.
     let fallback: Vec<_> = if config.merge.drop_abandoned {
@@ -851,27 +909,48 @@ fn construct_group(
             0
         }) as u64;
     // Release graph/union workspaces before retaining completed cells: bit-packed
-    // in a staged file (default), bit-packed in RAM (--low-disk), or in the
+    // in RAM (default), in an opt-in staged file, or in the
     // --disk-backed u64 cell cache.
     drop(peeled);
     drop(values);
     drop(keys);
-    let cells = match cache_stage {
-        Some(stage) if config.merge.disk_backed => {
-            let path = stage
-                .join("cells")
-                .join(format!("{}.u64", group.members[0]));
-            cache_write(&path, &cells)?;
-            CompletedCells::Disk(path)
+    fn retain<T: Copy + Into<u64>>(
+        cells: &[T],
+        cache_stage: Option<&Path>,
+        group: &planner::Group,
+        config: &BuildConfig,
+    ) -> Result<CompletedCells> {
+        Ok(match cache_stage {
+            Some(stage) if config.merge.disk_backed => {
+                let path = stage
+                    .join("cells")
+                    .join(format!("{}.u64", group.members[0]));
+                cache_write_values(&path, cells)?;
+                CompletedCells::Disk(path)
+            }
+            Some(stage) => CompletedCells::packed_disk(
+                cells,
+                group.width,
+                stage
+                    .join("cells")
+                    .join(format!("{}.bits", group.members[0])),
+            )?,
+            None => CompletedCells::packed(cells, group.width)?,
+        })
+    }
+    use super::graph::AssignedCells;
+    let cells = match cells {
+        AssignedCells::U8(data) if group.width == 8 && cache_stage.is_none() => {
+            CompletedCells::Packed {
+                data,
+                width: 8,
+                slots,
+            }
         }
-        Some(stage) => CompletedCells::packed_disk(
-            &cells,
-            group.width,
-            stage
-                .join("cells")
-                .join(format!("{}.bits", group.members[0])),
-        )?,
-        None => CompletedCells::packed(&cells, group.width)?,
+        AssignedCells::U8(data) => retain(&data, cache_stage, group, config)?,
+        AssignedCells::U16(data) => retain(&data, cache_stage, group, config)?,
+        AssignedCells::U32(data) => retain(&data, cache_stage, group, config)?,
+        AssignedCells::U64(data) => retain(&data, cache_stage, group, config)?,
     };
     Ok((
         BuiltGroup {
@@ -882,6 +961,61 @@ fn construct_group(
         },
         verified,
     ))
+}
+
+/// Exact sizes are known only after construction. Rebuild only promoted
+/// groups, rereading their own inputs; no key/cell scratch files are introduced.
+/// The sketch merge plan, member assignments and fingerprint width stay fixed.
+fn promote_small_subindexes(
+    built: &mut [BuiltGroup],
+    planned: &[planner::Group],
+    inputs: &[ColorInput],
+    colors: &[Color],
+    signatures: &[u64],
+    config: &BuildConfig,
+    graph: &(impl Fn(&[u64], usize) -> Result<PeelGraph> + Sync),
+) -> Result<usize> {
+    let mut sizes = BTreeMap::<usize, (usize, usize)>::new();
+    for group in built.iter() {
+        let bucket = sizes.entry(group.slots).or_default();
+        bucket.0 += group.meta.members.len();
+        bucket.1 += group.meta.width;
+    }
+    let buckets: Vec<_> = sizes
+        .iter()
+        .map(|(&slots, &(docs, width))| (slots, docs, width))
+        .collect();
+    let targets = super::layout::promotion_targets(&buckets, config.merge.min_subindex_documents)?;
+    let mapping: BTreeMap<_, _> = buckets
+        .iter()
+        .zip(&targets)
+        .map(|(b, &target)| (b.0, target))
+        .collect();
+    let promoted = built
+        .iter()
+        .filter(|group| mapping[&group.slots] > group.slots)
+        .count();
+    if promoted == 0 {
+        return Ok(0);
+    }
+    let plans: BTreeMap<_, _> = planned
+        .iter()
+        .map(|group| (group.members[0], group))
+        .collect();
+    eprintln!("minimum-document layout: {} original size buckets -> {} subindexes, minimum={}, rebuilding {} promoted groups without temporary files", buckets.len(), targets.iter().collect::<std::collections::BTreeSet<_>>().len(), config.merge.min_subindex_documents, promoted);
+    built.par_iter_mut().try_for_each(|old| -> Result<()> {
+        let slots = mapping[&old.slots];
+        if slots == old.slots {
+            return Ok(());
+        }
+        let group = plans[&old.meta.members[0]];
+        let (keys, values) = union_input_features(group, inputs, colors, signatures, config)?;
+        let (new, _) = construct_group(group, keys, values, None, config, graph, Some(slots))?;
+        let previous = std::mem::replace(old, new);
+        previous.cells.remove()?;
+        Ok(())
+    })?;
+    Ok(promoted)
 }
 
 // Sample eight short windows across the complete filter, including its ends.
@@ -1186,12 +1320,18 @@ fn load_abandoned(directory: &Path, manifest: &Manifest) -> Result<OriginMap> {
         manifest.abandoned_file.as_deref() == Some(ABANDONED_FILE),
         "invalid abandoned map filename"
     );
-    let mut reader = open_index_reader(&directory.join(ABANDONED_FILE))?;
+    // Buffer decompression output: small integer reads must not repeatedly enter
+    // the streaming decoder. Postings are decoded in bulk below, not per integer.
+    let mut reader = BufReader::with_capacity(
+        256 * 1024,
+        open_index_reader(&directory.join(ABANDONED_FILE))?,
+    );
     let mut magic = [0; 8];
     reader.read_exact(&mut magic)?;
     ensure!(&magic == ABANDONED_MAGIC, "invalid abandoned map magic");
     let mut map = OriginMap::with_capacity(manifest.abandoned_hashes, manifest.abandoned_origins)?;
     let mut origins = Vec::new();
+    let mut bytes = vec![0; 64 * 1024];
     for _ in 0..manifest.abandoned_hashes {
         let hash = read_u32(&mut reader)?;
         let count = read_u32(&mut reader)? as usize;
@@ -1204,13 +1344,19 @@ fn load_abandoned(directory: &Path, manifest: &Manifest) -> Result<OriginMap> {
             "abandoned origins exceed manifest"
         );
         origins.clear();
-        for _ in 0..count {
-            let origin = read_u32(&mut reader)?;
-            ensure!(
-                (origin as usize) < manifest.colors.len(),
-                "invalid abandoned dataset ID"
-            );
-            origins.push(origin);
+        let mut remaining = count;
+        while remaining != 0 {
+            let n = remaining.min(bytes.len() / 4);
+            reader.read_exact(&mut bytes[..n * 4])?;
+            for word in bytes[..n * 4].chunks_exact(4) {
+                let origin = u32::from_le_bytes(word.try_into().unwrap());
+                ensure!(
+                    (origin as usize) < manifest.colors.len(),
+                    "invalid abandoned dataset ID"
+                );
+                origins.push(origin);
+            }
+            remaining -= n;
         }
         map.push(hash, &origins)?;
     }
@@ -1252,6 +1398,43 @@ fn read_u64(reader: &mut impl Read) -> Result<u64> {
     Ok(u64::from_le_bytes(bytes))
 }
 
+// Modern banks are independent compressed streams. Validate the manifest first,
+// then decompress banks in parallel, concurrently with the auxiliary map.
+fn load_modern_bank(directory: &Path, meta: &BankMeta) -> Result<Bank> {
+    let expected_bytes = meta
+        .slots
+        .checked_mul(meta.row_bits.div_ceil(8))
+        .context("bank size overflow")?;
+    let mut reader = open_index_reader(&directory.join(&meta.file))?;
+    let mut magic = [0; 8];
+    reader.read_exact(&mut magic)?;
+    ensure!(
+        &magic
+            == if meta.fingerprint_first {
+                PLANE_MAGIC
+            } else {
+                MAGIC
+            },
+        "invalid bank magic"
+    );
+    for expected in [meta.slots, meta.row_bits, meta.groups.len(), expected_bytes] {
+        ensure!(
+            read_u64(&mut reader)? == expected as u64,
+            "bank header differs from manifest"
+        );
+    }
+    let mut data = vec![0; expected_bytes];
+    reader.read_exact(&mut data)?;
+    let mut extra = [0];
+    ensure!(reader.read(&mut extra)? == 0, "unexpected bank data");
+    Ok(Bank {
+        meta: meta.clone(),
+        data,
+        #[cfg(test)]
+        fallback: Vec::new(),
+    })
+}
+
 impl Index {
     fn load(directory: &Path) -> Result<Self> {
         Self::load_with_recovery(directory, true)
@@ -1261,7 +1444,7 @@ impl Index {
         let manifest: Manifest =
             serde_json::from_reader(BufReader::new(File::open(directory.join("manifest.json"))?))?;
         ensure!(
-            [1, 2, 3].contains(&manifest.version) && manifest.backend == Backend::Zor,
+            [1, 2, 3, 4, 5, 6].contains(&manifest.version) && manifest.backend == Backend::Zor,
             "unsupported power-of-two index format"
         );
         ensure!(
@@ -1382,6 +1565,14 @@ impl Index {
                 }
             }
             ensure!(offset == meta.row_bits && offset > 0, "invalid row width");
+            // All versions retain the same validation. Version 1 needs its
+            // embedded legacy records converted below; newer banks load later.
+            if manifest.version >= 2 {
+                meta.slots
+                    .checked_mul(meta.row_bits.div_ceil(8))
+                    .context("bank size overflow")?;
+                continue;
+            }
             let expected_bytes = meta
                 .slots
                 .checked_mul(meta.row_bits.div_ceil(8))
@@ -1462,13 +1653,31 @@ impl Index {
             });
         }
         ensure!(
-            !banks.is_empty() && seen.iter().all(|&s| s),
+            !manifest.banks.is_empty() && seen.iter().all(|&s| s),
             "incomplete dataset mapping"
         );
-        let abandoned = if !recover {
+        let abandoned = if manifest.version >= 2 {
+            let (loaded_banks, loaded_map) = rayon::join(
+                || {
+                    manifest
+                        .banks
+                        .par_iter()
+                        .map(|meta| load_modern_bank(directory, meta))
+                        .collect::<Result<Vec<_>>>()
+                },
+                || {
+                    if recover {
+                        load_abandoned(directory, &manifest).map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                },
+            );
+            // Indexed parallel collection preserves the manifest's bank order.
+            banks = loaded_banks?;
+            loaded_map?
+        } else if !recover {
             None
-        } else if manifest.version >= 2 {
-            Some(load_abandoned(directory, &manifest)?)
         } else {
             let mut map = OriginMap::default();
             visit_abandoned(&mut legacy_records, &legacy_members, |hash, origins| {
@@ -1481,13 +1690,10 @@ impl Index {
         let abandoned = abandoned.filter(|map| map.len() != 0);
         let row_scratch_bytes = banks
             .iter()
-            .map(|bank| {
-                if bank.meta.fingerprint_first {
-                    (bank.meta.groups.len() * manifest.fingerprint_bits).div_ceil(8)
-                } else {
-                    bank.meta.row_bits.div_ceil(8)
-                }
-            })
+            // Fingerprint-first banks now compare directly in registers. Only
+            // legacy banks require a materialised row before origin decoding.
+            .filter(|bank| !bank.meta.fingerprint_first)
+            .map(|bank| bank.meta.row_bits.div_ceil(8))
             .max()
             .unwrap_or(0);
         Ok(Self {
@@ -1499,6 +1705,31 @@ impl Index {
     }
 
     fn lookup(&self, key: u64, scores: &mut [u64], scratch: &mut Vec<u8>) {
+        self.lookup_into(key, scores, scratch);
+    }
+
+    fn lookup_into<S: ScoreSink + ?Sized>(&self, key: u64, scores: &mut S, scratch: &mut Vec<u8>) {
+        self.lookup_prepared(key, scores, scratch, None);
+    }
+
+    fn lookup_prepared<S: ScoreSink + ?Sized>(
+        &self,
+        key: u64,
+        scores: &mut S,
+        scratch: &mut Vec<u8>,
+        prepared: Option<&[usize]>,
+    ) {
+        self.lookup_selected(key, scores, scratch, prepared, None);
+    }
+
+    fn lookup_selected<S: ScoreSink + ?Sized>(
+        &self,
+        key: u64,
+        scores: &mut S,
+        scratch: &mut Vec<u8>,
+        prepared: Option<&[usize]>,
+        selected: Option<&[Vec<Range<usize>>]>,
+    ) {
         // Exactly one map probe for the feature, shared by all groups and banks.
         // Recovery is an additive union, including for 32-bit hash collisions.
         let recovered = self.abandoned.as_ref().map_or(&[][..], |map| {
@@ -1516,64 +1747,117 @@ impl Index {
             .chunks_exact_mut(8)
             .zip(recovered)
         {
-            bytes.copy_from_slice(&scores[origin as usize].to_le_bytes());
+            bytes.copy_from_slice(&scores.get(origin as usize).to_le_bytes());
         }
         let fp = fingerprint(key, self.manifest.seed, self.manifest.fingerprint_bits);
         let fp_mask = (1u64 << self.manifest.fingerprint_bits) - 1;
-        for bank in &self.banks {
+        let position_hash = prepared
+            .is_none()
+            .then(|| PositionHash::new(key, self.manifest.seed));
+        for (bank_id, bank) in self.banks.iter().enumerate() {
+            let ranges = selected.map(|banks| banks[bank_id].as_slice());
+            if ranges.is_some_and(|ranges| ranges.is_empty()) {
+                continue;
+            }
             let row_bytes = bank.meta.row_bits.div_ceil(8);
             let lookup_bytes = if bank.meta.fingerprint_first {
                 (bank.meta.groups.len() * self.manifest.fingerprint_bits).div_ceil(8)
             } else {
                 row_bytes
             };
-            let row = &mut scratch[..lookup_bytes];
-            row.fill(0);
-            let mut slots = [0; MAX_HASHES];
-            positions(
-                key,
-                bank.meta.slots,
-                self.manifest.hashes,
-                self.manifest.seed,
-                &mut slots[..self.manifest.hashes],
-            );
-            for &slot in &slots[..self.manifest.hashes] {
-                xor_row(
-                    row,
-                    &bank.data[slot * row_bytes..slot * row_bytes + lookup_bytes],
+            let mut computed;
+            let slots = if let Some(prepared) = prepared {
+                &prepared[bank_id * self.manifest.hashes..(bank_id + 1) * self.manifest.hashes]
+            } else {
+                computed = [0; MAX_HASHES];
+                position_hash.as_ref().unwrap().positions(
+                    bank.meta.slots,
+                    self.manifest.hashes,
+                    &mut computed[..self.manifest.hashes],
                 );
-            }
+                &computed[..self.manifest.hashes]
+            };
             if bank.meta.fingerprint_first {
-                fingerprint_matches(
-                    row,
-                    self.manifest.fingerprint_bits,
-                    fp,
-                    bank.meta.groups.len(),
-                    |i| {
-                        let group = &bank.meta.groups[i];
+                let mut rows = [&[][..]; MAX_HASHES];
+                for (row, &slot) in rows.iter_mut().zip(&slots[..self.manifest.hashes]) {
+                    *row = &bank.data[slot * row_bytes..slot * row_bytes + lookup_bytes];
+                }
+                let mut hit = |i: usize| {
+                    let group = &bank.meta.groups[i];
+                    if group.members.len() == 1 {
+                        scores.increment(group.members[0]);
+                    } else {
+                        let offset = bank.meta.groups.len() * self.manifest.fingerprint_bits
+                            + group.offset
+                            - i * self.manifest.fingerprint_bits;
+                        let mut mask = 0;
+                        for &slot in &slots[..self.manifest.hashes] {
+                            mask ^= get_bits(
+                                &bank.data[slot * row_bytes..(slot + 1) * row_bytes],
+                                offset,
+                                group.width - self.manifest.fingerprint_bits,
+                            );
+                        }
+                        while mask != 0 {
+                            let bit = mask.trailing_zeros() as usize;
+                            scores.increment(group.members[bit]);
+                            mask &= mask - 1;
+                        }
+                    }
+                };
+                if let Some(ranges) = ranges {
+                    fingerprint_matches_selected(
+                        &rows[..self.manifest.hashes],
+                        self.manifest.fingerprint_bits,
+                        fp,
+                        ranges,
+                        &mut hit,
+                    );
+                } else {
+                    fingerprint_matches_rows(
+                        &rows[..self.manifest.hashes],
+                        self.manifest.fingerprint_bits,
+                        fp,
+                        bank.meta.groups.len(),
+                        &mut hit,
+                    );
+                }
+                continue;
+            }
+            if let Some(ranges) = ranges {
+                // Legacy interleaved layouts can also skip retired groups:
+                // decode only selected payloads, without materialising a row.
+                for range in ranges {
+                    for group in &bank.meta.groups[range.clone()] {
+                        let mut value = 0;
+                        for &slot in slots {
+                            value ^= get_bits(
+                                &bank.data[slot * row_bytes..(slot + 1) * row_bytes],
+                                group.offset,
+                                group.width,
+                            );
+                        }
+                        if value & fp_mask != fp {
+                            continue;
+                        }
                         if group.members.len() == 1 {
-                            scores[group.members[0]] += 1;
+                            scores.increment(group.members[0]);
                         } else {
-                            let offset = bank.meta.groups.len() * self.manifest.fingerprint_bits
-                                + group.offset
-                                - i * self.manifest.fingerprint_bits;
-                            let mut mask = 0;
-                            for &slot in &slots[..self.manifest.hashes] {
-                                mask ^= get_bits(
-                                    &bank.data[slot * row_bytes..(slot + 1) * row_bytes],
-                                    offset,
-                                    group.width - self.manifest.fingerprint_bits,
-                                );
-                            }
+                            let mut mask = value >> self.manifest.fingerprint_bits;
                             while mask != 0 {
-                                let bit = mask.trailing_zeros() as usize;
-                                scores[group.members[bit]] += 1;
+                                scores.increment(group.members[mask.trailing_zeros() as usize]);
                                 mask &= mask - 1;
                             }
                         }
-                    },
-                );
+                    }
+                }
                 continue;
+            }
+            // Legacy interleaved fingerprints/origins still need a complete row.
+            let row = &mut scratch[..lookup_bytes];
+            row.copy_from_slice(&bank.data[slots[0] * row_bytes..(slots[0] + 1) * row_bytes]);
+            for &slot in &slots[1..self.manifest.hashes] {
+                xor_row(row, &bank.data[slot * row_bytes..(slot + 1) * row_bytes]);
             }
             for group in &bank.meta.groups {
                 let value = get_bits(row, group.offset, group.width);
@@ -1581,12 +1865,12 @@ impl Index {
                     continue;
                 }
                 if group.members.len() == 1 {
-                    scores[group.members[0]] += 1;
+                    scores.increment(group.members[0]);
                 } else {
                     let mut mask = value >> self.manifest.fingerprint_bits;
                     while mask != 0 {
                         let bit = mask.trailing_zeros() as usize;
-                        scores[group.members[bit]] += 1;
+                        scores.increment(group.members[bit]);
                         mask &= mask - 1;
                     }
                 }
@@ -1597,10 +1881,258 @@ impl Index {
             .zip(recovered)
         {
             let before = u64::from_le_bytes(bytes.try_into().unwrap());
-            if scores[origin as usize] == before {
-                scores[origin as usize] += 1;
+            if scores.get(origin as usize) == before {
+                scores.increment(origin as usize);
             }
         }
+    }
+
+    /// Small per-worker blocks expose independent row accesses before lookup.
+    /// Geometry is prepared once per key, not recomputed for prefetch and XOR.
+    fn lookup_batch<S: ScoreSink + ?Sized>(
+        &self,
+        keys: &[u64],
+        scores: &mut S,
+        scratch: &mut Vec<u8>,
+        positions: &mut Vec<usize>,
+    ) {
+        const BLOCK: usize = 32;
+        const AHEAD: usize = 4;
+        if keys.len() < AHEAD {
+            for &key in keys {
+                self.lookup_into(key, scores, scratch);
+            }
+            return;
+        }
+        let hashes = self.manifest.hashes;
+        let stride = self.banks.len() * hashes;
+        for block in keys.chunks(BLOCK) {
+            positions.resize(block.len() * stride, 0);
+            for (&key, slots) in block.iter().zip(positions.chunks_exact_mut(stride)) {
+                let hash = PositionHash::new(key, self.manifest.seed);
+                for (bank, slots) in self.banks.iter().zip(slots.chunks_exact_mut(hashes)) {
+                    hash.positions(bank.meta.slots, hashes, slots);
+                }
+            }
+            for i in 0..block.len().min(AHEAD) {
+                self.prefetch_lookup(block[i], &positions[i * stride..(i + 1) * stride]);
+            }
+            for (i, &key) in block.iter().enumerate() {
+                if i + AHEAD < block.len() {
+                    let next = i + AHEAD;
+                    self.prefetch_lookup(
+                        block[next],
+                        &positions[next * stride..(next + 1) * stride],
+                    );
+                }
+                self.lookup_prepared(
+                    key,
+                    scores,
+                    scratch,
+                    Some(&positions[i * stride..(i + 1) * stride]),
+                );
+            }
+        }
+    }
+
+    #[inline]
+    fn prefetch_record(
+        &self,
+        key: u64,
+        positions: &[usize],
+        selected: Option<&[Vec<Range<usize>>]>,
+    ) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if let Some(map) = &self.abandoned {
+                map.prefetch(abandoned::hash(key, self.manifest.seed));
+            }
+            for (id, (bank, slots)) in self
+                .banks
+                .iter()
+                .zip(positions.chunks_exact(self.manifest.hashes))
+                .enumerate()
+            {
+                let first = match selected {
+                    Some(ranges) => match ranges[id].first() {
+                        Some(range) => range.start,
+                        None => continue,
+                    },
+                    None => 0,
+                };
+                let row_bytes = bank.meta.row_bits.div_ceil(8);
+                let offset = if bank.meta.fingerprint_first {
+                    first * self.manifest.fingerprint_bits / 8
+                } else {
+                    0
+                };
+                // Hint only the start of each independent row stream; hardware
+                // handles its sequential continuation. Never prefetch every line.
+                for &slot in slots {
+                    unsafe {
+                        std::arch::x86_64::_mm_prefetch(
+                            bank.data.as_ptr().add(slot * row_bytes + offset).cast(),
+                            std::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = (key, positions, selected);
+    }
+
+    #[inline]
+    fn prefetch_lookup(&self, key: u64, positions: &[usize]) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            if let Some(map) = &self.abandoned {
+                map.prefetch(abandoned::hash(key, self.manifest.seed));
+            }
+            for (bank, slots) in self
+                .banks
+                .iter()
+                .zip(positions.chunks_exact(self.manifest.hashes))
+            {
+                let row_bytes = bank.meta.row_bits.div_ceil(8);
+                let bytes = if bank.meta.fingerprint_first {
+                    (bank.meta.groups.len() * self.manifest.fingerprint_bits).div_ceil(8)
+                } else {
+                    row_bytes
+                };
+                for &slot in slots {
+                    for byte in (0..bytes).step_by(64) {
+                        // Every prefetched address is inside a validated row.
+                        unsafe {
+                            _mm_prefetch(
+                                bank.data.as_ptr().add(slot * row_bytes + byte).cast(),
+                                _MM_HINT_T0,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = (key, positions);
+    }
+}
+
+/// The dense aggregate path and sparse record path share the exact same lookup,
+/// including additive abandoned-key handling. Monomorphisation avoids dynamic
+/// dispatch or touched-list bookkeeping in the aggregate query hot path.
+trait ScoreSink {
+    fn get(&self, origin: usize) -> u64;
+    fn increment(&mut self, origin: usize);
+    fn add(&mut self, origin: usize, count: u64);
+}
+
+impl ScoreSink for [u64] {
+    #[inline]
+    fn get(&self, origin: usize) -> u64 {
+        self[origin]
+    }
+
+    #[inline]
+    fn increment(&mut self, origin: usize) {
+        self[origin] += 1;
+    }
+
+    #[inline]
+    fn add(&mut self, origin: usize, count: u64) {
+        self[origin] += count;
+    }
+}
+
+struct WeightedScores<'a, S: ScoreSink + ?Sized> {
+    scores: &'a mut S,
+    weight: u64,
+}
+
+impl<S: ScoreSink + ?Sized> ScoreSink for WeightedScores<'_, S> {
+    #[inline]
+    fn get(&self, origin: usize) -> u64 {
+        self.scores.get(origin)
+    }
+    #[inline]
+    fn increment(&mut self, origin: usize) {
+        self.scores.add(origin, self.weight);
+    }
+    #[inline]
+    fn add(&mut self, origin: usize, count: u64) {
+        self.scores.add(origin, count * self.weight);
+    }
+}
+
+struct RecordScores {
+    values: Vec<u64>,
+    touched: Vec<usize>,
+}
+
+impl RecordScores {
+    fn new(colors: usize) -> Self {
+        Self {
+            values: vec![0; colors],
+            touched: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        for origin in self.touched.drain(..) {
+            self.values[origin] = 0;
+        }
+    }
+
+    fn write(&mut self, total: u64, min_ratio: f64, out: &mut impl Write) -> Result<()> {
+        write!(out, "{total}\t")?;
+        let mut separator = "";
+        let mut emit = |origin: usize, count: u64| -> Result<()> {
+            // Retain the original floating-point threshold semantics exactly.
+            let ratio = if total == 0 {
+                0.0
+            } else {
+                count as f64 / total as f64
+            };
+            if ratio >= min_ratio {
+                write!(out, "{separator}{origin}:{count}")?;
+                separator = ",";
+            }
+            Ok(())
+        };
+        if min_ratio == 0.0 {
+            // At threshold zero, zero-count documents must still be reported.
+            for (origin, &count) in self.values.iter().enumerate() {
+                emit(origin, count)?;
+            }
+        } else if total != 0 {
+            self.touched.sort_unstable();
+            for &origin in &self.touched {
+                emit(origin, self.values[origin])?;
+            }
+        }
+        writeln!(out)?;
+        Ok(())
+    }
+}
+
+impl ScoreSink for RecordScores {
+    #[inline]
+    fn get(&self, origin: usize) -> u64 {
+        self.values[origin]
+    }
+
+    #[inline]
+    fn increment(&mut self, origin: usize) {
+        self.add(origin, 1);
+    }
+
+    #[inline]
+    fn add(&mut self, origin: usize, count: u64) {
+        if self.values[origin] == 0 {
+            self.touched.push(origin);
+        }
+        self.values[origin] += count;
     }
 }
 
@@ -1608,6 +2140,131 @@ fn fingerprint(key: u64, seed: u64, bits: usize) -> u64 {
     splitmix64(key ^ seed ^ FINGERPRINT_SEED) & ((1u64 << bits) - 1)
 }
 
+/// XOR and compare directly in registers, without materialising an intermediate
+/// fingerprint row or repeatedly reading/writing it for every selected slot.
+fn fingerprint_matches_selected(
+    rows: &[&[u8]],
+    bits: usize,
+    fp: u64,
+    ranges: &[Range<usize>],
+    hit: &mut impl FnMut(usize),
+) {
+    let mut selected = [&[][..]; MAX_HASHES];
+    for range in ranges {
+        debug_assert!(bits != 1 || range.start % 8 == 0);
+        let start = range.start * bits / 8;
+        let end = (range.end * bits).div_ceil(8);
+        for (out, row) in selected.iter_mut().zip(rows) {
+            *out = &row[start..end];
+        }
+        fingerprint_matches_rows(&selected[..rows.len()], bits, fp, range.len(), |group| {
+            hit(range.start + group)
+        });
+    }
+}
+
+fn fingerprint_matches_rows(
+    rows: &[&[u8]],
+    bits: usize,
+    fp: u64,
+    count: usize,
+    mut hit: impl FnMut(usize),
+) {
+    debug_assert!(!rows.is_empty());
+    debug_assert!(rows
+        .iter()
+        .all(|row| row.len() == (count * bits).div_ceil(8)));
+    if bits == 1 {
+        for base in (0..count).step_by(64) {
+            let byte = base / 8;
+            let len = (count - base).min(64).div_ceil(8);
+            let mut value = 0u64;
+            for row in rows {
+                let mut word = [0; 8];
+                word[..len].copy_from_slice(&row[byte..byte + len]);
+                value ^= u64::from_le_bytes(word);
+            }
+            let remaining = (count - base).min(64);
+            let valid = u64::MAX >> (64 - remaining);
+            let mut mask = (if fp == 1 { value } else { !value }) & valid;
+            while mask != 0 {
+                hit(base + mask.trailing_zeros() as usize);
+                mask &= mask - 1;
+            }
+        }
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") {
+        // Check once per bank, rather than dispatching for every selected row.
+        unsafe { fingerprint_matches_rows_avx2(rows, bits, fp, &mut hit) };
+        return;
+    }
+    fingerprint_matches_rows_scalar(rows, bits, fp, 0, &mut hit);
+}
+
+fn fingerprint_matches_rows_scalar(
+    rows: &[&[u8]],
+    bits: usize,
+    fp: u64,
+    byte_start: usize,
+    hit: &mut impl FnMut(usize),
+) {
+    let width = bits / 8;
+    for byte in (byte_start..rows[0].len()).step_by(width) {
+        let mut value = 0u64;
+        for row in rows {
+            value ^= if bits == 8 {
+                row[byte] as u64
+            } else {
+                u16::from_le_bytes([row[byte], row[byte + 1]]) as u64
+            };
+        }
+        if value == fp {
+            hit(byte / width);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fingerprint_matches_rows_avx2(
+    rows: &[&[u8]],
+    bits: usize,
+    fp: u64,
+    hit: &mut impl FnMut(usize),
+) {
+    use std::arch::x86_64::*;
+    let target = if bits == 8 {
+        _mm256_set1_epi8(fp as i8)
+    } else {
+        _mm256_set1_epi16(fp as i16)
+    };
+    let end = rows[0].len() / 32 * 32;
+    for byte in (0..end).step_by(32) {
+        let mut value = unsafe { _mm256_loadu_si256(rows[0].as_ptr().add(byte).cast()) };
+        for row in &rows[1..] {
+            let next = unsafe { _mm256_loadu_si256(row.as_ptr().add(byte).cast()) };
+            value = _mm256_xor_si256(value, next);
+        }
+        let equal = if bits == 8 {
+            _mm256_cmpeq_epi8(value, target)
+        } else {
+            _mm256_cmpeq_epi16(value, target)
+        };
+        let mut mask = _mm256_movemask_epi8(equal) as u32;
+        if bits == 16 {
+            mask &= 0x5555_5555;
+        }
+        while mask != 0 {
+            hit((byte + mask.trailing_zeros() as usize) / (bits / 8));
+            mask &= mask - 1;
+        }
+    }
+    fingerprint_matches_rows_scalar(rows, bits, fp, end, hit);
+}
+
+#[cfg(test)]
 fn fingerprint_matches(row: &[u8], bits: usize, fp: u64, count: usize, mut hit: impl FnMut(usize)) {
     if bits == 1 {
         // Each XORed bit is already a comparison result. Screen 64 groups at
@@ -1641,6 +2298,7 @@ fn fingerprint_matches(row: &[u8], bits: usize, fp: u64, count: usize, mut hit: 
     fingerprint_matches_scalar(row, bits, fp, 0, &mut hit);
 }
 
+#[cfg(test)]
 fn fingerprint_matches_scalar(
     row: &[u8],
     bits: usize,
@@ -1660,7 +2318,7 @@ fn fingerprint_matches_scalar(
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(test, target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn fingerprint_matches_avx2(row: &[u8], bits: usize, fp: u64, hit: &mut impl FnMut(usize)) {
     use std::arch::x86_64::*;
@@ -1691,17 +2349,37 @@ unsafe fn fingerprint_matches_avx2(row: &[u8], bits: usize, fp: u64, hit: &mut i
 }
 /// Same segmented mapping as production ZOR. Total cell count is a power of
 /// two; the number of overlapping segment starts is not necessarily one.
+#[cfg(test)]
 fn positions(key: u64, cells: usize, hashes: usize, seed: u64, out: &mut [usize]) {
-    let length = (cells / hashes).clamp(1, 4096);
-    let length = 1usize << length.ilog2();
-    let count = cells / length - hashes + 1;
-    let hash1 = crate::mixsplit(key, seed);
-    let mut hash = hash1;
-    let hash2 = splitmix64(hash1);
-    let base = (((hash1 as u128 * count as u128) >> 64) as usize) * length;
-    for (i, slot) in out.iter_mut().enumerate() {
-        *slot = base + i * length + ((hash ^ (hash >> 33)) as usize & (length - 1));
-        hash = hash.wrapping_add(hash2);
+    PositionHash::new(key, seed).positions(cells, hashes, out);
+}
+
+struct PositionHash {
+    first: u64,
+    step: u64,
+}
+
+impl PositionHash {
+    #[inline]
+    fn new(key: u64, seed: u64) -> Self {
+        let first = crate::mixsplit(key, seed);
+        Self {
+            first,
+            step: splitmix64(first),
+        }
+    }
+
+    #[inline]
+    fn positions(&self, cells: usize, hashes: usize, out: &mut [usize]) {
+        let length = (cells / hashes).clamp(1, 4096);
+        let length = 1usize << length.ilog2();
+        let count = cells / length - hashes + 1;
+        let base = (((self.first as u128 * count as u128) >> 64) as usize) * length;
+        let mut hash = self.first;
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = base + i * length + ((hash ^ (hash >> 33)) as usize & (length - 1));
+            hash = hash.wrapping_add(self.step);
+        }
     }
 }
 
@@ -1765,31 +2443,95 @@ fn get_bits(row: &[u8], offset: usize, width: usize) -> u64 {
 struct QueryWorker {
     scores: Vec<u64>,
     scratch: Vec<u8>,
+    positions: Vec<usize>,
 }
 fn flush(index: &Index, batch: &mut Vec<u64>, workers: &mut Vec<QueryWorker>) {
     if batch.is_empty() {
         return;
     }
-    let threads = rayon::current_num_threads().min(batch.len());
+    // Global batch deduplication happens before partitioning, so a repeated key
+    // is looked up once even when its occurrences would cross worker boundaries.
+    batch.sort_unstable();
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for &key in batch.iter() {
+        if let Some(last) = runs.last_mut().filter(|last| last.0 == key) {
+            last.1 += 1;
+        } else {
+            runs.push((key, 1));
+        }
+    }
+    let threads = rayon::current_num_threads().min(runs.len());
     while workers.len() < threads {
         workers.push(QueryWorker {
             scores: vec![0; index.manifest.colors.len()],
             scratch: Vec::new(),
+            positions: Vec::new(),
         });
     }
-    workers[..threads]
-        .par_iter_mut()
-        .zip(batch.par_chunks(batch.len().div_ceil(threads)))
-        .for_each(|(worker, keys)| {
-            for &key in keys {
-                index.lookup(key, &mut worker.scores, &mut worker.scratch);
-            }
-        });
+    if runs.len() != batch.len() {
+        workers[..threads]
+            .par_iter_mut()
+            .zip(runs.par_chunks(runs.len().div_ceil(threads)))
+            .for_each(|(worker, runs)| {
+                for &(key, weight) in runs {
+                    index.lookup_into(
+                        key,
+                        &mut WeightedScores {
+                            scores: worker.scores.as_mut_slice(),
+                            weight,
+                        },
+                        &mut worker.scratch,
+                    );
+                }
+            });
+    } else {
+        workers[..threads]
+            .par_iter_mut()
+            .zip(batch.par_chunks(batch.len().div_ceil(threads)))
+            .for_each(|(worker, keys)| {
+                index.lookup_batch(
+                    keys,
+                    worker.scores.as_mut_slice(),
+                    &mut worker.scratch,
+                    &mut worker.positions,
+                );
+            });
+    }
     batch.clear();
 }
 
 pub fn query_command(directory: &Path, query: &Path, min_ratio: f64) -> Result<()> {
     query_command_with_recovery(directory, query, min_ratio, true)
+}
+
+/// Record-level reporting for ordinary feature modes. Uses the native lookup
+/// and original benchmark TSV format, but retains counters/scratch per worker
+/// and formats only touched origins (unless threshold zero requires all).
+pub fn query_records_command(
+    directory: &Path,
+    query: &Path,
+    min_ratio: f64,
+    recover: bool,
+    batch_size: usize,
+) -> Result<()> {
+    ensure!(
+        (0.0..=1.0).contains(&min_ratio),
+        "--min-ratio must be in [0, 1]"
+    );
+    ensure!(batch_size > 0, "record batch size must be positive");
+    let index = Index::load_with_recovery(directory, recover)
+        .with_context(|| format!("loading {}", directory.display()))?;
+    let features = index.manifest.features()?;
+    ensure!(
+        features.mode != IndexMode::Findere,
+        "--records does not support findere indexes"
+    );
+    super::records::query_file(
+        query,
+        batch_size,
+        || record_query::Worker::new(&index),
+        |worker, records, out| worker.query_records(&index, features, min_ratio, records, out),
+    )
 }
 
 pub fn query_command_with_recovery(
@@ -1807,11 +2549,12 @@ pub fn query_command_with_recovery(
     let start = Instant::now();
     let features = index.manifest.features()?;
     let (scores, total, probes) = if features.mode == IndexMode::Findere {
-        let result = crate::findere::query_file(
+        let result = crate::findere::query_file_with_homopolymer_compression(
             query,
             index.manifest.k,
             features.findere_z,
             index.manifest.colors.len(),
+            features.homopolymer_compression,
             Vec::<u8>::new,
             |scratch, key, hits| {
                 index.lookup(key, hits, scratch);
@@ -1819,6 +2562,8 @@ pub fn query_command_with_recovery(
             },
         )?;
         (result.scores, result.total_kmers, result.smer_queries)
+    } else if features.randstrobemers.is_some() {
+        query_strobe_file(&index, query, features)?
     } else {
         let mut workers = Vec::new();
         let mut batch = Vec::with_capacity(262_144);
@@ -1864,6 +2609,61 @@ pub fn query_command_with_recovery(
     Ok(())
 }
 
+fn query_strobe_file(
+    index: &Index,
+    path: &Path,
+    features: FeatureConfig,
+) -> Result<(Vec<u64>, u64, u64)> {
+    let n = rayon::current_num_threads();
+    let mut workers: Vec<_> = (0..n)
+        .map(|_| {
+            (
+                record_query::Worker::new(index),
+                vec![0u64; index.manifest.colors.len()],
+                0u64,
+            )
+        })
+        .collect();
+    let mut batch = Vec::new();
+    let mut bases = 0;
+    let mut flush = |batch: &mut Vec<Vec<u8>>| {
+        if batch.is_empty() {
+            return;
+        }
+        let chunk = batch.len().div_ceil(n);
+        workers
+            .par_iter_mut()
+            .zip(batch.par_chunks(chunk))
+            .for_each(|((worker, sums, total), reads)| {
+                for seq in reads {
+                    *total += worker.query_sequence(index, features, 0.0, seq);
+                    for &origin in &worker.scores.touched {
+                        sums[origin] += worker.scores.values[origin];
+                    }
+                }
+            });
+        batch.clear();
+    };
+    crate::parse_sequences_from_file(path, |seq| {
+        bases += seq.len();
+        batch.push(seq.to_vec());
+        if bases >= 1024 * 1024 || batch.len() == 4096 {
+            flush(&mut batch);
+            bases = 0;
+        }
+    })?;
+    flush(&mut batch);
+    let mut scores = vec![0; index.manifest.colors.len()];
+    let mut total = 0;
+    for (_, sums, count) in workers {
+        total += count;
+        for (score, value) in scores.iter_mut().zip(sums) {
+            *score += value;
+        }
+    }
+    Ok((scores, total, total * 2))
+}
+
 pub fn info_command(directory: &Path) -> Result<()> {
     let index = Index::load(directory)?;
     let m = &index.manifest;
@@ -1907,6 +2707,12 @@ pub fn info_command(directory: &Path) -> Result<()> {
         "minimizer_size\t{}\nmodimizer_sampling\t{}",
         features.minimizer_size, features.modimizer_sampling
     );
+    println!("minimizer_scheme\t{}", features.minimizer_scheme.label());
+    println!(
+        "homopolymer_compression\t{}",
+        features.homopolymer_compression
+    );
+    crate::anchors::print_settings(features);
     println!(
         "merge_planner\t{}\nplanning_pair_evaluations\t{}\nplanning_possible_pair_evaluations\t{}\nmerge_reverts_enabled\t{}",
         m.merge_planner.label(),
@@ -1915,6 +2721,7 @@ pub fn info_command(directory: &Path) -> Result<()> {
         m.merge_reverts_enabled
     );
     println!("construction_cell_storage\t{}", m.construction_cell_storage);
+    println!("overflow_groups\t{}", m.overflow_groups);
     println!("merge_column_order\t{}", m.column_order.label());
     println!("abandoned_recovery\t{}\nabandoned_hash_bits\t32\nabandoned_keys\t{}\nabandoned_unique_hashes\t{}\nabandoned_dataset_associations\t{}\nabandoned_map_ram_bytes\t{}",
         m.abandoned_recovery,
@@ -1932,16 +2739,21 @@ pub fn info_command(directory: &Path) -> Result<()> {
         stack_bytes + fallback_bytes + metadata_bytes,
         disk_bytes
     );
-    println!("bank\tslots\tgroups\trow_bits\tpadding_bits_per_row\tfallback_keys");
+    println!(
+        "min_subindex_documents\t{}\npromoted_groups\t{}",
+        m.min_subindex_documents, m.promoted_groups
+    );
+    println!("bank\tslots\tgroups\trow_bits\tpadding_bits_per_row\tfallback_keys\tdocuments");
     for b in &m.banks {
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
             b.file,
             b.slots,
             b.groups.len(),
             b.row_bits,
             b.row_bits.div_ceil(8) * 8 - b.row_bits,
-            b.groups.iter().map(|g| g.fallback_keys).sum::<usize>()
+            b.groups.iter().map(|g| g.fallback_keys).sum::<usize>(),
+            b.groups.iter().map(|g| g.members.len()).sum::<usize>()
         );
     }
     println!("group\tslots\twidth\tunion_cardinality\tfallback_keys\tcolors");
@@ -1970,6 +2782,80 @@ pub fn info_command(directory: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_pipeline_preserves_input_order_with_one_or_multiple_workers() {
+        let items: Vec<_> = (0..65usize).collect();
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            for ahead in [1, 16, PLANNER_LOOKAHEAD, usize::MAX] {
+                let mut consumed = Vec::new();
+                pool.install(|| {
+                    pull_jobs(
+                        &items,
+                        ahead,
+                        |id, value| {
+                            if id % 7 == 0 {
+                                std::thread::yield_now();
+                            }
+                            Ok(*value)
+                        },
+                        |id, value| {
+                            assert_eq!(id, consumed.len());
+                            consumed.push(value);
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                });
+                assert_eq!(consumed, items);
+            }
+        }
+    }
+
+    #[test]
+    fn task_pipeline_propagates_worker_consumer_and_panic_errors() {
+        let items: Vec<_> = (0..16usize).collect();
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            for failure in ["worker", "consumer", "panic"] {
+                let error = pool.install(|| {
+                    pull_jobs(
+                        &items,
+                        4,
+                        |id, value| {
+                            if id == 3 {
+                                match failure {
+                                    "worker" => anyhow::bail!("worker failure"),
+                                    "panic" => panic!("test worker panic"),
+                                    _ => {}
+                                }
+                            }
+                            Ok(*value)
+                        },
+                        |id, _| {
+                            ensure!(id != 3 || failure != "consumer", "consumer failure");
+                            Ok(())
+                        },
+                    )
+                    .unwrap_err()
+                });
+                assert!(error.to_string().contains(if failure == "panic" {
+                    "task 3 panicked"
+                } else if failure == "worker" {
+                    "worker failure"
+                } else {
+                    "consumer failure"
+                }));
+            }
+        }
+    }
 
     #[test]
     fn in_place_union_matches_exact_origin_map() {
@@ -2071,12 +2957,13 @@ mod tests {
     }
 
     #[test]
-    fn low_disk_never_creates_scratch_files_during_construction() {
+    fn default_two_pass_never_creates_scratch_files_during_construction() {
+        assert!(super::super::MergeArgs::default().low_disk);
         two_pass_stages_only_packed_cells(true);
     }
 
     #[test]
-    fn default_two_pass_stages_only_packed_cells_during_construction() {
+    fn opt_in_two_pass_stages_only_packed_cells_during_construction() {
         two_pass_stages_only_packed_cells(false);
     }
 
@@ -2095,38 +2982,43 @@ mod tests {
         .unwrap();
         let output = root.0.join("index");
         let calls = AtomicUsize::new(0);
-        build(&fof, &output, scratch_free_config(low_disk), |keys, slots| {
-            calls.fetch_add(1, Ordering::Relaxed);
-            let stages: Vec<_> = fs::read_dir(&root.0)
-                .unwrap()
-                .map(|e| e.unwrap().path())
-                .filter(|p| {
-                    p.file_name()
-                        .unwrap()
-                        .to_string_lossy()
-                        .starts_with(".zor-pow2-building-")
-                })
-                .collect();
-            assert_eq!(stages.len(), 1);
-            // Before final packing, the publication directory holds no
-            // features/, cache files or other construction artifacts: nothing
-            // at all with --low-disk, only packed cells of completed groups
-            // otherwise.
-            let entries: Vec<_> = fs::read_dir(&stages[0])
-                .unwrap()
-                .map(|e| e.unwrap().path())
-                .collect();
-            if low_disk {
-                assert!(entries.is_empty());
-            } else {
-                assert_eq!(entries, [stages[0].join("cells")]);
-                for cell in fs::read_dir(&entries[0]).unwrap() {
-                    let name = cell.unwrap().file_name();
-                    assert!(name.to_string_lossy().ends_with(".bits"), "{name:?}");
+        build(
+            &fof,
+            &output,
+            scratch_free_config(low_disk),
+            |keys, slots| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                let stages: Vec<_> = fs::read_dir(&root.0)
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .filter(|p| {
+                        p.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with(".zor-pow2-building-")
+                    })
+                    .collect();
+                assert_eq!(stages.len(), 1);
+                // Before final packing, the publication directory holds no
+                // features/, cache files or other construction artifacts: nothing
+                // at all with --low-disk, only packed cells of completed groups
+                // otherwise.
+                let entries: Vec<_> = fs::read_dir(&stages[0])
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .collect();
+                if low_disk {
+                    assert!(entries.is_empty());
+                } else {
+                    assert_eq!(entries, [stages[0].join("cells")]);
+                    for cell in fs::read_dir(&entries[0]).unwrap() {
+                        let name = cell.unwrap().file_name();
+                        assert!(name.to_string_lossy().ends_with(".bits"), "{name:?}");
+                    }
                 }
-            }
-            Ok(dropped_test_graph(keys, slots))
-        })
+                Ok(dropped_test_graph(keys, slots))
+            },
+        )
         .unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         let index = Index::load(&output).unwrap();
@@ -2167,7 +3059,10 @@ mod tests {
         // One thread builds the groups one after another, so the second group rereads its dataset after the
         // first group's callback has changed it (retaining cardinality and occurrence count, so only the feature
         // signature can detect the change).
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
         let result = pool.install(|| {
             build(&fof, &output, scratch_free_config(false), |keys, slots| {
                 calls.fetch_add(1, Ordering::Relaxed);
@@ -2203,6 +3098,201 @@ mod tests {
                         .collect();
                     assert_eq!(actual, expected);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn fused_screening_matches_materialized_rows_for_all_widths_and_hash_counts() {
+        for bits in [1usize, 8, 16] {
+            for count in [1usize, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 257] {
+                for hashes in [2, 3, 4, 8, MAX_HASHES] {
+                    let storage: Vec<Vec<u8>> = (0..hashes)
+                        .map(|slot| {
+                            (0..(count * bits).div_ceil(8))
+                                .map(|byte| splitmix64((slot * 1024 + byte) as u64) as u8)
+                                .collect()
+                        })
+                        .collect();
+                    let rows: Vec<_> = storage.iter().map(Vec::as_slice).collect();
+                    let mut materialized = vec![0; rows[0].len()];
+                    for row in &rows {
+                        xor_row(&mut materialized, row);
+                    }
+                    for fp in [0, 1, (1u64 << bits) - 1] {
+                        let mut expected = Vec::new();
+                        fingerprint_matches(&materialized, bits, fp, count, |i| expected.push(i));
+                        let mut actual = Vec::new();
+                        fingerprint_matches_rows(&rows, bits, fp, count, |i| actual.push(i));
+                        assert_eq!(
+                            actual, expected,
+                            "bits={bits} count={count} hashes={hashes}"
+                        );
+                        if bits != 1 {
+                            actual.clear();
+                            fingerprint_matches_rows_scalar(&rows, bits, fp, 0, &mut |i| {
+                                actual.push(i)
+                            });
+                            assert_eq!(actual, expected);
+                        }
+                    }
+                    // Guarantee a full set of hits, including zero fingerprints.
+                    let zero = vec![0; rows[0].len()];
+                    let mut actual = Vec::new();
+                    fingerprint_matches_rows(&[&zero, &zero], bits, 0, count, |i| actual.push(i));
+                    assert_eq!(actual, (0..count).collect::<Vec<_>>());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_position_hash_matches_original_segment_mapping() {
+        for hashes in [2, 3, 4, 8, MAX_HASHES] {
+            for exponent in 5..=24 {
+                let cells = 1usize << exponent;
+                for key in [0, 1, 123, u64::MAX] {
+                    let seed = 69;
+                    let length = 1usize << (cells / hashes).clamp(1, 4096).ilog2();
+                    let count = cells / length - hashes + 1;
+                    let hash1 = crate::mixsplit(key, seed);
+                    let hash2 = splitmix64(hash1);
+                    let base = (((hash1 as u128 * count as u128) >> 64) as usize) * length;
+                    let mut hash = hash1;
+                    let expected: Vec<_> = (0..hashes)
+                        .map(|i| {
+                            let slot =
+                                base + i * length + ((hash ^ (hash >> 33)) as usize & (length - 1));
+                            hash = hash.wrapping_add(hash2);
+                            slot
+                        })
+                        .collect();
+                    let mut actual = vec![0; hashes];
+                    PositionHash::new(key, seed).positions(cells, hashes, &mut actual);
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_record_scores_preserve_thresholds_order_and_zero_count_documents() {
+        let mut sparse = RecordScores::new(8);
+        for origin in [7, 3, 7, 1, 3, 7] {
+            sparse.increment(origin);
+        }
+        for total in [0, 3, 6] {
+            for threshold in [0.0, 0.1, 1.0 / 3.0, 0.5, 1.0] {
+                let mut expected = format!("{total}\t");
+                let mut separator = "";
+                for (origin, &count) in sparse.values.iter().enumerate() {
+                    let ratio = if total == 0 {
+                        0.0
+                    } else {
+                        count as f64 / total as f64
+                    };
+                    if ratio >= threshold {
+                        expected.push_str(&format!("{separator}{origin}:{count}"));
+                        separator = ",";
+                    }
+                }
+                expected.push('\n');
+                let mut actual = Vec::new();
+                sparse.write(total, threshold, &mut actual).unwrap();
+                assert_eq!(actual, expected.as_bytes());
+            }
+        }
+        sparse.clear();
+        assert!(sparse.values.iter().all(|&value| value == 0));
+        assert!(sparse.touched.is_empty());
+        sparse.increment(3);
+        assert_eq!(sparse.touched, [3]);
+        assert_eq!(sparse.values[3], 1);
+    }
+
+    #[test]
+    fn sparse_lookup_preserves_abandoned_union_and_repeated_feature_counts() {
+        for recovered in [&[][..], &[0][..], &[1][..], &[0, 1][..]] {
+            let index = union_index(123, recovered);
+            let mut dense = vec![0u64; index.manifest.colors.len()];
+            let mut sparse = RecordScores::new(dense.len());
+            let mut scratch = Vec::new();
+            let mut sparse_scratch = Vec::new();
+            for _record in 0..3 {
+                dense.fill(0);
+                sparse.clear();
+                for key in [123, 123, 7, 19, u64::MAX, 123] {
+                    index.lookup(key, &mut dense, &mut scratch);
+                    index.lookup_into(key, &mut sparse, &mut sparse_scratch);
+                    assert_eq!(dense, sparse.values);
+                }
+                assert_eq!(
+                    sparse.touched.len(),
+                    dense.iter().filter(|&&value| value != 0).count()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn batched_prefetch_preserves_dense_and_sparse_scores_and_repeated_keys() {
+        for recovered in [&[][..], &[0][..], &[1][..], &[0, 1][..]] {
+            let index = union_index(123, recovered);
+            let mut positions = Vec::new();
+            for length in [0, 1, 3, 4, 31, 32, 33, 63, 65, 257] {
+                let keys: Vec<_> = (0..length)
+                    .map(|i| {
+                        if i % 3 == 0 {
+                            123
+                        } else {
+                            splitmix64(i as u64)
+                        }
+                    })
+                    .collect();
+                let mut scalar = vec![0u64; index.manifest.colors.len()];
+                let mut dense = scalar.clone();
+                let mut sparse = RecordScores::new(scalar.len());
+                for &key in &keys {
+                    index.lookup(key, &mut scalar, &mut Vec::new());
+                }
+                index.lookup_batch(&keys, dense.as_mut_slice(), &mut Vec::new(), &mut positions);
+                index.lookup_batch(&keys, &mut sparse, &mut Vec::new(), &mut positions);
+                assert_eq!(scalar, dense);
+                assert_eq!(scalar, sparse.values);
+            }
+        }
+    }
+
+    #[test]
+    fn aggregate_deduplication_preserves_weighted_counts_across_workers_and_flushes() {
+        for recovered in [&[][..], &[0][..], &[1][..], &[0, 1][..]] {
+            let index = union_index(123, recovered);
+            for threads in [1, 2, 4] {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap()
+                    .install(|| {
+                        let mut workers = Vec::new();
+                        let mut expected = vec![0; index.manifest.colors.len()];
+                        for keys in [
+                            vec![123; 100],
+                            (0..91).collect(),
+                            vec![83_843, 95_900, 123, 83_843, 123, 95_900, 123],
+                            Vec::new(),
+                        ] {
+                            for &key in &keys {
+                                index.lookup(key, &mut expected, &mut Vec::new());
+                            }
+                            let mut batch = keys;
+                            flush(&index, &mut batch, &mut workers);
+                            assert!(batch.is_empty());
+                            let actual: Vec<u64> = (0..expected.len())
+                                .map(|origin| workers.iter().map(|w| w.scores[origin]).sum())
+                                .collect();
+                            assert_eq!(actual, expected);
+                        }
+                    });
             }
         }
     }
@@ -2464,7 +3554,7 @@ mod tests {
         }
     }
 
-    fn union_index(key: u64, recovered: &[u32]) -> Index {
+    pub(super) fn union_index(key: u64, recovered: &[u32]) -> Index {
         let seed = 69;
         let group = GroupMeta {
             members: vec![0, 1],
@@ -2512,6 +3602,11 @@ mod tests {
             fingerprint_bits: 8,
             index_mode: IndexMode::Kmers.as_u8(),
             minimizer_size: 31,
+            minimizer_scheme: MinimizerScheme::Simd,
+            homopolymer_compression: false,
+            seed_pattern: None,
+            randstrobemers: None,
+            randstrobe_scheme: None,
             modimizer_sampling: 10,
             findere_z: 10,
             sketch_size: 64,
@@ -2524,6 +3619,8 @@ mod tests {
             construction_cell_storage: "temporary-disk-u64".into(),
             slot_scale: 1.0,
             singleton_logical_bits: 64,
+            min_subindex_documents: 1,
+            promoted_groups: 0,
             predicted_logical_bits: 40,
             planned_groups: 1,
             rejected_groups: 0,
@@ -2616,13 +3713,26 @@ mod tests {
         }
         let mut old_scratch = Vec::new();
         let mut new_scratch = Vec::new();
+        let mut sparse_scratch = Vec::new();
+        let mut sparse = RecordScores::new(next);
         for key in 0..20000 {
             let mut old = vec![0; next];
             let mut new = vec![0; next];
             legacy.lookup(key, &mut old, &mut old_scratch);
             planes.lookup(key, &mut new, &mut new_scratch);
             assert_eq!(old, new, "key {key}");
+            sparse.clear();
+            planes.lookup_into(key, &mut sparse, &mut sparse_scratch);
+            assert_eq!(old, sparse.values, "sparse key {key}");
         }
+        let keys: Vec<_> = (0..2000).collect();
+        let mut old = vec![0; next];
+        for &key in &keys {
+            legacy.lookup(key, &mut old, &mut old_scratch);
+        }
+        sparse.clear();
+        planes.lookup_batch(&keys, &mut sparse, &mut sparse_scratch, &mut Vec::new());
+        assert_eq!(old, sparse.values, "batched fingerprint width {bits}");
     }
 
     #[test]
@@ -2701,6 +3811,48 @@ mod tests {
         skipped.lookup(key, &mut scores, &mut Vec::new());
         assert_eq!(scores, [1, 0]);
         assert!(Index::load(&stage.0).is_err());
+    }
+
+    #[test]
+    fn bulk_abandoned_postings_cross_buffers_and_reject_truncation_and_trailing_data() {
+        let stage = temporary_stage();
+        let mut index = union_index(123, &[]);
+        // More than one 64KiB postings block, with a partial final word block.
+        let count = 16_387;
+        index
+            .manifest
+            .colors
+            .resize(count, index.manifest.colors[0].clone());
+        index.manifest.abandoned_file = Some(ABANDONED_FILE.into());
+        index.manifest.abandoned_hashes = 1;
+        index.manifest.abandoned_origins = count;
+        let hash = abandoned::hash(123, 69);
+        let mut data = Vec::new();
+        data.extend_from_slice(ABANDONED_MAGIC);
+        data.extend_from_slice(&hash.to_le_bytes());
+        data.extend_from_slice(&(count as u32).to_le_bytes());
+        for origin in 0..count as u32 {
+            data.extend_from_slice(&origin.to_le_bytes());
+        }
+        for length in [data.len(), data.len() - 1, data.len() - 4] {
+            let mut writer = create_index_writer(&stage.0.join(ABANDONED_FILE)).unwrap();
+            writer.write_all(&data[..length]).unwrap();
+            finish_index_writer(writer).unwrap();
+            let loaded = load_abandoned(&stage.0, &index.manifest);
+            if length == data.len() {
+                assert_eq!(
+                    loaded.unwrap().get(hash),
+                    (0..count as u32).collect::<Vec<_>>()
+                );
+            } else {
+                assert!(loaded.is_err());
+            }
+        }
+        data.push(0);
+        let mut writer = create_index_writer(&stage.0.join(ABANDONED_FILE)).unwrap();
+        writer.write_all(&data).unwrap();
+        finish_index_writer(writer).unwrap();
+        assert!(load_abandoned(&stage.0, &index.manifest).is_err());
     }
 
     #[test]
