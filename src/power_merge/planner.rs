@@ -671,6 +671,7 @@ mod tests {
             feature_config: FeatureConfig::legacy_kmers(),
             slot_scale: 1.0,
             minimum_slots: None,
+            segment_length: None,
             // Exact sizes: these tests check the cost rule itself, not the sketch-noise margin.
             merge: MergeArgs {
                 plan_margin: 0.0,

@@ -272,8 +272,8 @@ and ZOR repack operations.
 ## Zindex
 
 Zindex builds merged colored power-of-two banks by default, using streaming
-planning, compression column ordering, sizing factor **1.0**, `most-deg2` cycle
-breaking and `tie-scan=8`. Four hash locations are the default. These settings
+planning, compression column ordering, sizing factor **1.0**, `no-heuristic` cycle
+breaking and `tie-scan=1`. Four hash locations are the default. These settings
 do not need to be repeated on the command line:
 
 ```bash
@@ -413,6 +413,13 @@ among contiguous size-bucket partitions satisfying the minimum. Collections
 with fewer than 128 documents use one subindex. Set the parameter to `1` to
 retain the previous layout.
 
+`--max-subindexes N` additionally caps the number of subindexes (unlimited
+by default). The same padded-space dynamic program chooses at most `N`
+contiguous size ranges, promoting each to its largest power of two without
+folding or changing dataset merge membership. The document minimum still
+applies; use `--min-subindex-documents 1` to measure the count cap alone.
+A cap above the number of natural size buckets does not create extra subindexes.
+
 The constraint uses exact constructed sizes, not sketch estimates: only filters
 needing promotion are rebuilt from their input documents. This may require an
 additional input read and extra construction work, but introduces no temporary
@@ -520,7 +527,14 @@ accepting missing abandoned features. `query --ignore-abandoned` skips loading a
 querying the map of an existing merged index. Recovery is enabled by default.
 Version-1 and version-2 merged indexes remain readable. Version-1 fallback records are
 converted into the global 32-bit-hash map on load, without rewriting the files.
-New indexes use manifest version 5 (bank layout version 3) and require an updated reader.
+New indexes use manifest version 8 (bank layout version 3) and require an updated reader.
+Merged indexes use a fixed segment length of 64 cells, independent of filter
+capacity; `--segment-length` overrides that fixed value. The manifest records it
+so old indexes retain their historical position mapping. The minimum filter
+capacity accommodates the fixed segments and hash count; slot-scale stays 1.0.
+The global abandoned-key map uses lossless delta/variable-integer encoding on
+disk and inline singleton origins in RAM. All 32 hash bits and origin IDs are
+preserved. The updated reader also loads earlier recovery-file encodings.
 **Merges are never
 reverted**, even when exact union cardinalities, byte padding or fallback entries
 erase the estimated savings. Actual capacity is computed from exact union keys

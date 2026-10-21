@@ -149,11 +149,11 @@ struct BuildArgs {
     segment_length: Option<usize>,
 
     /// Cycle-breaking heuristic used when the pure ZOR peel reaches a core.
-    #[arg(long, value_enum, default_value = "most-deg2")]
+    #[arg(long, value_enum, default_value = "no-heuristic")]
     cycle_break: CycleBreakHeuristic,
 
     /// Number of tied min-degree cells to scan for heuristic cycle breaking.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 1)]
     tie_scan: usize,
 
     /// Add a separate union pure ZOR filter for graph/topology negative checks.
@@ -201,11 +201,11 @@ struct AppendArgs {
     output: Option<PathBuf>,
 
     /// Cycle-breaking heuristic used for newly appended color layers.
-    #[arg(long, value_enum, default_value = "most-deg2")]
+    #[arg(long, value_enum, default_value = "no-heuristic")]
     cycle_break: CycleBreakHeuristic,
 
     /// Number of tied min-degree cells to scan for heuristic cycle breaking.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 1)]
     tie_scan: usize,
 
     /// Override stack compression for the output index.
@@ -598,10 +598,9 @@ fn build_command(args: BuildArgs) -> Result<()> {
             args.stack_compression == StackCompression::None,
             "power-of-two banks currently support plain slices only (files are zstd compressed); use --plain for legacy stack codecs"
         );
-        ensure!(
-            args.segment_length.is_none(),
-            "power-of-two banks select their segment length automatically; use --plain for manual segment lengths"
-        );
+        let segment_length = args
+            .segment_length
+            .unwrap_or(zorindex::power_merge::DEFAULT_SEGMENT_LENGTH);
         let config = zorindex::power_merge::BuildConfig {
             backend: zorindex::power_merge::Backend::Zor,
             k: args.k,
@@ -611,13 +610,10 @@ fn build_command(args: BuildArgs) -> Result<()> {
             feature_config: feature_config_from_args(&args),
             slot_scale: args.slot_scale,
             minimum_slots: args.slot_count,
+            segment_length: Some(segment_length),
             merge: args.merge.clone(),
         };
         return zorindex::power_merge::build(&args.fof, &args.output, config, |keys, slots| {
-            let segment_length = (slots / args.hashes)
-                .max(1)
-                .min(1 << MAX_SEGMENT_LENGTH_LOG);
-            let segment_length = 1 << segment_length.ilog2();
             let layout = calculate_layout_with_segment_length(slots, args.hashes, segment_length)?;
             ensure!(layout.array_length == slots, "invalid power-of-two layout");
             peel_zor_graph(
@@ -4862,8 +4858,8 @@ mod tests {
         assert_eq!(defaults.merge.plan_margin, 0.0);
         assert!(defaults.merge.low_disk);
         assert!(!defaults.merge.disk_backed);
-        assert_eq!(defaults.cycle_break, CycleBreakHeuristic::MostDeg2);
-        assert_eq!(defaults.tie_scan, 8);
+        assert_eq!(defaults.cycle_break, CycleBreakHeuristic::NoHeuristic);
+        assert_eq!(defaults.tie_scan, 1);
 
         let Command::Build(plain) = Cli::try_parse_from(base.into_iter().chain(["--plain"]))
             .unwrap()
@@ -4902,9 +4898,9 @@ mod tests {
             "0.03",
             "--low-disk=false",
             "--cycle-break",
-            "no-heuristic",
+            "most-deg2",
             "--tie-scan",
-            "1",
+            "8",
         ]))
         .unwrap()
         .command
@@ -4919,8 +4915,8 @@ mod tests {
             custom.merge.column_order,
             zorindex::power_merge::ColumnOrder::Width
         );
-        assert_eq!(custom.cycle_break, CycleBreakHeuristic::NoHeuristic);
-        assert_eq!(custom.tie_scan, 1);
+        assert_eq!(custom.cycle_break, CycleBreakHeuristic::MostDeg2);
+        assert_eq!(custom.tie_scan, 8);
         assert_eq!(custom.merge.sketch_size, 512);
         assert_eq!(custom.merge.plan_margin, 0.03);
         assert!(!custom.merge.low_disk);
@@ -4938,8 +4934,8 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(append.cycle_break, CycleBreakHeuristic::MostDeg2);
-        assert_eq!(append.tie_scan, 8);
+        assert_eq!(append.cycle_break, CycleBreakHeuristic::NoHeuristic);
+        assert_eq!(append.tie_scan, 1);
     }
 
     #[test]

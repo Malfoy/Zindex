@@ -35,7 +35,7 @@ sample_0002	/path/to/genome_0002.fa.zst
 ```
 
 This uses merged power-of-two banks, streaming planning, compression column
-ordering, slot-scale 1.0, most-deg2 and tie-scan 8 by default.
+ordering, slot-scale 1.0, no-heuristic and tie-scan 1 by default.
 
 Compressed-stack example (requires the legacy single-stack layout):
 

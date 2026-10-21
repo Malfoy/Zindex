@@ -16,7 +16,7 @@ use std::{
     collections::{BTreeMap, BinaryHeap, HashMap},
     fs::{self, File},
     hash::{DefaultHasher, Hash, Hasher},
-    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     ops::Range,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
@@ -30,6 +30,7 @@ use std::{
 const MAGIC: &[u8; 8] = b"ZORPOW1\0";
 const PLANE_MAGIC: &[u8; 8] = b"ZORPOW3\0";
 const ABANDONED_MAGIC: &[u8; 8] = b"ZORABN1\0";
+const ABANDONED_DELTA_MAGIC: &[u8; 8] = b"ZORABN2\0";
 const ABANDONED_FILE: &str = "abandoned.zormap.zst";
 const FINGERPRINT_SEED: u64 = 0x8E2D_4F6A_9B13_C5D7;
 
@@ -76,6 +77,8 @@ struct Manifest {
     backend: Backend,
     k: usize,
     hashes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    segment_length: Option<usize>,
     seed: u64,
     fingerprint_bits: usize,
     index_mode: u8,
@@ -109,6 +112,8 @@ struct Manifest {
     slot_scale: f64,
     #[serde(default = "legacy_min_subindex_documents")]
     min_subindex_documents: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_subindexes: Option<usize>,
     #[serde(default)]
     promoted_groups: usize,
     singleton_logical_bits: u64,
@@ -589,11 +594,7 @@ pub fn build(
         fs::remove_dir(stage.0.join("cells"))?;
     }
     let mut manifest = Manifest {
-        version: if config.feature_config.randstrobemers.is_some() {
-            6
-        } else {
-            5
-        },
+        version: if config.segment_length.is_some() { 8 } else { 7 },
         abandoned_recovery: !config.merge.drop_abandoned,
         abandoned_file: (!config.merge.drop_abandoned).then(|| ABANDONED_FILE.into()),
         abandoned_hashes,
@@ -601,6 +602,7 @@ pub fn build(
         backend: config.backend,
         k: config.k,
         hashes: config.hashes,
+        segment_length: config.segment_length,
         seed: config.seed,
         fingerprint_bits: config.fingerprint_bits,
         index_mode: config.feature_config.mode.as_u8(),
@@ -632,6 +634,7 @@ pub fn build(
         .into(),
         slot_scale: config.slot_scale,
         min_subindex_documents: config.merge.min_subindex_documents,
+        max_subindexes: config.merge.max_subindexes,
         promoted_groups,
         singleton_logical_bits,
         predicted_logical_bits,
@@ -985,7 +988,11 @@ fn promote_small_subindexes(
         .iter()
         .map(|(&slots, &(docs, width))| (slots, docs, width))
         .collect();
-    let targets = super::layout::promotion_targets(&buckets, config.merge.min_subindex_documents)?;
+    let targets = super::layout::promotion_targets(
+        &buckets,
+        config.merge.min_subindex_documents,
+        config.merge.max_subindexes,
+    )?;
     let mapping: BTreeMap<_, _> = buckets
         .iter()
         .zip(&targets)
@@ -1002,7 +1009,7 @@ fn promote_small_subindexes(
         .iter()
         .map(|group| (group.members[0], group))
         .collect();
-    eprintln!("minimum-document layout: {} original size buckets -> {} subindexes, minimum={}, rebuilding {} promoted groups without temporary files", buckets.len(), targets.iter().collect::<std::collections::BTreeSet<_>>().len(), config.merge.min_subindex_documents, promoted);
+    eprintln!("subindex layout: {} original size buckets -> {} subindexes, minimum={}, maximum={:?}, rebuilding {} promoted groups without temporary files", buckets.len(), targets.iter().collect::<std::collections::BTreeSet<_>>().len(), config.merge.min_subindex_documents, config.merge.max_subindexes, promoted);
     built.par_iter_mut().try_for_each(|old| -> Result<()> {
         let slots = mapping[&old.slots];
         if slots == old.slots {
@@ -1125,6 +1132,41 @@ fn transpose(groups: Vec<BuiltGroup>, order: ColumnOrder) -> Result<Vec<Bank>> {
     Ok(banks)
 }
 
+fn pack_ram_rows(
+    groups: &[BuiltGroup],
+    fp_bits: usize,
+    start: usize,
+    output: &mut [u8],
+    row_bytes: usize,
+) {
+    let fp_mask = (1u64 << fp_bits) - 1;
+    let rows = output.len() / row_bytes;
+    for (index, group) in groups.iter().enumerate() {
+        let CompletedCells::Packed { data, width, .. } = &group.cells else {
+            unreachable!()
+        };
+        if *width == fp_bits && matches!(fp_bits, 8 | 16) {
+            let bytes = fp_bits / 8;
+            let offset = index * bytes;
+            for (row, cell) in output
+                .chunks_exact_mut(row_bytes)
+                .zip(data[start * bytes..(start + rows) * bytes].chunks_exact(bytes))
+            {
+                row[offset..offset + bytes].copy_from_slice(cell);
+            }
+            continue;
+        }
+        let origin_offset = groups.len() * fp_bits + group.meta.offset - index * fp_bits;
+        for (n, row) in output.chunks_exact_mut(row_bytes).enumerate() {
+            let value = get_bits(data, (start + n) * width, *width);
+            put_bits(row, index * fp_bits, fp_bits, value & fp_mask);
+            if *width > fp_bits {
+                put_bits(row, origin_offset, width - fp_bits, value >> fp_bits);
+            }
+        }
+    }
+}
+
 fn pack_banks_streaming(
     groups: Vec<BuiltGroup>,
     order: ColumnOrder,
@@ -1173,10 +1215,36 @@ fn pack_banks_streaming(
             .collect::<std::io::Result<Vec<_>>>()
             .ok();
         let fp_mask = (1u64 << fp_bits) - 1;
+        let ram = groups
+            .iter()
+            .all(|g| matches!(g.cells, CompletedCells::Packed { .. }));
         for start in (0..slots).step_by(tile_rows) {
             let rows = tile_rows.min(slots - start);
             let output = &mut tile[..rows * row_bytes];
             output.fill(0);
+            if ram {
+                // Rows are disjoint ownership units, even when color planes
+                // are not byte aligned. Preserve the exact writer tile order.
+                if output.len() >= 1024 * 1024 && rows >= 128 && groups.len() >= 32 {
+                    let per_task = rows.div_ceil(rayon::current_num_threads());
+                    output
+                        .par_chunks_mut(per_task * row_bytes)
+                        .enumerate()
+                        .for_each(|(task, rows)| {
+                            pack_ram_rows(
+                                &groups,
+                                fp_bits,
+                                start + task * per_task,
+                                rows,
+                                row_bytes,
+                            );
+                        });
+                } else {
+                    pack_ram_rows(&groups, fp_bits, start, output, row_bytes);
+                }
+                writer.write_all(output)?;
+                continue;
+            }
             for (index, group) in groups.iter().enumerate() {
                 let block = &mut input[..rows * 8];
                 let file = files.as_mut().and_then(|files| files[index].as_mut());
@@ -1217,7 +1285,13 @@ fn visit_abandoned(
     members: &[Vec<usize>],
     mut emit: impl FnMut(u32, &[u32]) -> Result<()>,
 ) -> Result<(usize, usize)> {
-    records.sort_unstable_by_key(|record| (record.0, record.1));
+    // Only hash order matters. Origin lists are sorted/deduplicated below;
+    // construction-group order within an equal hash has no observable effect.
+    if records.len() >= 16_384 {
+        records.par_sort_unstable_by_key(|record| record.0);
+    } else {
+        records.sort_unstable_by_key(|record| record.0);
+    }
     let mut origins = Vec::new();
     let mut hashes = 0usize;
     let mut associations = 0usize;
@@ -1295,18 +1369,77 @@ fn save_abandoned_groups(groups: &mut [BuiltGroup], directory: &Path) -> Result<
             records.push((hash, id, mask));
         }
     }
-    let mut writer = create_index_writer(&directory.join(ABANDONED_FILE))?;
-    writer.write_all(ABANDONED_MAGIC)?;
+    // Buffer the uncompressed records too: entering the zstd encoder for every
+    // tiny integer is expensive on hundreds of millions of abandoned hashes.
+    let mut writer = BufWriter::with_capacity(
+        1024 * 1024,
+        create_index_writer(&directory.join(ABANDONED_FILE))?,
+    );
+    writer.write_all(ABANDONED_DELTA_MAGIC)?;
+    let mut previous_hash = 0u32;
     let stats = visit_abandoned(&mut records, &members, |hash, origins| {
-        writer.write_all(&hash.to_le_bytes())?;
-        writer.write_all(&(origins.len() as u32).to_le_bytes())?;
+        write_var_u32(&mut writer, hash - previous_hash)?;
+        previous_hash = hash;
+        write_var_u32(
+            &mut writer,
+            u32::try_from(origins.len()).context("too many abandoned origins")?,
+        )?;
+        let mut previous_origin = 0u32;
         for &origin in origins {
-            writer.write_all(&origin.to_le_bytes())?;
+            write_var_u32(&mut writer, origin - previous_origin)?;
+            previous_origin = origin;
         }
         Ok(())
     })?;
-    finish_index_writer(writer)?;
+    finish_index_writer(writer.into_inner().map_err(|e| e.into_error())?)?;
     Ok(stats)
+}
+
+fn write_var_u32(writer: &mut impl Write, mut value: u32) -> Result<()> {
+    let mut bytes = [0u8; 5];
+    let mut n = 0;
+    while value >= 128 {
+        bytes[n] = value as u8 | 128;
+        value >>= 7;
+        n += 1;
+    }
+    bytes[n] = value as u8;
+    writer.write_all(&bytes[..n + 1])?;
+    Ok(())
+}
+
+#[inline]
+fn read_var_u32(reader: &mut impl BufRead) -> Result<u32> {
+    // Decode directly in the decompressor's output buffer. Nearly all hash
+    // deltas/counts fit one byte and document IDs two; avoid a Read call per
+    // byte. The bounded fallback also handles integers crossing buffer edges.
+    let bytes = reader.fill_buf()?;
+    if bytes.len() >= 5 || bytes.first().is_some_and(|b| b & 128 == 0) {
+        let mut value = 0u32;
+        for (n, &byte) in bytes.iter().take(5).enumerate() {
+            ensure!(n != 4 || byte <= 15, "abandoned variable integer overflow");
+            value |= ((byte & 127) as u32) << (n * 7);
+            if byte & 128 == 0 {
+                reader.consume(n + 1);
+                return Ok(value);
+            }
+        }
+        anyhow::bail!("abandoned variable integer overflow");
+    }
+    let mut value = 0u32;
+    for shift in (0..=28).step_by(7) {
+        let mut byte = [0];
+        reader.read_exact(&mut byte)?;
+        ensure!(
+            shift != 28 || byte[0] <= 15,
+            "abandoned variable integer overflow"
+        );
+        value |= ((byte[0] & 127) as u32) << shift;
+        if byte[0] & 128 == 0 {
+            return Ok(value);
+        }
+    }
+    anyhow::bail!("abandoned variable integer overflow")
 }
 
 fn read_u32(reader: &mut impl Read) -> Result<u32> {
@@ -1328,13 +1461,34 @@ fn load_abandoned(directory: &Path, manifest: &Manifest) -> Result<OriginMap> {
     );
     let mut magic = [0; 8];
     reader.read_exact(&mut magic)?;
-    ensure!(&magic == ABANDONED_MAGIC, "invalid abandoned map magic");
+    ensure!(
+        &magic == ABANDONED_MAGIC || &magic == ABANDONED_DELTA_MAGIC,
+        "invalid abandoned map magic"
+    );
+    let delta_encoded = &magic == ABANDONED_DELTA_MAGIC;
     let mut map = OriginMap::with_capacity(manifest.abandoned_hashes, manifest.abandoned_origins)?;
     let mut origins = Vec::new();
     let mut bytes = vec![0; 64 * 1024];
-    for _ in 0..manifest.abandoned_hashes {
-        let hash = read_u32(&mut reader)?;
-        let count = read_u32(&mut reader)? as usize;
+    let mut previous_hash = 0u32;
+    for record in 0..manifest.abandoned_hashes {
+        let hash = if delta_encoded {
+            let delta = read_var_u32(&mut reader)?;
+            ensure!(
+                record == 0 || delta != 0,
+                "unsorted/duplicate abandoned hashes"
+            );
+            previous_hash
+                .checked_add(delta)
+                .context("abandoned hash delta overflow")?
+        } else {
+            read_u32(&mut reader)?
+        };
+        previous_hash = hash;
+        let count = if delta_encoded {
+            read_var_u32(&mut reader)?
+        } else {
+            read_u32(&mut reader)?
+        } as usize;
         ensure!(
             count > 0 && count <= manifest.colors.len(),
             "invalid abandoned origin count"
@@ -1345,6 +1499,23 @@ fn load_abandoned(directory: &Path, manifest: &Manifest) -> Result<OriginMap> {
         );
         origins.clear();
         let mut remaining = count;
+        if delta_encoded {
+            let mut previous_origin = 0u32;
+            for n in 0..count {
+                let delta = read_var_u32(&mut reader)?;
+                ensure!(n == 0 || delta != 0, "duplicate abandoned origins");
+                let origin = previous_origin
+                    .checked_add(delta)
+                    .context("abandoned origin delta overflow")?;
+                ensure!(
+                    (origin as usize) < manifest.colors.len(),
+                    "invalid abandoned dataset ID"
+                );
+                origins.push(origin);
+                previous_origin = origin;
+            }
+            remaining = 0;
+        }
         while remaining != 0 {
             let n = remaining.min(bytes.len() / 4);
             reader.read_exact(&mut bytes[..n * 4])?;
@@ -1444,12 +1615,23 @@ impl Index {
         let manifest: Manifest =
             serde_json::from_reader(BufReader::new(File::open(directory.join("manifest.json"))?))?;
         ensure!(
-            [1, 2, 3, 4, 5, 6].contains(&manifest.version) && manifest.backend == Backend::Zor,
+            [1, 2, 3, 4, 5, 6, 7, 8].contains(&manifest.version)
+                && manifest.backend == Backend::Zor,
             "unsupported power-of-two index format"
         );
         ensure!(
             (2..=MAX_HASHES).contains(&manifest.hashes),
             "invalid hash count"
+        );
+        ensure!(
+            if manifest.version >= 8 {
+                manifest
+                    .segment_length
+                    .is_some_and(|n| n.is_power_of_two() && n <= 4096)
+            } else {
+                manifest.segment_length.is_none()
+            },
+            "invalid/missing segment length for index version"
         );
         ensure!(
             [1, 8, 16].contains(&manifest.fingerprint_bits),
@@ -1498,6 +1680,12 @@ impl Index {
             "invalid feature parameters"
         );
         let mut seen = vec![false; manifest.colors.len()];
+        ensure!(
+            manifest
+                .max_subindexes
+                .is_none_or(|limit| limit > 0 && manifest.banks.len() <= limit),
+            "invalid maximum subindex count"
+        );
         let mut banks = Vec::new();
         let mut previous_slots = 0;
         for meta in &manifest.banks {
@@ -1512,6 +1700,12 @@ impl Index {
                 "invalid bank size/order"
             );
             previous_slots = meta.slots;
+            if let Some(length) = manifest.segment_length {
+                ensure!(
+                    meta.slots % length == 0 && meta.slots / length >= manifest.hashes,
+                    "subindex too small for fixed segment geometry"
+                );
+            }
             ensure!(
                 meta.file == format!("bank-{}.zorbank.zst", meta.slots.ilog2()),
                 "invalid bank file name"
@@ -1773,6 +1967,7 @@ impl Index {
                 position_hash.as_ref().unwrap().positions(
                     bank.meta.slots,
                     self.manifest.hashes,
+                    self.manifest.segment_length,
                     &mut computed[..self.manifest.hashes],
                 );
                 &computed[..self.manifest.hashes]
@@ -1911,7 +2106,7 @@ impl Index {
             for (&key, slots) in block.iter().zip(positions.chunks_exact_mut(stride)) {
                 let hash = PositionHash::new(key, self.manifest.seed);
                 for (bank, slots) in self.banks.iter().zip(slots.chunks_exact_mut(hashes)) {
-                    hash.positions(bank.meta.slots, hashes, slots);
+                    hash.positions(bank.meta.slots, hashes, self.manifest.segment_length, slots);
                 }
             }
             for i in 0..block.len().min(AHEAD) {
@@ -2351,7 +2546,7 @@ unsafe fn fingerprint_matches_avx2(row: &[u8], bits: usize, fp: u64, hit: &mut i
 /// two; the number of overlapping segment starts is not necessarily one.
 #[cfg(test)]
 fn positions(key: u64, cells: usize, hashes: usize, seed: u64, out: &mut [usize]) {
-    PositionHash::new(key, seed).positions(cells, hashes, out);
+    PositionHash::new(key, seed).positions(cells, hashes, None, out);
 }
 
 struct PositionHash {
@@ -2370,9 +2565,11 @@ impl PositionHash {
     }
 
     #[inline]
-    fn positions(&self, cells: usize, hashes: usize, out: &mut [usize]) {
-        let length = (cells / hashes).clamp(1, 4096);
-        let length = 1usize << length.ilog2();
+    fn positions(&self, cells: usize, hashes: usize, fixed: Option<usize>, out: &mut [usize]) {
+        let length = fixed.unwrap_or_else(|| {
+            let n = (cells / hashes).clamp(1, 4096);
+            1usize << n.ilog2()
+        });
         let count = cells / length - hashes + 1;
         let base = (((self.first as u128 * count as u128) >> 64) as usize) * length;
         let mut hash = self.first;
@@ -2514,6 +2711,7 @@ pub fn query_records_command(
     recover: bool,
     batch_size: usize,
 ) -> Result<()> {
+    let load_start = Instant::now();
     ensure!(
         (0.0..=1.0).contains(&min_ratio),
         "--min-ratio must be in [0, 1]"
@@ -2521,17 +2719,25 @@ pub fn query_records_command(
     ensure!(batch_size > 0, "record batch size must be positive");
     let index = Index::load_with_recovery(directory, recover)
         .with_context(|| format!("loading {}", directory.display()))?;
+    let load_seconds = load_start.elapsed().as_secs_f64();
     let features = index.manifest.features()?;
     ensure!(
         features.mode != IndexMode::Findere,
         "--records does not support findere indexes"
     );
+    let query_start = Instant::now();
     super::records::query_file(
         query,
         batch_size,
         || record_query::Worker::new(&index),
         |worker, records, out| worker.query_records(&index, features, min_ratio, records, out),
-    )
+    )?;
+    eprintln!(
+        "query_timings\tload_s={:.6}\tquery_s={:.6}",
+        load_seconds,
+        query_start.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 pub fn query_command_with_recovery(
@@ -2721,6 +2927,9 @@ pub fn info_command(directory: &Path) -> Result<()> {
         m.merge_reverts_enabled
     );
     println!("construction_cell_storage\t{}", m.construction_cell_storage);
+    if let Some(length) = m.segment_length {
+        println!("segment_length\t{length}");
+    }
     println!("overflow_groups\t{}", m.overflow_groups);
     println!("merge_column_order\t{}", m.column_order.label());
     println!("abandoned_recovery\t{}\nabandoned_hash_bits\t32\nabandoned_keys\t{}\nabandoned_unique_hashes\t{}\nabandoned_dataset_associations\t{}\nabandoned_map_ram_bytes\t{}",
@@ -2743,6 +2952,9 @@ pub fn info_command(directory: &Path) -> Result<()> {
         "min_subindex_documents\t{}\npromoted_groups\t{}",
         m.min_subindex_documents, m.promoted_groups
     );
+    if let Some(limit) = m.max_subindexes {
+        println!("max_subindexes\t{limit}");
+    }
     println!("bank\tslots\tgroups\trow_bits\tpadding_bits_per_row\tfallback_keys\tdocuments");
     for b in &m.banks {
         println!(
@@ -2933,6 +3145,7 @@ mod tests {
             feature_config: FeatureConfig::legacy_kmers(),
             slot_scale: 1.0,
             minimum_slots: None,
+            segment_length: None,
             merge: super::super::MergeArgs {
                 disabled: true,
                 sketch_size: 64,
@@ -3168,7 +3381,7 @@ mod tests {
                         })
                         .collect();
                     let mut actual = vec![0; hashes];
-                    PositionHash::new(key, seed).positions(cells, hashes, &mut actual);
+                    PositionHash::new(key, seed).positions(cells, hashes, None, &mut actual);
                     assert_eq!(actual, expected);
                 }
             }
@@ -3554,6 +3767,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fixed_segments_have_the_same_length_at_every_filter_size() {
+        let length = super::super::DEFAULT_SEGMENT_LENGTH;
+        for hashes in [4, 6, 8] {
+            for cells in [512usize, 1024, 65536, 524288, 4194304] {
+                for key in [0, 1, 69, 123456, u64::MAX] {
+                    let hash = PositionHash::new(key, 69);
+                    let mut positions = [0; MAX_HASHES];
+                    hash.positions(cells, hashes, Some(length), &mut positions[..hashes]);
+                    let base = positions[0] / length;
+                    for (i, &slot) in positions[..hashes].iter().enumerate() {
+                        assert!(slot < cells);
+                        assert_eq!(slot / length, base + i);
+                    }
+                }
+            }
+        }
+        let mut config = scratch_free_config(true);
+        config.segment_length = Some(length);
+        for hashes in [4usize, 6, 8] {
+            config.hashes = hashes;
+            config.validate().unwrap();
+            assert_eq!(
+                config.slots(0.0).unwrap(),
+                length * hashes.next_power_of_two()
+            );
+            assert_eq!(config.slots(60000.0).unwrap(), 65536);
+        }
+    }
+
     pub(super) fn union_index(key: u64, recovered: &[u32]) -> Index {
         let seed = 69;
         let group = GroupMeta {
@@ -3598,6 +3841,7 @@ mod tests {
             backend: Backend::Zor,
             k: 31,
             hashes: 2,
+            segment_length: None,
             seed,
             fingerprint_bits: 8,
             index_mode: IndexMode::Kmers.as_u8(),
@@ -3620,6 +3864,7 @@ mod tests {
             slot_scale: 1.0,
             singleton_logical_bits: 64,
             min_subindex_documents: 1,
+            max_subindexes: None,
             promoted_groups: 0,
             predicted_logical_bits: 40,
             planned_groups: 1,
@@ -3779,6 +4024,122 @@ mod tests {
         let mut scores = [0; 2];
         index.lookup(a, &mut scores, &mut Vec::new());
         assert_eq!(scores, [1, 1]);
+    }
+
+    #[test]
+    fn parallel_packed_ram_transpose_matches_disk_tiles_byte_for_byte() {
+        let stage = temporary_stage();
+        for fp in [1usize, 8, 16] {
+            let make = |ram, prefix| {
+                (0..256)
+                    .map(|id| {
+                        let count = [1, 2, 3, 7, 64 - fp][id % 5];
+                        let width = fp + if count == 1 { 0 } else { count };
+                        let mask = u64::MAX >> (64 - width);
+                        let cells: Vec<_> = (0..4096)
+                            .map(|slot| splitmix64((id * 4096 + slot) as u64) & mask)
+                            .collect();
+                        let mut group = test_group(&stage, prefix + id, width, &cells);
+                        group.meta.members = (0..count).map(|i| id * 64 + i).collect();
+                        if ram {
+                            group.cells.remove().unwrap();
+                            group.cells = CompletedCells::packed(&cells, width).unwrap();
+                        }
+                        group
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let reference =
+                pack_banks_streaming(make(false, 0), ColumnOrder::Compression, fp, &stage.0)
+                    .unwrap();
+            let bytes = fs::read(stage.0.join(&reference[0].file)).unwrap();
+            for threads in [1, 4] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                let groups = make(true, threads * 1000);
+                let actual = pool
+                    .install(|| {
+                        pack_banks_streaming(groups, ColumnOrder::Compression, fp, &stage.0)
+                    })
+                    .unwrap();
+                assert_eq!(bytes, fs::read(stage.0.join(&actual[0].file)).unwrap());
+                assert_eq!(reference[0].row_bits, actual[0].row_bits);
+            }
+        }
+    }
+
+    #[test]
+    fn variable_integers_and_delta_recovery_preserve_full_u32_values() {
+        for value in [0, 1, 127, 128, 16383, 16384, 1 << 28, u32::MAX] {
+            let mut bytes = Vec::new();
+            write_var_u32(&mut bytes, value).unwrap();
+            assert_eq!(read_var_u32(&mut bytes.as_slice()).unwrap(), value);
+        }
+        assert!(read_var_u32(&mut &[255u8; 5][..]).is_err());
+        assert!(read_var_u32(&mut &[128u8][..]).is_err());
+        let values = [0, 1, 127, 128, 16383, 16384, 1 << 28, u32::MAX];
+        let mut encoded = Vec::new();
+        for &value in &values {
+            write_var_u32(&mut encoded, value).unwrap();
+        }
+        for capacity in 1..=8 {
+            let mut reader = BufReader::with_capacity(capacity, encoded.as_slice());
+            for value in values {
+                assert_eq!(read_var_u32(&mut reader).unwrap(), value);
+            }
+            assert!(read_var_u32(&mut reader).is_err());
+        }
+        let stage = temporary_stage();
+        let mut index = union_index(123, &[]);
+        index
+            .manifest
+            .colors
+            .resize(65, index.manifest.colors[0].clone());
+        index.manifest.abandoned_file = Some(ABANDONED_FILE.into());
+        let expected = [
+            (0u32, vec![0u32]),
+            (7, vec![0, 32, 64]),
+            (u32::MAX, vec![64]),
+        ];
+        index.manifest.abandoned_hashes = expected.len();
+        index.manifest.abandoned_origins = 5;
+        let mut data = ABANDONED_DELTA_MAGIC.to_vec();
+        let mut previous = 0;
+        for (hash, origins) in &expected {
+            write_var_u32(&mut data, hash - previous).unwrap();
+            previous = *hash;
+            write_var_u32(&mut data, origins.len() as u32).unwrap();
+            let mut prior = 0;
+            for &id in origins {
+                write_var_u32(&mut data, id - prior).unwrap();
+                prior = id;
+            }
+        }
+        for mode in 0..3 {
+            let mut writer = create_index_writer(&stage.0.join(ABANDONED_FILE)).unwrap();
+            writer
+                .write_all(if mode == 1 {
+                    &data[..data.len() - 1]
+                } else {
+                    &data
+                })
+                .unwrap();
+            if mode == 2 {
+                writer.write_all(&[0]).unwrap();
+            }
+            finish_index_writer(writer).unwrap();
+            let result = load_abandoned(&stage.0, &index.manifest);
+            if mode == 0 {
+                let map = result.unwrap();
+                for (hash, origins) in &expected {
+                    assert_eq!(map.get(*hash), origins);
+                }
+            } else {
+                assert!(result.is_err());
+            }
+        }
     }
 
     #[test]

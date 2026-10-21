@@ -123,9 +123,9 @@ fn short_default_command_matches_explicit_optimized_settings() {
         "--slot-scale",
         "1.0",
         "--cycle-break",
-        "most-deg2",
+        "no-heuristic",
         "--tie-scan",
-        "8",
+        "1",
     ];
     let mut indexes = Vec::new();
     let mut outputs = Vec::new();
@@ -152,6 +152,8 @@ fn short_default_command_matches_explicit_optimized_settings() {
             serde_json::from_slice(&fs::read(Path::new(&index).join("manifest.json")).unwrap())
                 .unwrap();
         assert_eq!(manifest["merge_planner"], "streaming");
+        assert_eq!(manifest["version"], 8);
+        assert_eq!(manifest["segment_length"], 64);
         assert_eq!(manifest["min_subindex_documents"], 128);
         assert_eq!(manifest["column_order"], "compression");
         assert_eq!(
@@ -420,7 +422,7 @@ fn global_abandoned_recovery_can_be_omitted_or_skipped_without_changing_filters(
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(Path::new(&recovery).join("manifest.json")).unwrap())
             .unwrap();
-    assert_eq!(manifest["version"], 5);
+    assert_eq!(manifest["version"], 8);
     for bank in manifest["banks"].as_array().unwrap() {
         let name = bank["file"].as_str().unwrap();
         assert_eq!(
@@ -989,17 +991,28 @@ fn minimum_subindex_documents_promotes_without_changing_document_membership() {
         paths.push(path);
     }
     let fof = f.write("minimum.fof", fof);
-    for (minimum, expected_banks) in [("1", 2), ("8", 1), ("128", 1)] {
-        let index = f.path(&format!("minimum-{minimum}"));
-        build(
-            &fof,
-            &index,
-            &["--merge-disabled", "--min-subindex-documents", minimum],
-        );
+    for (minimum, maximum, expected_banks) in [
+        ("1", None, 2),
+        ("8", None, 1),
+        ("128", None, 1),
+        ("1", Some("1"), 1),
+        ("1", Some("3"), 2),
+        ("8", Some("1"), 1),
+    ] {
+        let index = f.path(&format!("minimum-{minimum}-maximum-{maximum:?}"));
+        let mut extra = vec!["--merge-disabled", "--min-subindex-documents", minimum];
+        if let Some(maximum) = maximum {
+            extra.extend(["--max-subindexes", maximum]);
+        }
+        build(&fof, &index, &extra);
         let m: serde_json::Value =
             serde_json::from_slice(&fs::read(Path::new(&index).join("manifest.json")).unwrap())
                 .unwrap();
         let banks = m["banks"].as_array().unwrap();
+        assert_eq!(
+            m["max_subindexes"].as_u64(),
+            maximum.map(|m| m.parse::<u64>().unwrap())
+        );
         assert_eq!(banks.len(), expected_banks);
         for bank in banks {
             assert!(bank["slots"].as_u64().unwrap().is_power_of_two());
@@ -1028,6 +1041,22 @@ fn minimum_subindex_documents_promotes_without_changing_document_membership() {
             "--output",
             &invalid,
             "--min-subindex-documents",
+            "0"
+        ],
+        "1"
+    )
+    .status
+    .success());
+    assert!(!Path::new(&invalid).exists());
+    let invalid = f.path("maximum-invalid");
+    assert!(!call(
+        &[
+            "build",
+            "--fof",
+            &fof,
+            "--output",
+            &invalid,
+            "--max-subindexes",
             "0"
         ],
         "1"
