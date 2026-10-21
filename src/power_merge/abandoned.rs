@@ -9,22 +9,54 @@ pub(super) fn hash(key: u64, seed: u64) -> u32 {
     (crate::splitmix64(key ^ seed ^ HASH_SEED) >> 32) as u32
 }
 
+const MULTIPLE: u32 = 1 << 31;
+const EMPTY: u32 = u32::MAX;
+const WIDE: u32 = EMPTY - 1;
+
+#[derive(Clone, Copy)]
+struct Entry {
+    hash: u32,
+    // A normal document ID is inline. The high bit selects a multiple-origin
+    // descriptor; EMPTY is a slot marker, never a reserved hash or origin ID.
+    value: u32,
+}
+const EMPTY_ENTRY: Entry = Entry {
+    hash: 0,
+    value: EMPTY,
+};
+
 #[derive(Default)]
 pub(super) struct OriginMap {
-    keys: Vec<u32>,
-    offsets: Vec<u64>,
+    directory: Vec<Entry>,
+    multiple: Vec<std::ops::Range<usize>>,
+    // Sorted overflow descriptors preserve the existing u32 key-count limit.
+    wide: Vec<(u32, std::ops::Range<usize>)>,
     origins: Vec<u32>,
-    // Zero means empty; otherwise this is a dense record index plus one.
-    // No per-key allocation, and no 64-bit abandoned key is retained.
-    directory: Vec<u32>,
+    hashes: usize,
+    associations: usize,
+    last_hash: Option<u32>,
+    finalized: bool,
 }
 
 impl OriginMap {
     #[inline]
+    fn first_slot(key: u32, capacity: usize) -> usize {
+        // Recovery records arrive in hash order. Taking high hash bits makes
+        // insertion a sequential pass instead of revisiting the entire table
+        // once per high-bit prefix. Hashes are already uniformly mixed.
+        let bits = capacity.trailing_zeros();
+        if bits <= 32 {
+            (key >> (32 - bits)) as usize
+        } else {
+            (key as usize) << (bits - 32)
+        }
+    }
+
+    #[inline]
     pub(super) fn prefetch(&self, key: u32) {
         #[cfg(target_arch = "x86_64")]
         if !self.directory.is_empty() {
-            let slot = key as usize & (self.directory.len() - 1);
+            let slot = Self::first_slot(key, self.directory.len());
             // Only the first directory bucket is known without doing the probe.
             // Actual collision resolution/postings remain unchanged in get().
             unsafe {
@@ -40,67 +72,99 @@ impl OriginMap {
 
     pub(super) fn with_capacity(keys: usize, origins: usize) -> Result<Self> {
         ensure!(keys <= u32::MAX as usize, "too many abandoned hashes");
+        let capacity = if keys == 0 { 0 } else { Self::capacity(keys)? };
+        let extra = origins.saturating_sub(keys);
         Ok(Self {
-            keys: Vec::with_capacity(keys),
-            offsets: Vec::with_capacity(keys.checked_add(1).context("abandoned offsets overflow")?),
-            origins: Vec::with_capacity(origins),
-            directory: Vec::new(),
+            directory: vec![EMPTY_ENTRY; capacity],
+            multiple: Vec::with_capacity(extra),
+            // At most twice the excess associations belong to non-singletons.
+            // Do not reserve a posting for every inline singleton.
+            origins: Vec::with_capacity(extra.saturating_mul(2).min(origins)),
+            ..Default::default()
         })
     }
+
+    fn capacity(keys: usize) -> Result<usize> {
+        keys.checked_mul(4)
+            .and_then(|n| n.div_ceil(3).max(4).checked_next_power_of_two())
+            .context("abandoned directory size overflow")
+    }
+
+    fn insert(directory: &mut [Entry], entry: Entry) {
+        let mask = directory.len() - 1;
+        let mut slot = Self::first_slot(entry.hash, directory.len());
+        while directory[slot].value != EMPTY {
+            slot = (slot + 1) & mask;
+        }
+        directory[slot] = entry;
+    }
+
+    fn reserve_one(&mut self) -> Result<()> {
+        if (self.hashes + 1) * 4 <= self.directory.len() * 3 {
+            return Ok(());
+        }
+        let capacity = Self::capacity(self.hashes + 1)?;
+        let mut directory = vec![EMPTY_ENTRY; capacity];
+        for &entry in &self.directory {
+            if entry.value != EMPTY {
+                Self::insert(&mut directory, entry);
+            }
+        }
+        self.directory = directory;
+        Ok(())
+    }
+    fn add_multiple(&mut self, key: u32, origins: &[u32], limit: usize) -> u32 {
+        let start = self.origins.len();
+        self.origins.extend_from_slice(origins);
+        let range = start..self.origins.len();
+        if self.multiple.len() < limit {
+            let id = self.multiple.len() as u32;
+            self.multiple.push(range);
+            MULTIPLE | id
+        } else {
+            self.wide.push((key, range));
+            WIDE
+        }
+    }
+
     pub(super) fn push(&mut self, key: u32, origins: &[u32]) -> Result<()> {
+        ensure!(!self.finalized, "abandoned directory already finalized");
         ensure!(
-            self.directory.is_empty(),
-            "abandoned directory already finalized"
-        );
-        ensure!(
-            self.keys.last().is_none_or(|&previous| previous < key),
+            self.last_hash.is_none_or(|previous| previous < key),
             "unsorted/duplicate abandoned hashes"
         );
         ensure!(
             !origins.is_empty() && origins.windows(2).all(|pair| pair[0] < pair[1]),
             "empty/unsorted/duplicate abandoned origins"
         );
-        ensure!(
-            self.keys.len() < u32::MAX as usize,
-            "too many abandoned hashes"
-        );
-        if self.offsets.is_empty() {
-            self.offsets.push(0);
-        }
-        self.keys.push(key);
-        self.origins.extend_from_slice(origins);
-        self.offsets.push(self.origins.len() as u64);
+        ensure!(self.hashes < u32::MAX as usize, "too many abandoned hashes");
+        self.reserve_one()?;
+        let value = if origins.len() == 1 && origins[0] < MULTIPLE {
+            origins[0]
+        } else {
+            self.add_multiple(key, origins, (MULTIPLE - 2) as usize)
+        };
+        Self::insert(&mut self.directory, Entry { hash: key, value });
+        self.hashes += 1;
+        self.associations = self
+            .associations
+            .checked_add(origins.len())
+            .context("abandoned origins overflow")?;
+        self.last_hash = Some(key);
         Ok(())
     }
 
     pub(super) fn finish(&mut self) -> Result<()> {
-        ensure!(
-            self.directory.is_empty(),
-            "abandoned directory already finalized"
-        );
-        if self.keys.is_empty() {
+        ensure!(!self.finalized, "abandoned directory already finalized");
+        if self.hashes == 0 {
             return Ok(());
         }
-        // Legacy conversion does not know the number of globally distinct hashes
-        // in advance. Discard vector growth slack before creating the directory.
-        self.keys.shrink_to_fit();
-        self.offsets.shrink_to_fit();
+        // Discard posting/descriptor growth slack, including legacy conversion
+        // whose globally distinct hash count was not known in advance.
+        self.multiple.shrink_to_fit();
+        self.wide.shrink_to_fit();
         self.origins.shrink_to_fit();
-        let capacity = self
-            .keys
-            .len()
-            .checked_mul(4)
-            .and_then(|n| n.div_ceil(3).checked_next_power_of_two())
-            .context("abandoned directory size overflow")?;
-        self.directory = vec![0; capacity];
-        let mask = capacity - 1;
-        for (index, &key) in self.keys.iter().enumerate() {
-            let mut slot = key as usize & mask;
-            while self.directory[slot] != 0 {
-                slot = (slot + 1) & mask;
-            }
-            self.directory[slot] = index as u32 + 1;
-        }
+        self.finalized = true;
         Ok(())
     }
 
@@ -110,32 +174,40 @@ impl OriginMap {
             return &[];
         }
         let mask = self.directory.len() - 1;
-        let mut slot = key as usize & mask;
+        let mut slot = Self::first_slot(key, self.directory.len());
         loop {
-            let entry = self.directory[slot];
-            if entry == 0 {
+            let entry = &self.directory[slot];
+            if entry.value == EMPTY {
                 return &[];
             }
-            let index = entry as usize - 1;
-            if self.keys[index] == key {
-                return &self.origins
-                    [self.offsets[index] as usize..self.offsets[index + 1] as usize];
+            if entry.hash == key {
+                return if entry.value & MULTIPLE == 0 {
+                    std::slice::from_ref(&entry.value)
+                } else if entry.value == WIDE {
+                    let id = self
+                        .wide
+                        .binary_search_by_key(&key, |entry| entry.0)
+                        .unwrap();
+                    &self.origins[self.wide[id].1.clone()]
+                } else {
+                    &self.origins[self.multiple[(entry.value & !MULTIPLE) as usize].clone()]
+                };
             }
             slot = (slot + 1) & mask;
         }
     }
 
     pub(super) fn len(&self) -> usize {
-        self.keys.len()
+        self.hashes
     }
     pub(super) fn origins_len(&self) -> usize {
-        self.origins.len()
+        self.associations
     }
     pub(super) fn memory_bytes(&self) -> usize {
-        self.keys.capacity() * 4
-            + self.offsets.capacity() * 8
+        self.directory.capacity() * std::mem::size_of::<Entry>()
+            + self.multiple.capacity() * std::mem::size_of::<std::ops::Range<usize>>()
+            + self.wide.capacity() * std::mem::size_of::<(u32, std::ops::Range<usize>)>()
             + self.origins.capacity() * 4
-            + self.directory.capacity() * 4
     }
 }
 
@@ -182,6 +254,62 @@ mod tests {
         assert!(map.push(1, &[3]).is_err());
         map.finish().unwrap();
         assert!(map.push(2, &[3]).is_err());
+    }
+
+    #[test]
+    fn wide_descriptor_escape_does_not_limit_origin_ids_or_hashes() {
+        let mut map = OriginMap::with_capacity(2, 4).unwrap();
+        for (hash, origins) in [(0, &[0, u32::MAX][..]), (u32::MAX, &[1, 2][..])] {
+            let value = map.add_multiple(hash, origins, 0);
+            OriginMap::insert(&mut map.directory, Entry { hash, value });
+            assert_eq!(map.get(hash), origins);
+        }
+        assert!(map.get(1).is_empty());
+    }
+
+    #[test]
+    fn inline_and_multiple_origins_match_a_reference_through_growth() {
+        for reserved in [false, true] {
+            let mut hashes: Vec<_> = (0..100_000u64)
+                .map(|i| crate::splitmix64(i) as u32)
+                .collect();
+            hashes.extend([0, u32::MAX]);
+            hashes.sort_unstable();
+            hashes.dedup();
+            let mut map = if reserved {
+                OriginMap::with_capacity(hashes.len(), hashes.len() * 2).unwrap()
+            } else {
+                OriginMap::default()
+            };
+            let mut expected = std::collections::BTreeMap::new();
+            for (i, hash) in hashes.into_iter().enumerate() {
+                let values = if i % 127 == 0 {
+                    vec![u32::MAX]
+                } else if i % 25 == 0 {
+                    vec![0, (i as u32 % 16_000) + 1, u32::MAX]
+                } else {
+                    vec![i as u32 % 16_384]
+                };
+                map.push(hash, &values).unwrap();
+                expected.insert(hash, values);
+            }
+            map.finish().unwrap();
+            assert_eq!(map.len(), expected.len());
+            assert_eq!(
+                map.origins_len(),
+                expected.values().map(Vec::len).sum::<usize>()
+            );
+            for (&hash, values) in &expected {
+                assert_eq!(map.get(hash), values);
+            }
+            for i in 0..1000 {
+                let hash = crate::splitmix64(i + 100_000) as u32;
+                assert_eq!(
+                    map.get(hash),
+                    expected.get(&hash).map_or(&[][..], Vec::as_slice)
+                );
+            }
+        }
     }
 
     #[test]

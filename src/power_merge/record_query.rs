@@ -313,7 +313,12 @@ impl Worker {
                     .iter()
                     .zip(out.chunks_exact_mut(index.manifest.hashes))
                 {
-                    hash.positions(bank.meta.slots, index.manifest.hashes, out);
+                    hash.positions(
+                        bank.meta.slots,
+                        index.manifest.hashes,
+                        index.manifest.segment_length,
+                        out,
+                    );
                 }
             }
             for n in 0..count.min(AHEAD) {

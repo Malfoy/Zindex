@@ -206,6 +206,10 @@ fn default_is_open_closed_and_legacy_metadata_keeps_simd() {
         ];
         if plain {
             args.push("--plain");
+        } else {
+            // Build a fixed layout identical to the historical geometry before
+            // removing its new metadata. Do not relabel differently hashed cells.
+            args.extend(["--slot-count", "8192", "--segment-length", "2048"]);
         }
         ok(&args, "4");
         let expected = ok(&["query", "--index", &index, "--query", &reference], "1");
@@ -236,6 +240,7 @@ fn default_is_open_closed_and_legacy_metadata_keeps_simd() {
                 serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
             manifest["version"] = 3.into();
             manifest.as_object_mut().unwrap().remove("minimizer_scheme");
+            manifest.as_object_mut().unwrap().remove("segment_length");
             manifest
                 .as_object_mut()
                 .unwrap()
@@ -586,10 +591,11 @@ fn downstream_strobes_keep_strands_separate_and_reject_custom_legacy_indexes() {
             let path = PathBuf::from(&index).join("manifest.json");
             let mut manifest: serde_json::Value =
                 serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            assert_eq!(manifest["version"], 6);
+            assert_eq!(manifest["version"], 8);
             assert_eq!(manifest["colors"][0]["occurrences"], total);
             assert_eq!(manifest["randstrobe_scheme"], zorindex::RANDSTROBE_SCHEME);
             manifest["version"] = 5.into();
+            manifest.as_object_mut().unwrap().remove("segment_length");
             manifest
                 .as_object_mut()
                 .unwrap()

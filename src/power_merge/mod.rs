@@ -14,6 +14,8 @@ use anyhow::{ensure, Context, Result};
 use clap::{Args, ValueEnum};
 pub use graph::{DegreeQueue, GraphIndex, IndexedDegreeHeap, PeelGraph, TypedPeelGraph};
 use serde::{Deserialize, Serialize};
+/// Fixed segment size for newly built merged indexes, independent of filter size.
+pub const DEFAULT_SEGMENT_LENGTH: usize = 64;
 pub use storage::{
     build, info_command, query_command, query_command_with_recovery, query_records_command,
 };
@@ -88,6 +90,9 @@ pub struct MergeArgs {
     /// Collections smaller than this use one subindex. Set 1 for the legacy layout.
     #[arg(long, default_value_t = 128)]
     pub min_subindex_documents: usize,
+    /// Maximum subindex count; promote smaller filters, never fold. Omit for unlimited.
+    #[arg(long)]
+    pub max_subindexes: Option<usize>,
     /// Keep singleton power-of-two banks, for measuring sizing independently of merging.
     #[arg(long = "merge-disabled")]
     pub disabled: bool,
@@ -117,6 +122,7 @@ impl Default for MergeArgs {
             min_saving: 0.0,
             plan_margin: 0.0,
             min_subindex_documents: 128,
+            max_subindexes: None,
             disabled: false,
             drop_abandoned: false,
             disk_backed: false,
@@ -141,10 +147,16 @@ pub struct BuildConfig {
     pub feature_config: FeatureConfig,
     pub slot_scale: f64,
     pub minimum_slots: Option<usize>,
+    /// Fixed segment size. None is retained for legacy library/layout fixtures.
+    pub segment_length: Option<usize>,
     pub merge: MergeArgs,
 }
 impl BuildConfig {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.merge.max_subindexes != Some(0),
+            "--max-subindexes must be positive"
+        );
         ensure!(
             self.merge.min_subindex_documents > 0,
             "--min-subindex-documents must be positive"
@@ -198,6 +210,11 @@ impl BuildConfig {
             self.slot_scale.is_finite() && self.slot_scale > 0.0,
             "invalid slot scale"
         );
+        ensure!(
+            self.segment_length
+                .is_none_or(|n| n.is_power_of_two() && n <= 4096),
+            "segment length must be a power of two in 1..=4096"
+        );
         Ok(())
     }
     pub fn width(&self, colors: usize) -> usize {
@@ -211,7 +228,13 @@ impl BuildConfig {
         );
         let needed = (needed as usize)
             .max(self.minimum_slots.unwrap_or(0))
-            .max(self.hashes.next_power_of_two());
+            .max(self.hashes.next_power_of_two())
+            .max(
+                self.segment_length
+                    .unwrap_or(1)
+                    .checked_mul(self.hashes.next_power_of_two())
+                    .context("segment geometry overflow")?,
+            );
         needed
             .checked_next_power_of_two()
             .context("power-of-two capacity overflow")

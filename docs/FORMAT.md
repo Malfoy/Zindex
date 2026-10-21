@@ -134,7 +134,7 @@ count each color at most once per feature.
 Zindex builds a new merged directory by default, regardless of the output
 extension. `--plain` selects the legacy single-file `.zoridx` layout;
 `--power-of-two-merge` remains an optional compatibility flag.
-`manifest.json` contains version `5` (or `6` for downstream randstrobemers), feature/hash settings, dataset identities,
+`manifest.json` contains version `8`, feature/hash settings, dataset identities,
 group members and widths, bank sizes and abandoned-key map metadata.
 Version 4 adds `minimizer_scheme` (`simd` or `open-closed-mod`) and
 `homopolymer_compression` (boolean). These govern both construction and queries.
@@ -152,7 +152,13 @@ first-minimum tie breaking, self-pair fallback and the paper's symmetric
 `h1/2+h2/2` full-seed key. Query orientations are scored independently and
 combined by per-document maximum per record. Missing or unknown extraction
 identities on randstrobemer indexes require rebuilding. Bank payloads and the
-abandoned-key map are unchanged. Non-randstrobemer indexes remain version 5.
+abandoned-key membership semantics are unchanged. Version 7 changes the lossless
+recovery-file encoding, not bank payloads or feature extraction.
+Version 8 adds `segment_length`: one fixed power-of-two segment size for every
+filter/subindex, default 64 cells, independent of filter capacity. Array sizes
+remain powers of two and must fit at least `hashes` complete segments. Queries
+use this stored size. Versions 1 through 7 retain their historical size-dependent
+position mapping; changing a version number alone does not convert an index.
 
 Each `bank-<exponent>.zorbank.zst` expands to magic `ZORPOW3\0`, followed by
 four little-endian `u64` values: slots, bits per row, group count and data bytes.
@@ -187,13 +193,17 @@ capacity may change which absent keys are false positives. Setting the minimum
 to 1 preserves the old layout. Queries fuse row XOR and fingerprint comparison
 in registers where supported; this is an execution change, not a format change.
 
-`abandoned.zormap.zst` expands to magic `ZORABN1\0`, followed by records:
-32-bit abandoned-key hash, 32-bit origin count, then that many 32-bit origin IDs.
-All integers are little-endian. This is one global multimap across all banks;
+`abandoned.zormap.zst` expands to magic `ZORABN2\0`, followed by records:
+the delta from the previous 32-bit hash (initially zero), the origin count,
+then the ascending origin IDs delta-coded from zero within each record.
+Integers use unsigned base-128 variable-length encoding (at most five bytes
+per u32). No hash or origin bits are discarded. The reader also accepts the
+legacy `ZORABN1\0` stream: little-endian u32 hash, count and origin IDs.
+This is one global multimap across all banks;
 32-bit hash collisions union origin lists. It is omitted with `--drop-abandoned`.
 
-The current reader also supports manifest versions 1, 2, 3 and 4 and their legacy
+The current reader also supports manifest versions 1 through 7 and their legacy
 `ZORPOW1\0` interleaved banks. Version-1 per-group abandoned-key records are
 converted to the global 32-bit-hash multimap on load. Older readers cannot read
-new version-5 directories. Merged directories currently cannot be appended or
+new version-8 directories. Merged directories currently cannot be appended or
 repacked; rebuilding requires the complete input list.
