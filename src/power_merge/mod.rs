@@ -19,6 +19,7 @@ pub const DEFAULT_SEGMENT_LENGTH: usize = 64;
 pub use storage::{
     build, info_command, query_command, query_command_with_recovery, query_records_command,
 };
+mod memory;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -110,6 +111,13 @@ pub struct MergeArgs {
         require_equals = true, default_missing_value = "true", default_value_t = true,
         conflicts_with_all = ["plain", "disk_backed"])]
     pub low_disk: bool,
+
+    /// Estimated concurrent build-workspace budget in GiB. Default: 80% of
+    /// available RAM (including visible cgroup limits). Oversized jobs run alone.
+    /// This is admission control, not an RSS cap; retained filters/recovery and
+    /// a single oversized genome still need enough memory. No external sorting.
+    #[arg(long)]
+    pub build_memory_gib: Option<f64>,
 }
 impl Default for MergeArgs {
     fn default() -> Self {
@@ -127,6 +135,7 @@ impl Default for MergeArgs {
             drop_abandoned: false,
             disk_backed: false,
             low_disk: true,
+            build_memory_gib: None,
         }
     }
 }
@@ -153,6 +162,12 @@ pub struct BuildConfig {
 }
 impl BuildConfig {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.merge
+                .build_memory_gib
+                .is_none_or(|v| v.is_finite() && v > 0.0 && v * 1073741824.0 < u64::MAX as f64),
+            "--build-memory-gib must be a positive finite GiB value"
+        );
         ensure!(
             self.merge.max_subindexes != Some(0),
             "--max-subindexes must be positive"

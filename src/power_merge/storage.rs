@@ -426,6 +426,13 @@ pub fn build(
     if config.merge.disk_backed || !config.merge.low_disk {
         fs::create_dir(stage.0.join("cells"))?;
     }
+    let input_costs = inputs
+        .par_iter()
+        .map(|input| super::memory::input_estimate(&input.path))
+        .collect::<Result<Vec<_>>>()?;
+    let extraction_budget = super::memory::budget(config.merge.build_memory_gib);
+    eprintln!("build workspace admission: extraction budget={} bytes, workers={}; estimates, not an RSS cap; oversized jobs run alone",
+        extraction_budget, rayon::current_num_threads());
     eprintln!(
         "sketching {} datasets with {} SimdSketch buckets (8-bit fingerprints, 32-bit union minima)",
         inputs.len(),
@@ -442,9 +449,11 @@ pub fn build(
     // results into the planner in FOF order. Idle threads take the oldest queued task first, so they parse while
     // this thread plans, and the planner's own parallel scans split onto the same pool when it is free.
     rayon::scope(|_| {
-        pull_jobs(
+        pull_jobs_budgeted(
             &inputs,
             PLANNER_LOOKAHEAD,
+            &input_costs,
+            extraction_budget,
             |id, input| {
                 let mut keys = Vec::new();
                 let mut occurrences = 0;
@@ -542,10 +551,18 @@ pub fn build(
     let mut built = Vec::new();
     let rejected_groups = 0;
     let mut exact_group_verifications = 0;
-    // All groups are queued at once; the pool builds them `--threads` at a time in plan order.
-    pull_jobs(
+    let group_costs = planned
+        .iter()
+        .map(|group| group_workspace(group, &colors, &input_costs, &config, 0))
+        .collect::<Result<Vec<_>>>()?;
+    let construction_budget = super::memory::budget(config.merge.build_memory_gib);
+    eprintln!("build workspace admission: construction budget={} bytes, workers={}; completed RAM filters/recovery are additional",
+        construction_budget, rayon::current_num_threads());
+    pull_jobs_budgeted(
         &planned,
         usize::MAX,
+        &group_costs,
+        construction_budget,
         |_, group| {
             if config.merge.disk_backed {
                 build_group(group, &stage.0, &config, &graph)
@@ -573,6 +590,8 @@ pub fn build(
         &inputs,
         &colors,
         &input_signatures,
+        &input_costs,
+        &stage.0,
         &config,
         &graph,
     )?;
@@ -672,21 +691,67 @@ const PLANNER_LOOKAHEAD: usize = 1024;
 /// calling thread, keeping at most `in_flight` items started but not yet consumed. The pool runs the tasks in item
 /// order, as many at a time as it has threads, so one slow item never idles the others, and parallel work inside
 /// `consume` (the planner) shares those same threads. Nothing more is started after the first error.
+#[cfg(test)]
 fn pull_jobs<T: Sync, R: Send>(
     items: &[T],
     in_flight: usize,
     work: impl Fn(usize, &T) -> Result<R> + Sync,
+    consume: impl FnMut(usize, R) -> Result<()>,
+) -> Result<()> {
+    pull_jobs_budgeted(
+        items,
+        in_flight,
+        &vec![0; items.len()],
+        u64::MAX,
+        work,
+        consume,
+    )
+}
+
+fn pull_jobs_budgeted<T: Sync, R: Send>(
+    items: &[T],
+    in_flight: usize,
+    estimates: &[u64],
+    budget: u64,
+    work: impl Fn(usize, &T) -> Result<R> + Sync,
     mut consume: impl FnMut(usize, R) -> Result<()>,
 ) -> Result<()> {
+    ensure!(
+        in_flight > 0 && budget > 0 && estimates.len() == items.len(),
+        "invalid admission limits"
+    );
     let failed = AtomicBool::new(false);
     let (tx, rx) = mpsc::channel();
     rayon::in_place_scope(|scope| {
         let mut started = 0;
+        let mut reserved = 0u64;
+        let mut oversized_warnings = 0;
         // Results arrive in completion order; hold them until their predecessors are consumed.
         let mut pending = BTreeMap::new();
         let outcome = (0..items.len()).try_for_each(|next| {
             while started < items.len().min(next.saturating_add(in_flight)) {
                 let i = started;
+                let estimate = estimates[i];
+                // Admission events also account for retained recovery/filter
+                // buffers and other processes consuming RAM since stage start.
+                // No timer or monitor thread is involved.
+                let limit = if estimate == 0 {
+                    budget
+                } else {
+                    super::memory::available_bytes()
+                        .map(|n| budget.min(n.saturating_mul(4) / 5))
+                        .unwrap_or(budget)
+                };
+                // Reserve before spawning, never block a Rayon worker on a
+                // semaphore: the same pool may be needed to finish active jobs.
+                if started != next && (reserved > limit || estimate > limit.saturating_sub(reserved)) {
+                    break;
+                }
+                if estimate > limit && oversized_warnings < 8 {
+                    eprintln!("build workspace: job {i} estimate={estimate} exceeds admission budget={limit}; running it alone (single-job memory is not capped)");
+                    oversized_warnings += 1;
+                }
+                reserved = reserved.saturating_add(estimate);
                 let (tx, failed, work) = (tx.clone(), &failed, &work);
                 scope.spawn(move |_| {
                     if failed.load(Ordering::Relaxed) {
@@ -708,13 +773,54 @@ fn pull_jobs<T: Sync, R: Send>(
                 };
                 pending.insert(i, result?);
             }
-            consume(next, pending.remove(&next).unwrap())
+            consume(next, pending.remove(&next).unwrap())?;
+            reserved = reserved.saturating_sub(estimates[next]);
+            Ok(())
         });
         if outcome.is_err() {
             failed.store(true, Ordering::Relaxed);
         }
         outcome
     })
+}
+
+fn group_workspace(
+    group: &planner::Group,
+    colors: &[Color],
+    input_costs: &[u64],
+    config: &BuildConfig,
+    slot_floor: usize,
+) -> Result<u64> {
+    let sum = group.members.iter().fold(0usize, |sum, &id| {
+        sum.saturating_add(colors[id].unique_kmers)
+    });
+    let largest = group
+        .members
+        .iter()
+        .map(|&id| colors[id].unique_kmers)
+        .max()
+        .unwrap_or(0);
+    // The exact union is not available until extraction. Allow a full extra
+    // capacity doubling over the sketch plan, bounded by exact input counts.
+    let features = sum.min(group.slots.saturating_mul(2)).max(largest);
+    let slots = config.slots(features as f64)?.max(slot_floor);
+    let input_peak = group
+        .members
+        .iter()
+        .map(|&id| {
+            // Include actual first-pass occurrence count (before dedup), not just
+            // compressed size, for highly repetitive genomes.
+            input_costs[id].max(colors[id].occurrences.saturating_mul(16))
+        })
+        .max()
+        .unwrap_or(0);
+    Ok(super::memory::group_estimate(
+        features,
+        slots,
+        config.hashes,
+        group.width,
+        input_peak,
+    ))
 }
 
 fn union_features(group: &planner::Group, stage: &Path) -> Result<(Vec<u64>, Vec<u64>)> {
@@ -975,6 +1081,8 @@ fn promote_small_subindexes(
     inputs: &[ColorInput],
     colors: &[Color],
     signatures: &[u64],
+    input_costs: &[u64],
+    stage: &Path,
     config: &BuildConfig,
     graph: &(impl Fn(&[u64], usize) -> Result<PeelGraph> + Sync),
 ) -> Result<usize> {
@@ -1010,18 +1118,38 @@ fn promote_small_subindexes(
         .map(|group| (group.members[0], group))
         .collect();
     eprintln!("subindex layout: {} original size buckets -> {} subindexes, minimum={}, maximum={:?}, rebuilding {} promoted groups without temporary files", buckets.len(), targets.iter().collect::<std::collections::BTreeSet<_>>().len(), config.merge.min_subindex_documents, config.merge.max_subindexes, promoted);
-    built.par_iter_mut().try_for_each(|old| -> Result<()> {
-        let slots = mapping[&old.slots];
-        if slots == old.slots {
-            return Ok(());
-        }
-        let group = plans[&old.meta.members[0]];
-        let (keys, values) = union_input_features(group, inputs, colors, signatures, config)?;
-        let (new, _) = construct_group(group, keys, values, None, config, graph, Some(slots))?;
-        let previous = std::mem::replace(old, new);
-        previous.cells.remove()?;
-        Ok(())
-    })?;
+    let jobs: Vec<_> = built
+        .iter()
+        .enumerate()
+        .filter_map(|(id, old)| {
+            let slots = mapping[&old.slots];
+            (slots > old.slots).then(|| (id, slots, plans[&old.meta.members[0]]))
+        })
+        .collect();
+    let costs = jobs
+        .iter()
+        .map(|(_, slots, group)| group_workspace(group, colors, input_costs, config, *slots))
+        .collect::<Result<Vec<_>>>()?;
+    pull_jobs_budgeted(
+        &jobs,
+        usize::MAX,
+        &costs,
+        super::memory::budget(config.merge.build_memory_gib),
+        |_, &(id, slots, group)| {
+            let (keys, values) = union_input_features(group, inputs, colors, signatures, config)?;
+            let (mut new, _) =
+                construct_group(group, keys, values, None, config, graph, Some(slots))?;
+            if !config.merge.low_disk || config.merge.disk_backed {
+                if let CompletedCells::Packed { data, width, slots } = new.cells {
+                    let path = stage.join("cells").join(format!("promoted-{id}.bits"));
+                    fs::write(&path, &data)?;
+                    new.cells = CompletedCells::PackedDisk { path, width, slots };
+                }
+            }
+            Ok((id, new))
+        },
+        |_, (id, new)| std::mem::replace(&mut built[id], new).cells.remove(),
+    )?;
     Ok(promoted)
 }
 
@@ -2994,6 +3122,84 @@ pub fn info_command(directory: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_admission_limits_live_and_pending_results_without_deadlock() {
+        use std::sync::atomic::AtomicU64;
+        let items = [4u64, 6, 20, 3, 7, 1, 9, 2];
+        for threads in [1, 4] {
+            let live = AtomicU64::new(0);
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            struct Reservation<'a> {
+                bytes: u64,
+                live: &'a AtomicU64,
+            }
+            impl Drop for Reservation<'_> {
+                fn drop(&mut self) {
+                    self.live.fetch_sub(self.bytes, Ordering::SeqCst);
+                }
+            }
+            let mut order = Vec::new();
+            pool.install(|| {
+                pull_jobs_budgeted(
+                    &items,
+                    usize::MAX,
+                    &items,
+                    10,
+                    |id, &bytes| {
+                        let previous = live.fetch_add(bytes, Ordering::SeqCst);
+                        assert!(if bytes > 10 {
+                            previous == 0
+                        } else {
+                            previous + bytes <= 10
+                        });
+                        if id % 2 == 0 {
+                            std::thread::yield_now();
+                        }
+                        Ok(Reservation { bytes, live: &live })
+                    },
+                    |id, value| {
+                        order.push(id);
+                        drop(value);
+                        Ok(())
+                    },
+                )
+            })
+            .unwrap();
+            assert_eq!(order, (0..items.len()).collect::<Vec<_>>());
+            assert_eq!(live.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn workspace_admission_releases_results_when_worker_or_consumer_fails() {
+        for fail_worker in [true, false] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .unwrap();
+            let result = pool.install(|| {
+                pull_jobs_budgeted(
+                    &[0, 1, 2, 3],
+                    4,
+                    &[4, 4, 11, 4],
+                    8,
+                    |id, _| {
+                        ensure!(id != 2 || !fail_worker, "worker failed");
+                        Ok(id)
+                    },
+                    |id, _| {
+                        ensure!(id != 2 || fail_worker, "consumer failed");
+                        Ok(())
+                    },
+                )
+            });
+            assert!(result.is_err());
+        }
+    }
 
     #[test]
     fn task_pipeline_preserves_input_order_with_one_or_multiple_workers() {

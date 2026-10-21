@@ -132,7 +132,7 @@ impl PeelGraph {
         }
     }
     pub fn dropped(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..self.dropped_len()).map(|i| match self {
+        (0..self.dropped_len()).map(move |i| match self {
             Self::Compact(g) => g.dropped[i] as usize,
             Self::Wide(g) => g.dropped[i],
         })
