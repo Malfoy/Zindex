@@ -556,12 +556,25 @@ The existing compression-aware column ordering is preserved using exactly the
 same cell samples. Bank packing uses bounded row tiles and writes directly to
 zstd; completed banks are released from RAM. The atomic publication directory
 contains only the final index files. Both passes run as tasks on the
-`--threads` rayon pool, which is the only concurrency setting. Parsing and
+`--threads` rayon pool. Parsing and
 planning overlap: one pool thread inserts each parsed dataset into the
 streaming planner, in input order, while the other threads parse the datasets
 queued ahead of it, and the planner's own candidate scans use the same pool.
-At most 1024 datasets are parsed ahead of the planner, so the slower side sets
-the pace and memory stays bounded. Nothing is split by hand.
+At most 1024 datasets are parsed ahead of the planner. Admission also limits
+the total estimated workspace of outstanding extraction and construction jobs.
+The default budget is 80% of available RAM at each stage, respecting visible
+cgroup-v2 limits; override it with `--build-memory-gib N`. The worker pool still
+uses every requested thread. Large jobs reduce concurrent group admission rather
+than blocking worker threads on a memory semaphore. Plans, member order, feature
+sets, fingerprints and recovery are unchanged.
+
+This is estimated workspace admission, **not a hard RSS cap**. Compressed-size
+estimates cannot predict every repetitive input; second-pass estimates also use
+the observed occurrence/unique counts and planned graph geometry. An oversized
+single job runs alone with a warning. Completed RAM filters and accumulated
+recovery records remain additional memory costs; use `--low-disk=false` for large
+collections. Feature vectors are still sorted/deduplicated in memory, with no
+external sorting.
 
 `--low-disk` explicitly selects the default scratch-free mode. To trade RAM for
 scratch disk, use `--low-disk=false`: completed filters are staged as packed cell
@@ -712,4 +725,8 @@ International Symposium on Experimental Algorithms (SEA 2026), LIPIcs 371,
 24:1-24:17, 2026. DOI:
 [10.4230/LIPIcs.SEA.2026.24](https://doi.org/10.4230/LIPIcs.SEA.2026.24).
 
-Compression applies to construction inputs and queries, including findere. Use the appropriate compression suffix; decoding errors are returned. Compressed construction inputs are decoded into memory before feature parsing.
+Compression applies to construction inputs and queries, including findere. Use
+the appropriate compression suffix; decoding errors are returned. Compressed
+feature extraction streams gzip, zstd, xz and bzip2 through the same FASTA/FASTQ
+parser instead of inflating the entire file first. Parser buffers can still grow
+for a long individual record, and extracted feature vectors remain in memory.

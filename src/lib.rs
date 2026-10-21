@@ -1,11 +1,12 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{ensure, Context, Result};
 use clap::ValueEnum;
 use deko::read::AnyDecoder;
-use helicase::input::{FromMmap, FromSlice};
+use helicase::input::{FromMmap, FromReader};
 use helicase::{Config, FastxParser, HelicaseParser, ParserOptions};
 use simd_minimizers::packed_seq::{PackedSeqVec, SeqVec};
 
@@ -231,6 +232,47 @@ pub struct FastxStats {
     pub chunks: u64,
 }
 
+// Helicase's streaming reader panics on Read errors. Decode here and retain the
+// original error while presenting EOF to the parser, then return it as Result.
+// This also checks the compression trailer instead of accepting a damaged tail.
+struct CheckedSequenceReader<R: Read> {
+    decoder: AnyDecoder<R>,
+    error: Arc<Mutex<Option<std::io::Error>>>,
+}
+impl<R: Read> Read for CheckedSequenceReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if self.error.lock().unwrap().is_some() {
+            return Ok(0);
+        }
+        loop {
+            match self.decoder.read(output) {
+                Ok(n) => return Ok(n),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    *self.error.lock().unwrap() = Some(error);
+                    return Ok(0);
+                }
+            }
+        }
+    }
+}
+
+fn with_streaming_parser<R: Read + Send + 'static, T>(
+    reader: R,
+    visit: impl FnOnce(FastxParser<'static, PARSER_CONFIG>) -> Result<T>,
+) -> Result<T> {
+    let error = Arc::new(Mutex::new(None));
+    let parser = FastxParser::from_reader(CheckedSequenceReader {
+        decoder: AnyDecoder::new(reader),
+        error: Arc::clone(&error),
+    });
+    let result = parser.map_err(anyhow::Error::from).and_then(visit);
+    if let Some(error) = error.lock().unwrap().take() {
+        return Err(error).context("reading/decompressing sequence stream");
+    }
+    result
+}
+
 pub fn read_fof(path: &Path) -> Result<Vec<ColorInput>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -337,20 +379,28 @@ where
     if is_compressed_path(path) {
         let file =
             File::open(path).with_context(|| format!("unable to open {}", path.display()))?;
-        let mut decoder = AnyDecoder::new(file);
-        let mut data = Vec::new();
-        decoder
-            .read_to_end(&mut data)
-            .with_context(|| format!("decompressing {}", path.display()))?;
-        ensure!(!data.is_empty(), "{} is empty", path.display());
-        let parser = FastxParser::<PARSER_CONFIG>::from_slice(&data)
-            .with_context(|| format!("parsing {}", path.display()))?;
-        return parse_features_from_parser(parser, k, seed, feature_config, on_feature);
+        return parse_features_from_reader(file, k, seed, feature_config, on_feature)
+            .with_context(|| format!("parsing compressed {}", path.display()));
     }
 
     let parser = FastxParser::<PARSER_CONFIG>::from_file_mmap(path)
         .with_context(|| format!("unable to mmap {}", path.display()))?;
     parse_features_from_parser(parser, k, seed, feature_config, on_feature)
+}
+
+/// Stream compressed or plain FASTA/FASTQ without retaining the entire input.
+/// Record/ambiguity boundaries are handled by the same parser as mmap input;
+/// feature vectors and sorting remain the caller's in-memory responsibility.
+pub fn parse_features_from_reader<R: Read + Send + 'static, F: FnMut(u64)>(
+    reader: R,
+    k: usize,
+    seed: u64,
+    feature_config: FeatureConfig,
+    on_feature: F,
+) -> Result<FastxStats> {
+    with_streaming_parser(reader, |parser| {
+        parse_features_from_parser(parser, k, seed, feature_config, on_feature)
+    })
 }
 
 pub fn parse_features_from_parser<F>(
@@ -379,14 +429,22 @@ pub fn parse_sequences_from_file(
     path: &Path,
     mut on_sequence: impl FnMut(&[u8]),
 ) -> Result<FastxStats> {
-    let mut data = Vec::new();
-    let mut parser = if is_compressed_path(path) {
-        AnyDecoder::new(File::open(path)?).read_to_end(&mut data)?;
-        ensure!(!data.is_empty(), "{} is empty", path.display());
-        FastxParser::<PARSER_CONFIG>::from_slice(&data)?
-    } else {
-        FastxParser::<PARSER_CONFIG>::from_file_mmap(path)?
-    };
+    if is_compressed_path(path) {
+        return with_streaming_parser(File::open(path)?, |parser| {
+            visit_sequence_parser(parser, &mut on_sequence)
+        })
+        .with_context(|| format!("parsing compressed {}", path.display()));
+    }
+    visit_sequence_parser(
+        FastxParser::<PARSER_CONFIG>::from_file_mmap(path)?,
+        &mut on_sequence,
+    )
+}
+
+fn visit_sequence_parser(
+    mut parser: FastxParser<'_, PARSER_CONFIG>,
+    on_sequence: &mut impl FnMut(&[u8]),
+) -> Result<FastxStats> {
     let mut stats = FastxStats::default();
     while parser.next().is_some() {
         let seq = parser.get_dna_string();
@@ -982,5 +1040,167 @@ mod tests {
         reader.read_to_end(&mut decoded).unwrap();
         assert_eq!(decoded, b"raw-index-payload");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn streaming_features_match_slice_across_refills_records_ambiguities_and_modes() {
+        use deko::{
+            write::{AnyEncoder, Compression},
+            Format,
+        };
+        use helicase::input::FromSlice;
+        use std::io::Cursor;
+        // Long wrapped records cross multiple decoder/parser buffer refills.
+        // Include CRLF, short records, lowercase, ambiguity and reverse strand.
+        let dna: Vec<u8> = (0..350_017)
+            .map(|i| b"ACGT"[(splitmix64(i) & 3) as usize])
+            .collect();
+        let mut fasta = b">long\r\n".to_vec();
+        for line in dna.chunks(79) {
+            fasta.extend_from_slice(line);
+            fasta.extend_from_slice(b"\r\n");
+        }
+        fasta.extend_from_slice(b">short\nACGTNacgtNNAA\n>ambiguous\n");
+        fasta.extend_from_slice(&dna[..100_019]);
+        fasta.extend_from_slice(b"NNN");
+        fasta.extend_from_slice(&reverse_complement(&dna[..85_021]));
+        fasta.extend_from_slice(b"\n");
+        let streams: Vec<_> = [
+            Format::Verbatim,
+            Format::Gz,
+            Format::Zstd,
+            Format::Xz,
+            Format::Bz,
+        ]
+        .into_iter()
+        .map(|format| {
+            let mut encoder = AnyEncoder::new(Vec::new(), format, Compression::Default).unwrap();
+            encoder.write_all(&fasta).unwrap();
+            encoder.finish().unwrap()
+        })
+        .collect();
+        for mode in [
+            IndexMode::Kmers,
+            IndexMode::Minimizers,
+            IndexMode::Modimizers,
+            IndexMode::Findere,
+        ] {
+            for scheme in [MinimizerScheme::Simd, MinimizerScheme::OpenClosedMod] {
+                let config = FeatureConfig::new(mode, 21, 7).with_minimizer_scheme(scheme);
+                let mut expected = Vec::new();
+                let before = parse_features_from_parser(
+                    FastxParser::from_slice(&fasta).unwrap(),
+                    31,
+                    69,
+                    config,
+                    |key| expected.push(key),
+                )
+                .unwrap();
+                for stream in &streams {
+                    let mut actual = Vec::new();
+                    let after = parse_features_from_reader(
+                        Cursor::new(stream.clone()),
+                        31,
+                        69,
+                        config,
+                        |key| actual.push(key),
+                    )
+                    .unwrap();
+                    assert_eq!(actual, expected, "{mode:?}/{scheme:?}");
+                    assert_eq!((before.bases, before.chunks), (after.bases, after.chunks));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_emits_before_eof_and_returns_reader_errors() {
+        use std::io::{self, Cursor};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let consumed = Arc::new(AtomicUsize::new(0));
+        struct Reader {
+            bytes: Cursor<Vec<u8>>,
+            consumed: Arc<AtomicUsize>,
+        }
+        impl Read for Reader {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                let n = self.bytes.read(out)?;
+                self.consumed.fetch_add(n, Ordering::SeqCst);
+                Ok(n)
+            }
+        }
+        let fasta = b">record\nACGTTGCAACGTTGCANN\n".repeat(100_000);
+        let total = fasta.len();
+        let mut early = false;
+        parse_features_from_reader(
+            Reader {
+                bytes: Cursor::new(fasta),
+                consumed: Arc::clone(&consumed),
+            },
+            7,
+            69,
+            FeatureConfig::legacy_kmers(),
+            |_| {
+                early |= consumed.load(Ordering::SeqCst) < total;
+            },
+        )
+        .unwrap();
+        assert!(
+            early,
+            "must emit features without decoding the entire file first"
+        );
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("injected decoder failure"))
+            }
+        }
+        let error =
+            parse_features_from_reader(Broken, 7, 69, FeatureConfig::legacy_kmers(), |_| {})
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("injected decoder failure"));
+    }
+
+    #[test]
+    fn streaming_fastq_and_corrupt_gzip_tail() {
+        use deko::{
+            write::{AnyEncoder, Compression},
+            Format,
+        };
+        use helicase::input::FromSlice;
+        use std::io::Cursor;
+        let dna: Vec<u8> = (0..180_101)
+            .map(|i| b"ACGT"[(splitmix64(i ^ 42) & 3) as usize])
+            .collect();
+        let mut fastq = b"@long\n".to_vec();
+        fastq.extend_from_slice(&dna);
+        fastq.extend_from_slice(b"\n+\n");
+        fastq.extend(std::iter::repeat_n(b'@', dna.len()));
+        fastq.extend_from_slice(b"\n@short\nACGTNNacgtACGT\n+\nIIIIIIIIIIIIII\n");
+        let config = FeatureConfig::new(IndexMode::Minimizers, 31, 1)
+            .with_minimizer_scheme(MinimizerScheme::OpenClosedMod);
+        let mut expected = Vec::new();
+        parse_features_from_parser(
+            FastxParser::from_slice(&fastq).unwrap(),
+            49,
+            69,
+            config,
+            |key| expected.push(key),
+        )
+        .unwrap();
+        let mut encoder = AnyEncoder::new(Vec::new(), Format::Gz, Compression::Default).unwrap();
+        encoder.write_all(&fastq).unwrap();
+        let mut compressed = encoder.finish().unwrap();
+        let mut actual = Vec::new();
+        parse_features_from_reader(Cursor::new(compressed.clone()), 49, 69, config, |key| {
+            actual.push(key)
+        })
+        .unwrap();
+        assert_eq!(actual, expected);
+        let last = compressed.len() - 1;
+        compressed[last] ^= 0x80;
+        assert!(
+            parse_features_from_reader(Cursor::new(compressed), 49, 69, config, |_| {}).is_err()
+        );
     }
 }
