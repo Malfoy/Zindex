@@ -853,8 +853,17 @@ fn all_cell_storage_modes_build_identical_filters_and_queries() {
                     )
                     .unwrap();
                     assert_eq!(json["construction_cell_storage"], storage);
+                    assert_eq!(
+                        json["construction_abandoned_storage"],
+                        if mode.is_some() {
+                            "temporary-disk-sorted-runs"
+                        } else {
+                            "memory"
+                        }
+                    );
                     for key in [
                         "construction_cell_storage",
+                        "construction_abandoned_storage",
                         "sketch_seconds",
                         "plan_seconds",
                         "build_seconds",

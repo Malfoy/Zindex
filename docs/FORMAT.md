@@ -178,6 +178,14 @@ publication directory contains only final index files. First-pass projected
 capacities may differ from exact final capacities; this does not change the
 planned dataset membership partition.
 
+New builds also record `construction_abandoned_storage`: `memory`,
+`temporary-disk-sorted-runs`, or `omitted`. Missing legacy metadata means the
+older in-RAM construction behavior. Both disk construction modes now stage
+abandoned-key records as sorted temporary runs and use a bounded external merge;
+the published `ZORABN2` file, 32-bit hashes, origin unions and query behavior are
+unchanged. Temporary run records contain little-endian `(u32 hash, u32 group ID,
+u64 origin mask)`, and are never part of the published index.
+
 The optional manifest metadata `min_subindex_documents` records the build's
 minimum original-document count per bank (new default 128, missing legacy
 field defaults to 1). `promoted_groups` records filters rebuilt at a larger

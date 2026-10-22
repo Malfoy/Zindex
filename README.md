@@ -593,15 +593,20 @@ sets, fingerprints and recovery are unchanged.
 This is estimated workspace admission, **not a hard RSS cap**. Compressed-size
 estimates cannot predict every repetitive input; second-pass estimates also use
 the observed occurrence/unique counts and planned graph geometry. An oversized
-single job runs alone with a warning. Completed RAM filters and accumulated
-recovery records remain additional memory costs; use `--low-disk=false` for large
-collections. Feature vectors are still sorted/deduplicated in memory, with no
-external sorting.
+single job runs alone with a warning. In RAM mode, completed filters and accumulated
+abandoned-key records remain additional memory costs. In disk mode both are staged
+to disk. Feature vectors are still sorted/deduplicated in memory; external sorting
+is used only for staged abandoned-key records, never for extracted input features.
 
 `--low-disk` explicitly selects the default scratch-free mode. To trade RAM for
 scratch disk, use `--low-disk=false`: completed filters are staged as packed cell
-files next to the output and removed after bank compression. `--disk-backed`
-selects the previous single-extraction builder, using temporary `u64` feature
+files and abandoned keys as sorted hash/group/origin-mask runs next to the output.
+Each active job uses at most 65,536 records (1 MiB) for abandoned-key sorting.
+A bounded-fan-in external merge writes the same single global abandoned-key map
+without retaining the collection's records in RAM. Even pathological hash collisions
+keep at most a collection-sized origin list, rather than one entry per abandoned key.
+Staged files are removed after use; promoted filters follow the same storage policy.
+`--disk-backed` also stages abandoned keys, alongside its temporary `u64` feature
 and cell caches followed by tiled bank packing. All modes produce identical bank files and the same global
 abandoned-key map for unchanged inputs, settings and column order; only
 construction metadata and timings differ.

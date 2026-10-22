@@ -109,6 +109,8 @@ struct Manifest {
     merge_reverts_enabled: bool,
     #[serde(default = "legacy_cell_storage")]
     construction_cell_storage: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    construction_abandoned_storage: Option<String>,
     slot_scale: f64,
     #[serde(default = "legacy_min_subindex_documents")]
     min_subindex_documents: usize,
@@ -173,6 +175,17 @@ struct BuiltGroup {
     // Construction-only 32-bit hashes and origin masks. Converted to the single
     // global dataset multimap before publication, never consulted during queries.
     fallback: Vec<(u32, u64)>,
+    fallback_path: Option<PathBuf>,
+}
+
+impl BuiltGroup {
+    fn discard(self) -> Result<()> {
+        self.cells.remove()?;
+        if let Some(path) = self.fallback_path {
+            fs::remove_file(path)?;
+        }
+        Ok(())
+    }
 }
 
 enum CompletedCells {
@@ -425,6 +438,9 @@ pub fn build(
     }
     if config.merge.disk_backed || !config.merge.low_disk {
         fs::create_dir(stage.0.join("cells"))?;
+        if !config.merge.drop_abandoned {
+            fs::create_dir(stage.0.join("abandoned"))?;
+        }
     }
     let input_costs = inputs
         .par_iter()
@@ -546,7 +562,7 @@ pub fn build(
     if !config.merge.disk_backed && config.merge.low_disk {
         eprintln!("two-pass construction: projected {} power-of-two banks, {} logical bits; rereading inputs, no temporary key/cell files; completed filters stay bit-packed in RAM", projected_banks, predicted_logical_bits);
     } else if !config.merge.disk_backed {
-        eprintln!("two-pass construction: projected {} power-of-two banks, {} logical bits; rereading inputs, completed filters staged bit-packed on disk", projected_banks, predicted_logical_bits);
+        eprintln!("two-pass construction: projected {} power-of-two banks, {} logical bits; rereading inputs, completed filters and abandoned keys staged on disk", projected_banks, predicted_logical_bits);
     }
     let mut built = Vec::new();
     let rejected_groups = 0;
@@ -556,8 +572,8 @@ pub fn build(
         .map(|group| group_workspace(group, &colors, &input_costs, &config, 0))
         .collect::<Result<Vec<_>>>()?;
     let construction_budget = super::memory::budget(config.merge.build_memory_gib);
-    eprintln!("build workspace admission: construction budget={} bytes, workers={}; completed RAM filters/recovery are additional",
-        construction_budget, rayon::current_num_threads());
+    eprintln!("build workspace admission: construction budget={} bytes, workers={}; completed filters and abandoned keys retained in {}",
+        construction_budget, rayon::current_num_threads(), if config.merge.low_disk && !config.merge.disk_backed { "RAM (additional to workspace)" } else { "temporary disk files" });
     pull_jobs_budgeted(
         &planned,
         usize::MAX,
@@ -611,6 +627,9 @@ pub fn build(
     }
     if config.merge.disk_backed || !config.merge.low_disk {
         fs::remove_dir(stage.0.join("cells"))?;
+        if !config.merge.drop_abandoned {
+            fs::remove_dir(stage.0.join("abandoned"))?;
+        }
     }
     let mut manifest = Manifest {
         version: if config.segment_length.is_some() { 8 } else { 7 },
@@ -651,6 +670,13 @@ pub fn build(
             "two-pass-temporary-disk-packed-tiled-packing"
         }
         .into(),
+        construction_abandoned_storage: Some(if config.merge.drop_abandoned {
+            "omitted"
+        } else if config.merge.low_disk && !config.merge.disk_backed {
+            "memory"
+        } else {
+            "temporary-disk-sorted-runs"
+        }.into()),
         slot_scale: config.slot_scale,
         min_subindex_documents: config.merge.min_subindex_documents,
         max_subindexes: config.merge.max_subindexes,
@@ -985,30 +1011,46 @@ fn construct_group(
     let cells = peeled.assign_verified_narrow(&keys, &values, slots, config.hashes, group.width)?;
     // Recover all dropped origins, including when the unconstrained cells happen
     // to match a fingerprint. Recovery adds hits; it never replaces filter hits.
-    let fallback: Vec<_> = if config.merge.drop_abandoned {
-        Vec::new()
-    } else {
-        peeled
-            .dropped()
-            .map(|edge| {
-                (
-                    abandoned::hash(keys[edge], config.seed),
-                    if group.members.len() == 1 {
-                        1
-                    } else {
-                        values[edge] >> config.fingerprint_bits
-                    },
-                )
-            })
-            .collect()
-    };
     let dropped_len = peeled.dropped_len();
+    let mut fallback_path = None;
+    let mut fallback = Vec::new();
+    if !config.merge.drop_abandoned {
+        let records = peeled.dropped().map(|edge| {
+            (
+                abandoned::hash(keys[edge], config.seed),
+                if group.members.len() == 1 {
+                    1
+                } else {
+                    values[edge] >> config.fingerprint_bits
+                },
+            )
+        });
+        if let Some(stage) = cache_stage {
+            if dropped_len != 0 {
+                let path = stage
+                    .join("abandoned")
+                    .join(format!("{}-{slots}.records", group.members[0]));
+                let id = u32::try_from(group.members[0]).context("group ID exceeds 32 bits")?;
+                super::staged_abandoned::write_sorted(
+                    &path,
+                    records.map(|(hash, mask)| (hash, id, mask)),
+                )?;
+                fallback_path = Some(path);
+            }
+        } else {
+            fallback.extend(records);
+        }
+    }
     let meta = GroupMeta {
         members: group.members.clone(),
         width: group.width,
         offset: 0,
         union_cardinality: keys.len(),
-        fallback_keys: fallback.len(),
+        fallback_keys: if config.merge.drop_abandoned {
+            0
+        } else {
+            dropped_len
+        },
         abandoned_keys: Some(dropped_len),
     };
     let verified = (keys.len()
@@ -1031,9 +1073,10 @@ fn construct_group(
     ) -> Result<CompletedCells> {
         Ok(match cache_stage {
             Some(stage) if config.merge.disk_backed => {
-                let path = stage
-                    .join("cells")
-                    .join(format!("{}.u64", group.members[0]));
+                let path =
+                    stage
+                        .join("cells")
+                        .join(format!("{}-{}.u64", group.members[0], cells.len()));
                 cache_write_values(&path, cells)?;
                 CompletedCells::Disk(path)
             }
@@ -1042,7 +1085,7 @@ fn construct_group(
                 group.width,
                 stage
                     .join("cells")
-                    .join(format!("{}.bits", group.members[0])),
+                    .join(format!("{}-{}.bits", group.members[0], cells.len())),
             )?,
             None => CompletedCells::packed(cells, group.width)?,
         })
@@ -1067,6 +1110,7 @@ fn construct_group(
             slots,
             cells,
             fallback,
+            fallback_path,
         },
         verified,
     ))
@@ -1137,18 +1181,11 @@ fn promote_small_subindexes(
         super::memory::budget(config.merge.build_memory_gib),
         |_, &(id, slots, group)| {
             let (keys, values) = union_input_features(group, inputs, colors, signatures, config)?;
-            let (mut new, _) =
-                construct_group(group, keys, values, None, config, graph, Some(slots))?;
-            if !config.merge.low_disk || config.merge.disk_backed {
-                if let CompletedCells::Packed { data, width, slots } = new.cells {
-                    let path = stage.join("cells").join(format!("promoted-{id}.bits"));
-                    fs::write(&path, &data)?;
-                    new.cells = CompletedCells::PackedDisk { path, width, slots };
-                }
-            }
+            let cache = (config.merge.disk_backed || !config.merge.low_disk).then_some(stage);
+            let (new, _) = construct_group(group, keys, values, cache, config, graph, Some(slots))?;
             Ok((id, new))
         },
-        |_, (id, new)| std::mem::replace(&mut built[id], new).cells.remove(),
+        |_, (id, new)| std::mem::replace(&mut built[id], new).discard(),
     )?;
     Ok(promoted)
 }
@@ -1488,6 +1525,83 @@ fn save_abandoned(banks: &mut [Bank], directory: &Path) -> Result<(usize, usize)
 }
 
 fn save_abandoned_groups(groups: &mut [BuiltGroup], directory: &Path) -> Result<(usize, usize)> {
+    if groups.iter().any(|group| group.fallback_path.is_some()) {
+        ensure!(
+            groups.iter().all(|group| group.fallback.is_empty()),
+            "mixed RAM/disk abandoned-key storage"
+        );
+        let paths = groups
+            .iter_mut()
+            .filter_map(|group| group.fallback_path.take())
+            .collect();
+        let max_id = groups
+            .iter()
+            .map(|group| group.meta.members[0])
+            .max()
+            .unwrap_or(0);
+        // Only construction metadata is resident: IDs address original groups
+        // by their first member. No abandoned-key vector is materialized.
+        let mut members = vec![&[][..]; max_id + 1];
+        for group in groups.iter() {
+            members[group.meta.members[0]] = group.meta.members.as_slice();
+        }
+        let origin_limit = groups
+            .iter()
+            .map(|group| group.meta.members.len())
+            .sum::<usize>()
+            .saturating_mul(2)
+            .max(1024);
+        return write_abandoned_map(directory, |emit| {
+            let mut current = None;
+            let mut origins = Vec::new();
+            let (mut hashes, mut associations) = (0usize, 0usize);
+            let mut flush = |hash, origins: &mut Vec<u32>| -> Result<()> {
+                origins.sort_unstable();
+                origins.dedup();
+                ensure!(!origins.is_empty(), "empty abandoned membership");
+                emit(hash, origins)?;
+                hashes += 1;
+                associations = associations
+                    .checked_add(origins.len())
+                    .context("abandoned origins overflow")?;
+                origins.clear();
+                Ok(())
+            };
+            super::staged_abandoned::visit_sorted(
+                paths,
+                &directory.join("abandoned"),
+                |(hash, group, mut mask)| {
+                    if current.is_some_and(|previous| previous != hash) {
+                        flush(current.unwrap(), &mut origins)?;
+                    }
+                    current = Some(hash);
+                    let group_members = members
+                        .get(group as usize)
+                        .context("invalid abandoned group ID")?;
+                    while mask != 0 {
+                        let bit = mask.trailing_zeros() as usize;
+                        let origin = group_members
+                            .get(bit)
+                            .context("invalid abandoned membership bit")?;
+                        origins.push(u32::try_from(*origin).context("dataset ID exceeds 32 bits")?);
+                        mask &= mask - 1;
+                    }
+                    // Even a deliberately pathological single-hash collision cannot
+                    // accumulate one origin entry per abandoned key indefinitely.
+                    if origins.len() >= origin_limit {
+                        origins.sort_unstable();
+                        origins.dedup();
+                    }
+                    Ok(())
+                },
+            )?;
+            if let Some(hash) = current {
+                flush(hash, &mut origins)?;
+            }
+            ensure!(hashes <= u32::MAX as usize, "too many abandoned hashes");
+            Ok((hashes, associations))
+        });
+    }
     let mut records = Vec::with_capacity(groups.iter().map(|g| g.fallback.len()).sum());
     let mut members = Vec::with_capacity(groups.len());
     for group in groups {
@@ -1497,6 +1611,15 @@ fn save_abandoned_groups(groups: &mut [BuiltGroup], directory: &Path) -> Result<
             records.push((hash, id, mask));
         }
     }
+    write_abandoned_map(directory, |emit| {
+        visit_abandoned(&mut records, &members, emit)
+    })
+}
+
+fn write_abandoned_map(
+    directory: &Path,
+    visit: impl FnOnce(&mut dyn FnMut(u32, &[u32]) -> Result<()>) -> Result<(usize, usize)>,
+) -> Result<(usize, usize)> {
     // Buffer the uncompressed records too: entering the zstd encoder for every
     // tiny integer is expensive on hundreds of millions of abandoned hashes.
     let mut writer = BufWriter::with_capacity(
@@ -1505,7 +1628,7 @@ fn save_abandoned_groups(groups: &mut [BuiltGroup], directory: &Path) -> Result<
     );
     writer.write_all(ABANDONED_DELTA_MAGIC)?;
     let mut previous_hash = 0u32;
-    let stats = visit_abandoned(&mut records, &members, |hash, origins| {
+    let stats = visit(&mut |hash, origins| {
         write_var_u32(&mut writer, hash - previous_hash)?;
         previous_hash = hash;
         write_var_u32(
@@ -3055,6 +3178,12 @@ pub fn info_command(directory: &Path) -> Result<()> {
         m.merge_reverts_enabled
     );
     println!("construction_cell_storage\t{}", m.construction_cell_storage);
+    println!(
+        "construction_abandoned_storage\t{}",
+        m.construction_abandoned_storage
+            .as_deref()
+            .unwrap_or("legacy-memory")
+    );
     if let Some(length) = m.segment_length {
         println!("segment_length\t{length}");
     }
@@ -3382,8 +3511,121 @@ mod tests {
     }
 
     #[test]
-    fn opt_in_two_pass_stages_only_packed_cells_during_construction() {
+    fn opt_in_two_pass_stages_cells_and_abandoned_keys_during_construction() {
         two_pass_stages_only_packed_cells(false);
+    }
+
+    #[test]
+    fn disk_group_retains_no_abandoned_records_and_promotion_uses_distinct_files() {
+        let root = temporary_stage();
+        fs::create_dir(root.0.join("cells")).unwrap();
+        fs::create_dir(root.0.join("abandoned")).unwrap();
+        let config = scratch_free_config(false);
+        let keys = vec![1, 2, 3, 4, 5];
+        let group = planner::Group {
+            members: vec![7],
+            cardinality: 5.0,
+            slots: 8,
+            width: 8,
+            sketch: Sketch::new(&keys, 64, 69),
+        };
+        let (first, _) = construct_group(
+            &group,
+            keys.clone(),
+            vec![1; keys.len()],
+            Some(&root.0),
+            &config,
+            &|keys, slots| Ok(dropped_test_graph(keys, slots)),
+            None,
+        )
+        .unwrap();
+        let (promoted, _) = construct_group(
+            &group,
+            keys.clone(),
+            vec![1; keys.len()],
+            Some(&root.0),
+            &config,
+            &|keys, slots| Ok(dropped_test_graph(keys, slots)),
+            Some(64),
+        )
+        .unwrap();
+        assert!(first.fallback.is_empty() && promoted.fallback.is_empty());
+        assert_eq!(first.meta.fallback_keys, keys.len());
+        assert_ne!(first.fallback_path, promoted.fallback_path);
+        assert_eq!(
+            fs::metadata(first.fallback_path.as_ref().unwrap())
+                .unwrap()
+                .len(),
+            16 * keys.len() as u64
+        );
+        let promoted_path = promoted.fallback_path.clone().unwrap();
+        first.discard().unwrap();
+        assert!(promoted_path.exists());
+        promoted.discard().unwrap();
+        assert!(!promoted_path.exists());
+        assert_eq!(fs::read_dir(root.0.join("cells")).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(root.0.join("abandoned")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn global_disk_abandoned_merge_is_byte_identical_to_ram_with_hash_collisions() {
+        let root = temporary_stage();
+        let ram = root.0.join("ram");
+        let disk = root.0.join("disk");
+        fs::create_dir(&ram).unwrap();
+        fs::create_dir(&disk).unwrap();
+        fs::create_dir(disk.join("abandoned")).unwrap();
+        let mut ram_groups = Vec::new();
+        let mut disk_groups = Vec::new();
+        // >64 group files forces an external merge pass. Sparse group IDs,
+        // shared hashes, repeated masks and 0/MAX hashes exercise all unions.
+        for id in 0..70usize {
+            let mut records = vec![(u32::MAX, 1), (0, 2), (43, 3), (id as u32, 1)];
+            records.extend(std::iter::repeat_n((19, 3), 1100));
+            let group = || BuiltGroup {
+                meta: GroupMeta {
+                    members: vec![id * 3, id * 3 + 1],
+                    width: 10,
+                    offset: 0,
+                    union_cardinality: records.len(),
+                    fallback_keys: records.len(),
+                    abandoned_keys: Some(records.len()),
+                },
+                slots: 8,
+                cells: CompletedCells::Packed {
+                    data: vec![0; 10],
+                    width: 10,
+                    slots: 8,
+                },
+                fallback: Vec::new(),
+                fallback_path: None,
+            };
+            let mut memory = group();
+            memory.fallback = records.clone();
+            ram_groups.push(memory);
+            let mut staged = group();
+            let path = disk.join("abandoned").join(format!("group-{id}.records"));
+            super::super::staged_abandoned::write_sorted(
+                &path,
+                records
+                    .into_iter()
+                    .map(|(hash, mask)| (hash, (id * 3) as u32, mask)),
+            )
+            .unwrap();
+            staged.fallback_path = Some(path);
+            disk_groups.push(staged);
+        }
+        let expected = save_abandoned_groups(&mut ram_groups, &ram).unwrap();
+        let actual = save_abandoned_groups(&mut disk_groups, &disk).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            fs::read(ram.join(ABANDONED_FILE)).unwrap(),
+            fs::read(disk.join(ABANDONED_FILE)).unwrap()
+        );
+        assert_eq!(fs::read_dir(disk.join("abandoned")).unwrap().count(), 0);
+        assert!(disk_groups
+            .iter()
+            .all(|group| group.fallback.is_empty() && group.fallback_path.is_none()));
     }
 
     fn two_pass_stages_only_packed_cells(low_disk: bool) {
@@ -3420,8 +3662,8 @@ mod tests {
                 assert_eq!(stages.len(), 1);
                 // Before final packing, the publication directory holds no
                 // features/, cache files or other construction artifacts: nothing
-                // at all with --low-disk, only packed cells of completed groups
-                // otherwise.
+                // at all with --low-disk, packed cells AND abandoned-key runs
+                // of completed groups otherwise.
                 let entries: Vec<_> = fs::read_dir(&stages[0])
                     .unwrap()
                     .map(|e| e.unwrap().path())
@@ -3429,8 +3671,12 @@ mod tests {
                 if low_disk {
                     assert!(entries.is_empty());
                 } else {
-                    assert_eq!(entries, [stages[0].join("cells")]);
-                    for cell in fs::read_dir(&entries[0]).unwrap() {
+                    let entries: std::collections::BTreeSet<_> = entries.into_iter().collect();
+                    assert_eq!(
+                        entries,
+                        [stages[0].join("cells"), stages[0].join("abandoned")].into()
+                    );
+                    for cell in fs::read_dir(stages[0].join("cells")).unwrap() {
                         let name = cell.unwrap().file_name();
                         assert!(name.to_string_lossy().ends_with(".bits"), "{name:?}");
                     }
@@ -3441,6 +3687,14 @@ mod tests {
         .unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         let index = Index::load(&output).unwrap();
+        assert_eq!(
+            index.manifest.construction_abandoned_storage.as_deref(),
+            Some(if low_disk {
+                "memory"
+            } else {
+                "temporary-disk-sorted-runs"
+            })
+        );
         assert_eq!(
             index.manifest.construction_cell_storage,
             if low_disk {
@@ -3782,6 +4036,7 @@ mod tests {
             slots: cells.len(),
             cells: CompletedCells::Disk(path),
             fallback: vec![(id as u32, cells[0])],
+            fallback_path: None,
         }
     }
 
@@ -4067,6 +4322,7 @@ mod tests {
             planning_possible_pair_evaluations: 0,
             merge_reverts_enabled: false,
             construction_cell_storage: "temporary-disk-u64".into(),
+            construction_abandoned_storage: None,
             slot_scale: 1.0,
             singleton_logical_bits: 64,
             min_subindex_documents: 1,
