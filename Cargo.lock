@@ -430,6 +430,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "minimizer-fasta"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "deko",
+ "flate2",
+ "itoa",
+ "packed-seq",
+ "rayon",
+ "serde",
+ "serde_json",
+ "simd-minimizers",
+]
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
