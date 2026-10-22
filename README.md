@@ -19,6 +19,7 @@ src/lib.rs              shared DNA parsing, feature extraction, hashing, FOF par
 src/bin/zorindex.rs     Zindex CLI and pure ZOR stack implementation
 src/bin/bloomindex.rs   Bindex CLI and interleaved Bloom stack implementation
 src/power_merge/        Zindex merge planning, colored power-of-two banks and lookup
+utils/minimizer-fasta/  standalone parallel SIMD minimizer FASTA generator
 ```
 
 ## Requirements
@@ -37,6 +38,7 @@ The release binaries are:
 ```text
 target/release/zorindex
 target/release/bloomindex
+target/release/minimizer-fasta
 ```
 
 Both tools default to all available hardware threads. Override this with
@@ -45,6 +47,26 @@ Both tools default to all available hardware threads. Override this with
 For copy-paste collaborator commands, see
 [docs/COLLABORATOR.txt](docs/COLLABORATOR.txt). Build on the machine where you
 will run the binaries: `.cargo/config.toml` enables `target-cpu=native`.
+
+## Standalone minimizer FASTA utility
+
+`minimizer-fasta` generates one canonical FASTA record per selected minimizer
+position. It is an independent workspace package, with no dependency on the
+index implementation. It preserves the canonical SimdMinimizers selection used
+by the original benchmark generator (default seed length31, window19 positions,
+49-base span); it does not silently substitute open-closed-mod selection.
+
+```bash
+cargo build --release -p minimizer-fasta
+./target/release/minimizer-fasta genome.fna.gz minimizers.fa.gz
+./target/release/minimizer-fasta --fof samples.fof --output-dir minimizers --gzip
+```
+
+Selection and gzip compression run in parallel, including chunks of a single
+long chromosome. Input/output order is deterministic; memory is bounded by the
+in-flight chunks rather than chromosome length. The default uses all available
+CPUs and gzip level1. See [the utility documentation](utils/minimizer-fasta/README.md)
+for parameters, compression details and the generated collection FOF.
 
 ## Input Format
 
