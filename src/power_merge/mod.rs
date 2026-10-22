@@ -6,6 +6,7 @@ mod planner;
 mod records;
 mod sketch;
 mod sort;
+mod staged_abandoned;
 mod storage;
 mod union;
 
@@ -101,12 +102,12 @@ pub struct MergeArgs {
     /// Abandoned features may then be missed.
     #[arg(long, conflicts_with = "plain")]
     pub drop_abandoned: bool,
-    /// Use temporary key/cell files instead of the default scratch-free two-pass build.
+    /// Use temporary feature/cell/abandoned-key files instead of the scratch-free two-pass build.
     /// The default keeps completed filters bit-packed in RAM until compression.
     #[arg(long, conflicts_with = "plain")]
     pub disk_backed: bool,
-    /// Keep completed filters bit-packed in RAM (default). Set --low-disk=false
-    /// to stage packed cells on disk instead. RAM must fit every completed filter.
+    /// Keep completed filters and abandoned-key records in RAM (default).
+    /// Set --low-disk=false to stage both on disk, with a bounded abandoned-key merge.
     #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1,
         require_equals = true, default_missing_value = "true", default_value_t = true,
         conflicts_with_all = ["plain", "disk_backed"])]
@@ -115,7 +116,7 @@ pub struct MergeArgs {
     /// Estimated concurrent build-workspace budget in GiB. Default: 80% of
     /// available RAM (including visible cgroup limits). Oversized jobs run alone.
     /// This is admission control, not an RSS cap; retained filters/recovery and
-    /// a single oversized genome still need enough memory. No external sorting.
+    /// a single oversized genome still need enough memory. Feature sorting stays in RAM.
     #[arg(long)]
     pub build_memory_gib: Option<f64>,
 }
