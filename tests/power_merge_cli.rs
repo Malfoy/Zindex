@@ -852,10 +852,10 @@ fn all_cell_storage_modes_build_identical_filters_and_queries() {
                     assert_eq!(json["construction_cell_storage"], storage);
                     assert_eq!(
                         json["construction_abandoned_storage"],
-                        if mode.is_some() {
-                            "temporary-disk-sorted-runs"
-                        } else {
+                        if mode == Some("--low-disk") {
                             "memory"
+                        } else {
+                            "temporary-disk-sorted-runs"
                         }
                     );
                     for key in [
