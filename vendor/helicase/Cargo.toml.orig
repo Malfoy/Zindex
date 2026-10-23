@@ -1,0 +1,35 @@
+[package]
+name = "helicase"
+version = "0.1.1"
+edition = "2024"
+authors = ["Igor Martayan", "Charles Paperman"]
+description = "SIMD-accelerated library for FASTA/FASTQ parsing and bitpacking"
+keywords = ["bioinformatics", "fasta", "fastq", "bitpacking", "simd"]
+categories = ["science::bioinformatics"]
+repository = "https://github.com/imartayan/helicase"
+documentation = "https://docs.rs/helicase"
+readme = "../README.md"
+license = "MIT"
+
+[dependencies]
+deko = { version = "0.6", default-features = false }
+flate2 = { version = "1.1", features = ["zlib-rs"], optional = true }
+memchr = "2.8"
+memmap2 = "0.9"
+packed-seq = { version = "4.4", default-features = false, optional = true }
+paraseq = { version = "0.4", default-features = false, optional = true }
+
+[features]
+default = ["gz", "zstd"]
+bz2 = ["deko/bzip2"]
+gz = ["deko/flate2", "flate2"]
+xz = ["deko/xz"]
+zstd = ["deko/zstd"]
+no-pdep = []
+
+[package.metadata.docs.rs]
+all-features = true
+
+[[example]]
+name = "packed"
+required-features = ["packed-seq"]

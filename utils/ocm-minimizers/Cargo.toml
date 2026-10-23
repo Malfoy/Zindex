@@ -1,0 +1,6 @@
+[package]
+name = "ocm-minimizers"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Canonical open-closed mod minimizers with AVX2 and portable iterators"

@@ -4,10 +4,13 @@ Independent FASTA preprocessing utility from the Zindex repository. It emits
 one canonical DNA seed per selected **position**, not one per distinct seed
 value. Repeated values at different positions remain present.
 
-The selection is **canonical SimdMinimizers 2.3.1**, matching the original
-`benchmark-simd-minimizers` / gzip benchmark generators. It is not the
-open-closed-mod selector used by native Zindex minimizer mode. Existing
-benchmark inputs and ongoing experiments are not changed by installing it.
+The default selection is **canonical SimdMinimizers 2.3.1**, matching the original
+`benchmark-simd-minimizers` / gzip benchmark generators. Select
+`--minimizer-scheme open-closed-mod` (alias `ocm`) to use the same optimized
+canonical open-closed mod iterator as native Zindex. Both tools share the
+dependency-free `ocm-minimizers` crate; there is no separate copied iterator to
+drift out of sync. Existing benchmark inputs and ongoing experiments are not
+changed by installing it.
 
 ## Build
 
@@ -36,13 +39,20 @@ RUSTFLAGS='-C target-cpu=native' cargo install --path utils/minimizer-fasta --lo
 ```bash
 ./target/release/minimizer-fasta input.fna.gz output.fa.gz
 ./target/release/minimizer-fasta --k 21 --window 19 --threads 32 input.fa output.fa
+./target/release/minimizer-fasta --minimizer-scheme open-closed-mod input.fna.xz output.fa.gz
+./target/release/minimizer-fasta --minimizer-scheme open-closed-mod --seed 69 input.fna.zst output.fa
 gzip -dc input.fa.gz | ./target/release/minimizer-fasta - - > output.fa
 ```
 
 `--k` is the **seed length** (default31); `--window` / `-w` is the number of
 candidate k-mers per window (default19). The total span is `k + window - 1`
 (49 bases by default). The span must be odd for canonical strand tie-breaking.
-Supported seed lengths are1..64, window counts1..65535. No seed is selected
+Supported seed lengths are1..64 for `simd`, 1..31 for `open-closed-mod`, and
+window counts1..65535. `--seed` defaults to69 and controls OCM's hash ordering;
+the legacy SIMD selector keeps its original hashing regardless of this setting.
+For example, utility `--k 31 --window 19 --minimizer-scheme open-closed-mod`
+matches Zindex `--k 49 --minimizer-size 31 --minimizer-scheme open-closed-mod`.
+No seed is selected
 from an ACGT run shorter than the full window span. Upper/lowercase and sequence
 whitespace are normalized; non-ACGT bases split runs. Record and ambiguity
 boundaries are never crossed. FASTQ is intentionally rejected: this is a FASTA
@@ -63,6 +73,8 @@ any partial output remains available for diagnosis and is not silently reused.
 
 ```bash
 ./target/release/minimizer-fasta --fof samples.fof --output-dir minimizers --gzip
+./target/release/minimizer-fasta --minimizer-scheme open-closed-mod \
+  --fof samples.fof --output-dir ocm-minimizers --gzip
 ```
 
 The FOF accepts `path` or `name<TAB>path`; blank/comment lines are ignored.
@@ -80,6 +92,16 @@ files or a manifest cause an error instead of being overwritten or resumed.
 
 - Defaults to all CPUs available to the process; `--threads` overrides this.
 - SIMD selection uses Ragnar Groot Koerkamp and Igor Martayan's SimdMinimizers.
+- OCM selection uses Zindex's four-lane AVX2 kernel, full-width 64-bit hashes,
+  prefix/suffix sliding minima, and a portable fallback. OCM writes positions
+  directly into the reusable deduplication bitset, avoiding a packed-DNA copy
+  and intermediate position vector.
+- FASTA parsing uses Helicase's SIMD block lexer, not its record-buffering API.
+  DNA spans are normalized and counted in bulk, without retaining complete
+  chromosomes. `vendor/helicase` contains upstream0.1.1 with only the lexer API
+  made public; parsing algorithms are unchanged. Magic-based gzip/xz/zstd/bzip2
+  decoding also applies to stdin and the library `generate` API. Decoder errors
+  are returned rather than triggering a parser panic or silently accepting EOF.
 - Long chromosomes are streamed in bounded chunks, with both left and right
   context so every selected position exactly matches full-record selection.
 - A reusable bitset replaces comparison sorting for exact sorted position
@@ -101,14 +123,17 @@ files or a manifest cause an error instead of being overwritten or resumed.
   file; the utility does not claim parallel inflation of one DEFLATE stream.
 
 JSON statistics go to stdout, or stderr when FASTA itself is written to stdout.
+They include `minimizer_scheme` and `seed` alongside the previous fields.
 Output is deterministic across thread counts for identical parameters. Changing
 chunk size may change gzip member boundaries, but never decompressed FASTA.
 
 Tests compare the chunked bitset implementation to the original full-run
 SIMD+sort+dedup algorithm, including repeated ties, reverse complements,
 ambiguous bases, short/empty records, tiny chunks and long unwrapped records.
-They also cover collection ordering, compression, refusal to overwrite and
-pipeline cancellation on read/write errors.
+They also compare OCM output against full-record iterator positions for several
+window/seed lengths, hash seeds, strands, periodic inputs and chunk sizes, and
+cover all supported compression formats, compressed stdin, collection ordering,
+truncated streams, refusal to overwrite and pipeline cancellation on I/O errors.
 
 ```bash
 cargo test --release -p minimizer-fasta

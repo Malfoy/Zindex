@@ -180,6 +180,101 @@ mod tests {
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
     #[test]
+    fn record_io_handles_short_reads_and_reports_each_truncation_boundary() {
+        struct ShortReader<'a>(&'a [u8]);
+        impl Read for ShortReader<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let len = out.len().min(3).min(self.0.len());
+                out[..len].copy_from_slice(&self.0[..len]);
+                self.0 = &self.0[len..];
+                Ok(len)
+            }
+        }
+        for record in [
+            (0, 0, 0),
+            (u32::MAX, u32::MAX, u64::MAX),
+            (17, 31, 1u64 << 63),
+        ] {
+            let mut bytes = Vec::new();
+            write_record(&mut bytes, record).unwrap();
+            assert_eq!(read_record(&mut ShortReader(&bytes)).unwrap(), Some(record));
+            assert_eq!(read_record(&mut ShortReader(&[])).unwrap(), None);
+            for end in 1..16 {
+                assert!(read_record(&mut ShortReader(&bytes[..end])).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn record_io_propagates_injected_read_and_storage_full_errors() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("injected read error"))
+            }
+        }
+        struct FullDisk(usize);
+        impl Write for FullDisk {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(std::io::Error::other("injected storage full"));
+                }
+                let n = self.0.min(bytes.len()).min(3);
+                self.0 -= n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        assert!(read_record(&mut Broken)
+            .unwrap_err()
+            .to_string()
+            .contains("injected read error"));
+        for available in 0..16 {
+            assert!(write_record(&mut FullDisk(available), (1, 2, 3))
+                .unwrap_err()
+                .to_string()
+                .contains("injected storage full"));
+        }
+        write_record(&mut FullDisk(16), (1, 2, 3)).unwrap();
+    }
+
+    #[test]
+    fn failed_emission_or_unsorted_run_does_not_delete_input_runs() {
+        let directory = std::env::temp_dir().join(format!(
+            "zor-abandoned-failure-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&directory).unwrap();
+        let a = directory.join("a");
+        let b = directory.join("b");
+        write_sorted(&a, [(1, 2, 3), (3, 4, 5)].into_iter()).unwrap();
+        write_sorted(&b, [(2, 3, 4)].into_iter()).unwrap();
+        let before = [fs::read(&a).unwrap(), fs::read(&b).unwrap()];
+        assert!(
+            visit_sorted(vec![a.clone(), b.clone()], &directory, |_| anyhow::bail!(
+                "injected emitter error"
+            ))
+            .unwrap_err()
+            .to_string()
+            .contains("injected emitter error")
+        );
+        assert_eq!(fs::read(&a).unwrap(), before[0]);
+        assert_eq!(fs::read(&b).unwrap(), before[1]);
+        let mut bytes = Vec::new();
+        write_record(&mut bytes, (9, 0, 1)).unwrap();
+        write_record(&mut bytes, (1, 0, 1)).unwrap();
+        fs::write(&a, &bytes).unwrap();
+        assert!(visit_sorted(vec![a.clone()], &directory, |_| Ok(())).is_err());
+        assert_eq!(fs::read(&a).unwrap(), bytes);
+        fs::remove_file(a).unwrap();
+        fs::remove_file(b).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
     fn tiny_buffers_force_multiple_sort_and_merge_passes_without_losing_records() {
         let directory = std::env::temp_dir().join(format!(
             "zor-abandoned-runs-{}-{}",

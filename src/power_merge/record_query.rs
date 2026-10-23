@@ -65,10 +65,15 @@ impl Candidates {
         for (bank_id, bank) in index.banks.iter().enumerate() {
             let mut next = std::mem::take(&mut self.spare[bank_id]);
             next.clear();
-            // One-bit SIMD screens blocks of 64 groups. Retain the entire block
-            // if ANY member can pass, so range starts remain byte aligned.
-            let unit = if bank.meta.fingerprint_first && index.manifest.fingerprint_bits == 1 {
-                64
+            // Keep packed range starts byte aligned. Retain a whole packing
+            // unit if any member can pass (one-bit uses its existing word unit).
+            let bits = index.manifest.fingerprint_bits;
+            let unit = if bank.meta.fingerprint_first && bits < 8 {
+                if bits == 1 {
+                    64
+                } else {
+                    8 / bits
+                }
             } else {
                 1
             };
@@ -827,7 +832,7 @@ mod tests {
 
     #[test]
     fn pruning_and_cached_weighted_hits_match_full_lookup_for_all_layouts() {
-        for bits in [1, 8, 16] {
+        for bits in [1, 2, 4, 8, 16] {
             for planes in [false, true] {
                 let mut index = random_index(bits, planes);
                 for recovery in [true, false] {
@@ -931,7 +936,7 @@ mod tests {
 
     #[test]
     fn paired_sink_preserves_weighted_counts_and_abandoned_union() {
-        for bits in [1, 8, 16, 32] {
+        for bits in [1, 2, 4, 8, 16, 32] {
             for planes in [false, true] {
                 let index = random_index(bits, planes);
                 for (forward_weight, reverse_weight) in

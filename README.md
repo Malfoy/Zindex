@@ -19,7 +19,8 @@ src/lib.rs              shared DNA parsing, feature extraction, hashing, FOF par
 src/bin/zorindex.rs     Zindex CLI and pure ZOR stack implementation
 src/bin/bloomindex.rs   Bindex CLI and interleaved Bloom stack implementation
 src/power_merge/        Zindex merge planning, colored power-of-two banks and lookup
-utils/minimizer-fasta/  standalone parallel SIMD minimizer FASTA generator
+utils/minimizer-fasta/  standalone parallel SIMD/OCM minimizer FASTA generator
+utils/ocm-minimizers/   shared dependency-free optimized OCM iterator
 ```
 
 ## Requirements
@@ -332,7 +333,15 @@ zorindex build \
 Important options:
 
 - `--hashes`: number of ZOR locations per key.
-- `--fingerprint-bits`: `1`, `8` (default), or `16`. The 1-bit option is bit-packed and has approximately 50% false positives per absent indexed feature; sequence-level thresholds still apply.
+- `--fingerprint-bits`: `1`, `2`, `4`, `8` (default), or `16`. Sub-byte
+  fingerprints are tightly packed (eight, four, or two per byte). Approximate
+  false-positive rates per absent indexed feature are 50%, 25%, 6.25%, 0.39%,
+  and 0.0015%, respectively; sequence-level thresholds still apply. The 2- and
+  4-bit query paths fuse slice XOR and packed equality screening with AVX2 where
+  available, with a portable word-parallel fallback. These widths work with
+  merged and plain indexes, including the existing compression modes and plain
+  index append/repack. Origin bits and the abandoned-key map remain additional
+  costs, so total index size does not scale solely with fingerprint width.
 - `--slot-scale`: multiplier applied to the largest color cardinality.
 - `--slot-count`: explicit slot budget before segmented layout rounding.
 - `--segment-length`: explicit power-of-two segment length.
@@ -393,7 +402,8 @@ results are not retained. This is not a persistent index cache.
 For positive `--min-ratio`, the total feature count is determined first. A filter
 group is skipped only when **every** document in it has too few possible remaining
 matches to pass. Contiguous retired groups are omitted from fingerprint reads;
-1-bit fingerprints retire aligned 64-group blocks. Counts for every reported
+1-bit fingerprints retire aligned 64-group blocks; 2- and 4-bit fingerprints
+retire byte-aligned units of four and two groups. Counts for every reported
 document remain exact, including abandoned-key matches and 32-bit hash collisions.
 Threshold-zero queries still report all counters, including zeros. Records longer
 than the feature budget use a bounded-memory two-scan path rather than retaining
@@ -624,7 +634,7 @@ union only for merge planning). The manifest's `overflow_groups` counts groups
 whose exact union required more slots than planned, before minimum-document
 promotion. `--merge-disabled` selects
 (power-of-two singleton banks for comparisons). Payloads currently fit at most
-64 bits, including the 1-, 8- or 16-bit fingerprint. `--slot-count` acts as a minimum
+64 bits, including the 1-, 2-, 4-, 8- or 16-bit fingerprint. `--slot-count` acts as a minimum
 per-group cell budget before rounding.
 
 Query supports all feature modes and uses Rayon for ordinary and findere queries.

@@ -8,6 +8,8 @@ readme = "README.md"
 
 [dependencies]
 anyhow = "1.0"
+ocm-minimizers = { version = "0.1.0", path = "../ocm-minimizers" }
+helicase = { version = "0.1.1", path = "../../vendor/helicase", default-features = false }
 clap = { version = "4.5", features = ["derive"] }
 deko = { version = "0.6", default-features = false, features = ["flate2", "zstd", "xz", "bzip2"] }
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }

@@ -178,8 +178,8 @@ impl BuildConfig {
             "--min-subindex-documents must be positive"
         );
         ensure!(
-            [1, 8, 16].contains(&self.fingerprint_bits),
-            "fingerprint bits must be 1, 8 or 16"
+            [1, 2, 4, 8, 16].contains(&self.fingerprint_bits),
+            "fingerprint bits must be 1, 2, 4, 8 or 16"
         );
         match self.feature_config.mode {
             crate::IndexMode::Kmers | crate::IndexMode::Modimizers => ensure!(
