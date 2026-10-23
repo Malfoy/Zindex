@@ -86,7 +86,7 @@ pub struct MergeArgs {
     pub min_saving: f64,
     /// Plan each merged group as if its estimated union were this fraction larger, so sketch noise does not push
     /// the exact union past the planned power of two at build time (which doubles the group's slots).
-    #[arg(long = "merge-plan-margin", default_value_t = 0.0)]
+    #[arg(long = "merge-plan-margin", default_value_t = 0.03)]
     pub plan_margin: f64,
     /// Minimum original documents per subindex; promote smaller filters, never fold.
     /// Collections smaller than this use one subindex. Set 1 for the legacy layout.
@@ -129,7 +129,7 @@ impl Default for MergeArgs {
             sketch_size: 128,
             max_colors: 48,
             min_saving: 0.0,
-            plan_margin: 0.0,
+            plan_margin: 0.03,
             min_subindex_documents: 128,
             max_subindexes: None,
             disabled: false,
