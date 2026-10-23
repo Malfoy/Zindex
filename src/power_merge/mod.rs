@@ -102,14 +102,16 @@ pub struct MergeArgs {
     /// Abandoned features may then be missed.
     #[arg(long, conflicts_with = "plain")]
     pub drop_abandoned: bool,
-    /// Use temporary feature/cell/abandoned-key files instead of the scratch-free two-pass build.
-    /// The default keeps completed filters bit-packed in RAM until compression.
+    /// Use temporary feature/cell/abandoned-key files instead of the two-pass build.
+    /// The default two-pass build stages completed filters as bit-packed cell files.
     #[arg(long, conflicts_with = "plain")]
     pub disk_backed: bool,
-    /// Keep completed filters and abandoned-key records in RAM (default).
-    /// Set --low-disk=false to stage both on disk, with a bounded abandoned-key merge.
+    /// Keep completed filters (bit-packed) and abandoned-key records in RAM until bank
+    /// compression, writing no scratch files. Default false: both are staged on disk next to
+    /// the output (bit-packed cell files, sorted abandoned-key runs with a bounded merge),
+    /// so peak RSS does not include them.
     #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1,
-        require_equals = true, default_missing_value = "true", default_value_t = true,
+        require_equals = true, default_missing_value = "true", default_value_t = false,
         conflicts_with_all = ["plain", "disk_backed"])]
     pub low_disk: bool,
 
@@ -135,7 +137,7 @@ impl Default for MergeArgs {
             disabled: false,
             drop_abandoned: false,
             disk_backed: false,
-            low_disk: true,
+            low_disk: false,
             build_memory_gib: None,
         }
     }

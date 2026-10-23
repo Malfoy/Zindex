@@ -581,9 +581,10 @@ Construction defaults to **two input passes without temporary key files**:
    power-of-two sizes; estimates are not hard capacities and merges are never
    reverted. Changed indexed features between passes cause a clean error.
 
-Completed filters are **bit-packed at their actual payload width in RAM**, not
-stored as 64-bit cells. The default creates no temporary key/cell files; RAM must
-fit the completed filters, planning metadata and active groups' keys/payloads/graphs.
+Completed filters are **bit-packed at their actual payload width**, not stored as
+64-bit cells. By default they are staged as bit-packed cell files next to the output,
+so RAM needs to fit only planning metadata and the active groups' keys/payloads/graphs;
+`--low-disk` keeps them in RAM instead and creates no temporary key/cell files.
 The existing compression-aware column ordering is preserved using exactly the
 same cell samples. Bank packing uses bounded row tiles and writes directly to
 zstd; completed banks are released from RAM. The atomic publication directory
@@ -608,9 +609,10 @@ abandoned-key records remain additional memory costs. In disk mode both are stag
 to disk. Feature vectors are still sorted/deduplicated in memory; external sorting
 is used only for staged abandoned-key records, never for extracted input features.
 
-`--low-disk` explicitly selects the default scratch-free mode. To trade RAM for
-scratch disk, use `--low-disk=false`: completed filters are staged as packed cell
+By default (`--low-disk=false`) completed filters are staged as bit-packed cell
 files and abandoned keys as sorted hash/group/origin-mask runs next to the output.
+`--low-disk` selects the scratch-free mode instead, trading RAM for scratch disk:
+both stay in RAM until bank compression.
 Each active job uses at most 65,536 records (1 MiB) for abandoned-key sorting.
 A bounded-fan-in external merge writes the same single global abandoned-key map
 without retaining the collection's records in RAM. Even pathological hash collisions

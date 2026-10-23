@@ -170,10 +170,10 @@ complete-payload prefix; the origin-plane offset for group `i` is
 
 Construction mode does not change the bank encoding or query layout. The default
 two-pass builder records `construction_cell_storage` as
-`two-pass-memory-packed-no-scratch` (verified cells retained in RAM bit-packed
-at the group's payload width until bank compression). `--low-disk=false` records
-`two-pass-temporary-disk-packed-tiled-packing` (the same packed cells staged in
-files); `--disk-backed` records `temporary-disk-u64-tiled-packing`. The two-pass
+`two-pass-temporary-disk-packed-tiled-packing` (verified cells staged in files,
+bit-packed at the group's payload width until bank compression). `--low-disk`
+records `two-pass-memory-packed-no-scratch` (the same packed cells retained in
+RAM); `--disk-backed` records `temporary-disk-u64-tiled-packing`. The two-pass
 publication directory contains only final index files. First-pass projected
 capacities may differ from exact final capacities; this does not change the
 planned dataset membership partition.
