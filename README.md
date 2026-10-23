@@ -629,10 +629,11 @@ counts are unchanged by construction mode.
 
 Options: `--merge-sketch-size` (128 buckets), `--merge-max-colors` (48 datasets),
 `--merge-min-saving` (0; a fractional safety margin), `--merge-plan-margin`
-(0 by default: no inflation; an explicit positive value inflates the estimated
-union only for merge planning). The manifest's `overflow_groups` counts groups
-whose exact union required more slots than planned, before minimum-document
-promotion. `--merge-disabled` selects
+(0.03 by default: each merged group is planned as if its estimated union were
+3% larger, because sketch noise can push the exact union past the planned power
+of two and double the group's slots; 0 disables the inflation). The manifest's
+`overflow_groups` counts groups whose exact union required more slots than
+planned, before minimum-document promotion. `--merge-disabled` selects
 (power-of-two singleton banks for comparisons). Payloads currently fit at most
 64 bits, including the 1-, 2-, 4-, 8- or 16-bit fingerprint. `--slot-count` acts as a minimum
 per-group cell budget before rounding.
