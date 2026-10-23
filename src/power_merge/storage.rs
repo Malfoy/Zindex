@@ -1060,7 +1060,7 @@ fn construct_group(
             0
         }) as u64;
     // Release graph/union workspaces before retaining completed cells: bit-packed
-    // in RAM (default), in an opt-in staged file, or in the
+    // in a staged file (default), in RAM (--low-disk), or in the
     // --disk-backed u64 cell cache.
     drop(peeled);
     drop(values);
@@ -3513,14 +3513,14 @@ mod tests {
     }
 
     #[test]
-    fn default_two_pass_never_creates_scratch_files_during_construction() {
-        assert!(super::super::MergeArgs::default().low_disk);
-        two_pass_stages_only_packed_cells(true);
+    fn default_two_pass_stages_packed_cells_and_abandoned_keys_during_construction() {
+        assert!(!super::super::MergeArgs::default().low_disk);
+        two_pass_stages_only_packed_cells(false);
     }
 
     #[test]
-    fn opt_in_two_pass_stages_cells_and_abandoned_keys_during_construction() {
-        two_pass_stages_only_packed_cells(false);
+    fn low_disk_two_pass_never_creates_scratch_files_during_construction() {
+        two_pass_stages_only_packed_cells(true);
     }
 
     #[test]
