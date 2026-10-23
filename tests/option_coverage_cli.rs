@@ -303,8 +303,8 @@ fn merged_colored_filters_survive_promotion_across_all_widths_and_storage_modes(
     let fof = f.write("inputs.fof", fof);
     for bits in ["1", "2", "4", "8", "16"] {
         for (mode, storage) in [
-            ("ram", None),
-            ("packed-disk", Some("--low-disk=false")),
+            ("ram", Some("--low-disk")),
+            ("packed-disk", None),
             ("disk", Some("--disk-backed")),
         ] {
             for (cap, minimum) in [("1", "1"), ("2", "4"), ("3", "128")] {
@@ -371,7 +371,7 @@ fn failed_builds_clean_staging_and_never_overwrite_existing_output() {
     let bad = f.write("corrupt.fa.zst", [0x28, 0xb5, 0x2f, 0xfd, 1, 2, 3]);
     for (id, input) in [&missing, &bad].into_iter().enumerate() {
         let fof = f.write("failed.fof", format!("good\t{good}\nbad\t{input}\n"));
-        for mode in [None, Some("--low-disk=false"), Some("--disk-backed")] {
+        for mode in [None, Some("--low-disk"), Some("--disk-backed")] {
             let index = f.path(&format!("failed-{id}-{mode:?}"));
             let mut args = vec!["build", "--fof", &fof, "--output", &index, "--k", "31"];
             args.extend(mode);
@@ -636,8 +636,8 @@ fn all_empty_feature_collections_and_empty_queries_are_consistent() {
     let fof = f.write("inputs.fof", format!("a\t{a}\nb\t{b}\n"));
     for bits in ["1", "2", "4", "8", "16"] {
         for (mode, flag) in [
-            ("ram", None),
-            ("packed-disk", Some("--low-disk=false")),
+            ("ram", Some("--low-disk")),
+            ("packed-disk", None),
             ("disk", Some("--disk-backed")),
         ] {
             let index = f.path(&format!("empty-{bits}-{mode}"));

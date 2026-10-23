@@ -158,7 +158,7 @@ fn short_default_command_matches_explicit_optimized_settings() {
         assert_eq!(manifest["column_order"], "compression");
         assert_eq!(
             manifest["construction_cell_storage"],
-            "two-pass-memory-packed-no-scratch"
+            "two-pass-temporary-disk-packed-tiled-packing"
         );
         assert_eq!(manifest["abandoned_recovery"], true);
         assert_eq!(manifest["rejected_groups"], 0);
@@ -227,7 +227,7 @@ fn merged_origins_and_serialized_size_classes_query_correctly() {
     let index = f.path("merged");
     build(&inputs, &index, &[]);
     let info = ok(&["info", "--index", &index], "1");
-    assert!(info.contains("construction_cell_storage\ttwo-pass-memory-packed-no-scratch"));
+    assert!(info.contains("construction_cell_storage\ttwo-pass-temporary-disk-packed-tiled-packing"));
     assert!(info.contains("merge_planner\tstreaming"));
     assert!(info.contains("merge_column_order\tcompression"));
     assert!(!Path::new(&index).join("cells").exists());
@@ -830,11 +830,8 @@ fn all_cell_storage_modes_build_identical_filters_and_queries() {
                 let mut manifests = Vec::new();
                 let mut results = Vec::new();
                 for (mode, storage) in [
-                    (None, "two-pass-memory-packed-no-scratch"),
-                    (
-                        Some("--low-disk=false"),
-                        "two-pass-temporary-disk-packed-tiled-packing",
-                    ),
+                    (None, "two-pass-temporary-disk-packed-tiled-packing"),
+                    (Some("--low-disk"), "two-pass-memory-packed-no-scratch"),
                     (Some("--disk-backed"), "temporary-disk-u64-tiled-packing"),
                 ] {
                     let path = f.path(&format!("{planner}-{fp}-{order}-{storage}"));
@@ -947,7 +944,7 @@ fn all_cell_storage_modes_preserve_all_feature_extractors() {
         let staged = f.path(&format!("{mode}-staged"));
         build(&fof, &staged, &settings);
         let one = ok(&["query", "--index", &staged, "--query", &query], "4");
-        for flag in ["--low-disk=false", "--disk-backed"] {
+        for flag in ["--low-disk", "--disk-backed"] {
             let other = f.path(&format!("{mode}{flag}"));
             let mut other_settings = settings.clone();
             other_settings.push(flag);

@@ -4975,7 +4975,7 @@ mod tests {
         assert_eq!(defaults.merge.sketch_size, 128);
         assert_eq!(zorindex::power_merge::MergeArgs::default().sketch_size, 128);
         assert_eq!(defaults.merge.plan_margin, 0.03);
-        assert!(defaults.merge.low_disk);
+        assert!(!defaults.merge.low_disk);
         assert!(!defaults.merge.disk_backed);
         assert_eq!(defaults.cycle_break, CycleBreakHeuristic::NoHeuristic);
         assert_eq!(defaults.tie_scan, 1);
@@ -5015,7 +5015,7 @@ mod tests {
             "512",
             "--merge-plan-margin",
             "0.05",
-            "--low-disk=false",
+            "--low-disk",
             "--cycle-break",
             "most-deg2",
             "--tie-scan",
@@ -5038,7 +5038,7 @@ mod tests {
         assert_eq!(custom.tie_scan, 8);
         assert_eq!(custom.merge.sketch_size, 512);
         assert_eq!(custom.merge.plan_margin, 0.05);
-        assert!(!custom.merge.low_disk);
+        assert!(custom.merge.low_disk);
 
         let Command::Append(append) = Cli::try_parse_from([
             "zorindex",
