@@ -1,7 +1,6 @@
 use anyhow::{ensure, Context, Result};
 use clap::Parser;
-use deko::read::AnyDecoder;
-use minimizer_fasta::{generate, Config, Stats};
+use minimizer_fasta::{generate, Config, MinimizerScheme, Stats};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::{
@@ -14,7 +13,7 @@ use std::{
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Parallel streaming canonical SIMD minimizer FASTA generator"
+    about = "Parallel streaming canonical SIMD/open-closed-mod minimizer FASTA generator"
 )]
 struct Args {
     /// Input FASTA, optionally gzip/zstd/xz/bzip2 compressed; '-' reads stdin.
@@ -35,6 +34,12 @@ struct Args {
     /// Number of candidate k-mers in each minimizer window.
     #[arg(short, long, alias = "w", default_value_t = 19)]
     window: usize,
+    /// Selection scheme; simd preserves legacy output, open-closed-mod matches Zindex.
+    #[arg(long, value_enum, default_value = "simd")]
+    minimizer_scheme: MinimizerScheme,
+    /// Open-closed-mod hash seed; ignored by the legacy SIMD selector.
+    #[arg(long, default_value_t = 69)]
+    seed: u64,
     /// Rayon worker count; defaults to all CPUs available to this process.
     #[arg(short, long)]
     threads: Option<usize>,
@@ -62,11 +67,8 @@ fn open_input(path: &Path) -> Result<Box<dyn Read + Send>> {
     } else {
         Box::new(File::open(path).with_context(|| format!("opening {}", path.display()))?)
     };
-    // Magic-based streaming detection, including concatenated gzip members.
-    Ok(Box::new(AnyDecoder::new(BufReader::with_capacity(
-        1024 * 1024,
-        input,
-    ))))
+    // generate() performs magic-based decoding, including concatenated members.
+    Ok(Box::new(BufReader::with_capacity(1024 * 1024, input)))
 }
 
 fn create_output(path: &Path) -> Result<Box<dyn Write + Send>> {
@@ -167,6 +169,8 @@ fn collection(args: &Args, config: Config, threads: usize) -> Result<(Stats, usi
 struct Summary {
     k: usize,
     w: usize,
+    minimizer_scheme: MinimizerScheme,
+    seed: u64,
     canonical: bool,
     #[serde(flatten)]
     stats: Stats,
@@ -197,6 +201,8 @@ fn main() -> Result<()> {
     let config = Config {
         k: args.k,
         w: args.window,
+        minimizer_scheme: args.minimizer_scheme,
+        seed: args.seed,
         chunk_bases: args.chunk_bases,
         batch_chunks: threads,
         gzip_level: gzip.then_some(args.gzip_level),
@@ -222,7 +228,23 @@ fn main() -> Result<()> {
             ))
         }
     })?;
-    let simd = if cfg!(target_feature = "avx2") {
+    let ocm_avx2 = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::is_x86_feature_detected!("avx2")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    };
+    let simd = if args.minimizer_scheme == MinimizerScheme::OpenClosedMod {
+        if ocm_avx2 {
+            "AVX2"
+        } else {
+            "scalar"
+        }
+    } else if cfg!(target_feature = "avx2") {
         "AVX2"
     } else if cfg!(target_feature = "neon") {
         "NEON"
@@ -232,6 +254,8 @@ fn main() -> Result<()> {
     let summary = Summary {
         k: args.k,
         w: args.window,
+        minimizer_scheme: args.minimizer_scheme,
+        seed: args.seed,
         canonical: true,
         stats,
         files,

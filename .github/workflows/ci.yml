@@ -6,11 +6,20 @@ on:
 
 jobs:
   test:
+    name: Tests (${{ matrix.cpu }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cpu: [native, x86-64]
+    env:
+      # Override the local native default to also compile/test the portable
+      # baseline. Explicit scalar-kernel tests run in both configurations.
+      RUSTFLAGS: -C target-cpu=${{ matrix.cpu }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Format
-        run: cargo fmt --check
+        run: cargo fmt --all --check
       - name: Test
-        run: cargo test --release
+        run: cargo test --workspace --release

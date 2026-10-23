@@ -697,6 +697,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn one_and_two_bit_singletons_cannot_save_bits_by_pairwise_merging() {
+        for bits in [1, 2] {
+            let mut c = config(Backend::Zor);
+            c.fingerprint_bits = bits;
+            for a in [1, 63, 64, 65, 127, 128, 129, 4096] {
+                for b in [1, 63, 64, 65, 127, 128, 129, 4096] {
+                    let ga = singleton(a, Sketch::new(&[1, 2, 3], 64, 69), 0, &c).unwrap();
+                    let gb = singleton(b, Sketch::new(&[1, 2, 3], 64, 69), 1, &c).unwrap();
+                    for similarity in [0.0, 0.5, 1.0] {
+                        assert!(candidate_with_similarity(0, 1, &ga, &gb, &c, similarity)
+                            .unwrap()
+                            .is_none());
+                    }
+                }
+            }
+        }
+    }
+
     fn initial(sets: &[Vec<u64>], c: &BuildConfig) -> Vec<Group> {
         sets.iter()
             .enumerate()
@@ -934,7 +953,7 @@ mod tests {
             .build()
             .unwrap();
         pool.install(|| {
-            for fingerprint_bits in [1, 8, 16] {
+            for fingerprint_bits in [1, 2, 4, 8, 16] {
                 for max_colors in [2, 5, 16] {
                     for min_saving in [0.0, 0.05, 0.5] {
                         for minimum_slots in [None, Some(256)] {

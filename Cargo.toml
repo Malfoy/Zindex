@@ -10,16 +10,18 @@ keywords = ["bioinformatics", "kmer", "debruijn", "bloom-filter"]
 categories = ["command-line-utilities", "science"]
 
 [workspace]
-members = ["vendor/simd-sketch", "utils/minimizer-fasta"]
-default-members = [".", "vendor/simd-sketch", "utils/minimizer-fasta"]
+members = ["vendor/simd-sketch", "utils/minimizer-fasta", "utils/ocm-minimizers"]
+default-members = [".", "vendor/simd-sketch", "utils/minimizer-fasta", "utils/ocm-minimizers"]
 resolver = "2"
+exclude = ["vendor/helicase"]
 
 [dependencies]
 anyhow = "1.0"
+ocm-minimizers = { version = "0.1.0", path = "utils/ocm-minimizers" }
 clap = { version = "4.5", features = ["derive"] }
 deko = { version = "0.6", default-features = false, features = ["flate2", "zstd", "xz", "bzip2"] }
 fastpfor = { version = "0.9", default-features = false, features = ["rust"] }
-helicase = { version = "0.1.1", default-features = false, features = ["gz", "zstd"] }
+helicase = { version = "0.1.1", path = "vendor/helicase", default-features = false, features = ["gz", "zstd"] }
 bitpacking = "0.9"
 lz4_flex = "0.11"
 lzzzz = "2.0"

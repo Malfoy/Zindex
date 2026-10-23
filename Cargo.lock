@@ -297,8 +297,6 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 [[package]]
 name = "helicase"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b168a0cb9e3647aecec0a5aadb8945755a6389237c2a5caf4b26c7b4477c819"
 dependencies = [
  "deko",
  "flate2",
@@ -437,7 +435,9 @@ dependencies = [
  "clap",
  "deko",
  "flate2",
+ "helicase",
  "itoa",
+ "ocm-minimizers",
  "packed-seq",
  "rayon",
  "serde",
@@ -454,6 +454,10 @@ dependencies = [
  "adler2",
  "simd-adler32",
 ]
+
+[[package]]
+name = "ocm-minimizers"
+version = "0.1.0"
 
 [[package]]
 name = "once_cell_polyfill"
@@ -839,6 +843,7 @@ dependencies = [
  "helicase",
  "lz4_flex",
  "lzzzz",
+ "ocm-minimizers",
  "rayon",
  "serde",
  "serde_json",

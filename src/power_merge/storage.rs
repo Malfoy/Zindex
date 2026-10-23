@@ -1885,7 +1885,7 @@ impl Index {
             "invalid/missing segment length for index version"
         );
         ensure!(
-            [1, 8, 16].contains(&manifest.fingerprint_bits),
+            [1, 2, 4, 8, 16].contains(&manifest.fingerprint_bits),
             "invalid fingerprint width"
         );
         ensure!(
@@ -2597,7 +2597,7 @@ fn fingerprint_matches_selected(
 ) {
     let mut selected = [&[][..]; MAX_HASHES];
     for range in ranges {
-        debug_assert!(bits != 1 || range.start % 8 == 0);
+        debug_assert!(range.start * bits % 8 == 0);
         let start = range.start * bits / 8;
         let end = (range.end * bits).div_ceil(8);
         for (out, row) in selected.iter_mut().zip(rows) {
@@ -2620,6 +2620,10 @@ fn fingerprint_matches_rows(
     debug_assert!(rows
         .iter()
         .all(|row| row.len() == (count * bits).div_ceil(8)));
+    if matches!(bits, 2 | 4) {
+        crate::packed_fingerprints::matches_rows(rows, bits, fp, count, hit);
+        return;
+    }
     if bits == 1 {
         for base in (0..count).step_by(64) {
             let byte = base / 8;
@@ -2712,6 +2716,10 @@ unsafe fn fingerprint_matches_rows_avx2(
 
 #[cfg(test)]
 fn fingerprint_matches(row: &[u8], bits: usize, fp: u64, count: usize, mut hit: impl FnMut(usize)) {
+    if matches!(bits, 2 | 4) {
+        crate::packed_fingerprints::matches_rows(&[row], bits, fp, count, hit);
+        return;
+    }
     if bits == 1 {
         // Each XORed bit is already a comparison result. Screen 64 groups at
         // once, and never treat padding or adjacent origin bits as groups.
@@ -3776,8 +3784,70 @@ mod tests {
     }
 
     #[test]
+    fn selected_subbyte_ranges_match_independent_field_reference() {
+        for bits in [2usize, 4] {
+            let unit = 8 / bits;
+            let count = 513;
+            let ranges = [unit..unit * 5, unit * 9..unit * 17, unit * 33..count];
+            for hashes in [2, 5, 6, 7, 32] {
+                let data: Vec<Vec<u8>> = (0..hashes)
+                    .map(|h| {
+                        (0..(count * bits).div_ceil(8))
+                            .map(|i| splitmix64((h * 3333 + i) as u64) as u8)
+                            .collect()
+                    })
+                    .collect();
+                let rows: Vec<_> = data.iter().map(Vec::as_slice).collect();
+                for fp in 0..1u64 << bits {
+                    let expected: Vec<_> = ranges
+                        .iter()
+                        .flat_map(|range| range.clone())
+                        .filter(|&i| {
+                            rows.iter().fold(0u64, |v, r| {
+                                v ^ ((r[i * bits / 8] >> (i * bits % 8)) as u64 & ((1 << bits) - 1))
+                            }) == fp
+                        })
+                        .collect();
+                    let mut actual = Vec::new();
+                    fingerprint_matches_selected(&rows, bits, fp, &ranges, &mut |i| actual.push(i));
+                    assert_eq!(actual, expected, "bits={bits} hashes={hashes} fp={fp}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn staging_guard_cleans_partial_artifacts_on_error_and_unwind() {
+        let parent = temporary_stage();
+        let sentinel = parent.0.join("sentinel");
+        fs::write(&sentinel, b"keep").unwrap();
+        for panic in [false, true] {
+            let path = parent.0.join(format!("partial-{panic}"));
+            let result = std::panic::catch_unwind(|| -> Result<()> {
+                fs::create_dir(&path)?;
+                let _stage = Staging(path.clone());
+                for directory in ["features", "cells", "abandoned"] {
+                    fs::create_dir(path.join(directory))?;
+                    fs::write(path.join(directory).join("partial"), b"unfinished")?;
+                }
+                if panic {
+                    panic!("injected worker unwind");
+                }
+                anyhow::bail!("injected build error")
+            });
+            if panic {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().is_err());
+            }
+            assert!(!path.exists());
+            assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
+        }
+    }
+
+    #[test]
     fn fused_screening_matches_materialized_rows_for_all_widths_and_hash_counts() {
-        for bits in [1usize, 8, 16] {
+        for bits in [1usize, 2, 4, 8, 16] {
             for count in [1usize, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 257] {
                 for hashes in [2, 3, 4, 8, MAX_HASHES] {
                     let storage: Vec<Vec<u8>> = (0..hashes)
@@ -3801,7 +3871,7 @@ mod tests {
                             actual, expected,
                             "bits={bits} count={count} hashes={hashes}"
                         );
-                        if bits != 1 {
+                        if bits >= 8 {
                             actual.clear();
                             fingerprint_matches_rows_scalar(&rows, bits, fp, 0, &mut |i| {
                                 actual.push(i)
@@ -4095,7 +4165,7 @@ mod tests {
 
     #[test]
     fn tiled_planes_preserve_every_payload_across_banks() {
-        for fp_bits in [1, 8, 16] {
+        for fp_bits in [1, 2, 4, 8, 16] {
             let stage = temporary_stage();
             let mut groups = Vec::new();
             for (id, count) in [1, 2, 3, 64 - fp_bits].into_iter().enumerate() {
@@ -4361,7 +4431,7 @@ mod tests {
 
     #[test]
     fn fingerprint_planes_preserve_legacy_lookup_and_abandoned_union() {
-        for bits in [1usize, 8, 16] {
+        for bits in [1usize, 2, 4, 8, 16] {
             check_fingerprint_planes(bits);
         }
     }
@@ -4491,7 +4561,7 @@ mod tests {
     #[test]
     fn parallel_packed_ram_transpose_matches_disk_tiles_byte_for_byte() {
         let stage = temporary_stage();
-        for fp in [1usize, 8, 16] {
+        for fp in [1usize, 2, 4, 8, 16] {
             let make = |ram, prefix| {
                 (0..256)
                     .map(|id| {

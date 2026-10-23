@@ -692,7 +692,7 @@ fn non_default_hash_counts_and_feature_modes_use_matching_bank_addresses() {
     let seq = dna(500, 83);
     let reference = f.write("a.fa", format!(">a\n{seq}\n"));
     let inputs = f.write("inputs.fof", format!("a\t{reference}\nb\t{reference}\n"));
-    for hashes in [2, 3, 4, 5, 8, 32] {
+    for hashes in [2, 3, 4, 5, 6, 7, 8, 32] {
         let index = f.path(&format!("hashes-{hashes}"));
         build(
             &inputs,
@@ -824,7 +824,7 @@ fn all_cell_storage_modes_build_identical_filters_and_queries() {
         format!(">present\n{shared}\n>absent\n{}\n", dna(300, 999)),
     );
     for planner in ["streaming", "streaming-unpruned", "all-pairs"] {
-        for fp in ["1", "8", "16"] {
+        for fp in ["1", "2", "4", "8", "16"] {
             for order in ["width", "compression"] {
                 let mut outputs = Vec::new();
                 let mut manifests = Vec::new();
@@ -1099,7 +1099,7 @@ fn record_queries_match_aggregate_counts_and_preserve_order_across_workers() {
         "records.fa.zst",
         zstd::bulk::compress(fasta.as_bytes(), 1).unwrap(),
     );
-    for bits in ["1", "8", "16"] {
+    for bits in ["1", "2", "4", "8", "16"] {
         let index = f.path(&format!("records-fp{bits}"));
         build(&fof, &index, &["--fingerprint-bits", bits]);
         for recovery in [true, false] {

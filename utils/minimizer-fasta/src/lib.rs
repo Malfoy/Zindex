@@ -1,15 +1,42 @@
 //! Canonical SimdMinimizers FASTAs with bounded, ordered parallel processing.
 //! Each selected position is emitted once, including repeated seed values.
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
+use clap::ValueEnum;
+use deko::read::AnyDecoder;
 use flate2::{write::GzEncoder, Compression};
+use helicase::input::{FromReader, InputData};
+use helicase::lexer::{FastaLexer, Lexer};
+use helicase::ParserOptions;
 use packed_seq::{PackedSeqVec, SeqVec};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::{
     io::{Read, Write},
-    sync::mpsc::{self, SyncSender},
+    sync::{
+        mpsc::{self, SyncSender},
+        Arc, Mutex,
+    },
     thread,
 };
+
+/// Keep legacy selection by default; OCM shares Zindex's exact SIMD iterator.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum MinimizerScheme {
+    #[default]
+    Simd,
+    #[value(alias = "ocm")]
+    OpenClosedMod,
+}
+
+// Use Helicase's SIMD FASTA lexer directly: the record-level parser retains
+// entire uninterrupted chromosomes. Lexer blocks preserve bounded streaming
+// and original record coordinates without synthesizing FASTA records.
+const PARSER_CONFIG: helicase::Config = ParserOptions::default()
+    .ignore_headers()
+    .dna_string()
+    .split_non_actg()
+    .config();
 
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
@@ -17,6 +44,9 @@ pub struct Config {
     pub k: usize,
     /// Number of candidate k-mers per minimizer window.
     pub w: usize,
+    pub minimizer_scheme: MinimizerScheme,
+    /// OCM hash seed; the legacy SIMD scheme retains its original hashing.
+    pub seed: u64,
     pub chunk_bases: usize,
     pub batch_chunks: usize,
     /// None: plain FASTA. Some(0..=9): concatenated gzip members.
@@ -26,6 +56,10 @@ pub struct Config {
 impl Config {
     pub fn validate(self) -> Result<()> {
         ensure!((1..=64).contains(&self.k), "k must be in 1..=64");
+        ensure!(
+            self.minimizer_scheme != MinimizerScheme::OpenClosedMod || self.k <= 31,
+            "open-closed-mod seed length k must be in 1..=31"
+        );
         ensure!((1..=65535).contains(&self.w), "window must be in 1..=65535");
         ensure!(
             (self.k + self.w - 1) % 2 == 1,
@@ -100,22 +134,39 @@ fn encode_job(job: &Job, worker: &mut Worker, out: &mut Encoded, config: Config)
     let mut integer = itoa::Buffer::new();
     for run in job.seq.split(|&b| !is_dna(b)) {
         if run.len() >= config.k + config.w - 1 {
-            worker.packed.clear();
-            worker.packed.push_ascii(run);
-            worker.positions.clear();
-            let _ = simd_minimizers::canonical_minimizers(config.k, config.w)
-                .run(worker.packed.as_slice(), &mut worker.positions);
             // Canonical minimizer positions need not be monotone and may recur
             // non-adjacently. A reusable bitset provides exact sorted uniqueness
             // in linear time, without comparison sorting or changing tie rules.
             let positions = run.len() - config.k + 1;
             worker.marks.resize(positions.div_ceil(64), 0);
             worker.marks.fill(0);
-            for &position in &worker.positions {
-                let position = position as usize;
+            let marks = &mut worker.marks;
+            let mut mark = |position: usize| {
                 let absolute = job.base + offset + position;
                 if absolute >= job.owned_start && absolute < job.owned_end {
-                    worker.marks[position / 64] |= 1 << (position % 64);
+                    marks[position / 64] |= 1 << (position % 64);
+                }
+            };
+            match config.minimizer_scheme {
+                MinimizerScheme::Simd => {
+                    worker.packed.clear();
+                    worker.packed.push_ascii(run);
+                    worker.positions.clear();
+                    let _ = simd_minimizers::canonical_minimizers(config.k, config.w)
+                        .run(worker.packed.as_slice(), &mut worker.positions);
+                    for &position in &worker.positions {
+                        mark(position as usize);
+                    }
+                }
+                MinimizerScheme::OpenClosedMod => {
+                    // No ASCII->packed copy and no temporary position vector.
+                    ocm_minimizers::scan_positions(
+                        run,
+                        config.k + config.w - 1,
+                        config.k,
+                        config.seed,
+                        &mut |position, _| mark(position),
+                    );
                 }
             }
             for (block, &marked) in worker.marks.iter().enumerate() {
@@ -218,14 +269,9 @@ impl Producer {
         Ok(())
     }
 
-    fn base(&mut self, base: u8) -> Result<()> {
-        let base = base.to_ascii_uppercase();
-        self.seq.push(base);
-        self.length += 1;
-        self.run_length = if is_dna(base) { self.run_length + 1 } else { 0 };
-        self.stats.eligible_kmer_positions += u64::from(self.run_length >= self.config.k);
+    fn flush_ready(&mut self) -> Result<()> {
         let right = self.config.k + self.config.w - 2;
-        if self.length - self.next >= self.config.chunk_bases + right {
+        while self.length - self.next >= self.config.chunk_bases + right {
             let end = self.next + self.config.chunk_bases;
             self.push_job(end, end + right)?;
             // Every window that can select an owned start is present: w-1
@@ -238,9 +284,52 @@ impl Producer {
         }
         Ok(())
     }
+
+    fn valid_bases(&mut self, bases: &[u8]) -> Result<()> {
+        let old = self.seq.len();
+        self.seq.extend_from_slice(bases);
+        self.seq[old..].make_ascii_uppercase();
+        let old_eligible = self.run_length.saturating_sub(self.config.k - 1);
+        self.run_length += bases.len();
+        self.stats.eligible_kmer_positions +=
+            (self.run_length.saturating_sub(self.config.k - 1) - old_eligible) as u64;
+        self.length += bases.len();
+        self.flush_ready()
+    }
+
+    fn separator(&mut self, base: u8) -> Result<()> {
+        self.seq.push(base.to_ascii_uppercase());
+        self.length += 1;
+        self.run_length = 0;
+        self.flush_ready()
+    }
 }
 
-fn produce(mut reader: impl Read, config: Config, send: SyncSender<Vec<Job>>) -> Result<Stats> {
+// Helicase currently panics on reader errors. Decode outside it, record the
+// actual failure, then present EOF so all bounded pipeline threads can join.
+struct CheckedReader<R: Read> {
+    decoder: AnyDecoder<R>,
+    error: Arc<Mutex<Option<std::io::Error>>>,
+}
+impl<R: Read> Read for CheckedReader<R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.error.lock().unwrap().is_some() {
+            return Ok(0);
+        }
+        loop {
+            match self.decoder.read(out) {
+                Ok(n) => return Ok(n),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    *self.error.lock().unwrap() = Some(e);
+                    return Ok(0);
+                }
+            }
+        }
+    }
+}
+
+fn produce(reader: impl Read + Send, config: Config, send: SyncSender<Vec<Job>>) -> Result<Stats> {
     let mut producer = Producer {
         config,
         send,
@@ -252,38 +341,60 @@ fn produce(mut reader: impl Read, config: Config, send: SyncSender<Vec<Job>>) ->
         run_length: 0,
         stats: Stats::default(),
     };
-    let mut block = [0u8; 65536];
-    let (mut line_start, mut header) = (true, false);
-    loop {
-        let n = reader.read(&mut block)?;
-        if n == 0 {
-            break;
-        }
-        for &base in &block[..n] {
-            if header {
-                if base == b'\n' {
-                    header = false;
-                    line_start = true;
+    let error = Arc::new(Mutex::new(None));
+    let mut lexer = FastaLexer::<PARSER_CONFIG, _>::from_reader(CheckedReader {
+        decoder: AnyDecoder::new(reader),
+        error: Arc::clone(&error),
+    })?;
+    let mut line_start = true;
+    while let Some(block) = lexer.next() {
+        let bytes = lexer.input().current_block();
+        let mut i = 0;
+        while i < block.len {
+            if block.header >> i & 1 != 0 {
+                let n = ((block.header >> i).trailing_ones() as usize).min(block.len - i);
+                // Adjacent empty FASTA records may share one contiguous header
+                // mask, including their separating line feeds.
+                for &base in &bytes[i..i + n] {
+                    if line_start && base == b'>' {
+                        producer.finish_record()?;
+                        producer.stats.records += 1;
+                    } else {
+                        ensure!(
+                            producer.stats.records > 0,
+                            "sequence before FASTA header (FASTA input required)"
+                        );
+                    }
+                    line_start = base == b'\n';
                 }
+                i += n;
                 continue;
             }
-            if line_start && base == b'>' {
-                producer.finish_record()?;
-                producer.stats.records += 1;
-                header = true;
+            if block.is_dna >> i & 1 != 0 {
+                ensure!(
+                    producer.stats.records > 0,
+                    "sequence before FASTA header (FASTA input required)"
+                );
+                let n = ((block.is_dna >> i).trailing_ones() as usize).min(block.len - i);
+                producer.valid_bases(&bytes[i..i + n])?;
                 line_start = false;
+                i += n;
                 continue;
             }
+            let base = bytes[i];
             line_start = base == b'\n';
-            if base.is_ascii_whitespace() {
-                continue;
+            if !base.is_ascii_whitespace() {
+                ensure!(
+                    producer.stats.records > 0,
+                    "sequence before FASTA header (FASTA input required)"
+                );
+                producer.separator(base)?;
             }
-            ensure!(
-                producer.stats.records > 0,
-                "sequence before FASTA header (FASTA input required)"
-            );
-            producer.base(base)?;
+            i += 1;
         }
+    }
+    if let Some(error) = error.lock().unwrap().take() {
+        return Err(error).context("reading/decompressing FASTA stream");
     }
     producer.finish_record()?;
     if !producer.batch.is_empty() {

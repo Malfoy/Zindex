@@ -114,7 +114,7 @@ fn packed_power_banks_query_one_bit_for_all_planners_and_word_tails() {
 }
 
 #[test]
-fn packed_plain_one_bit_roundtrips_codecs_append_and_split_bins() {
+fn packed_plain_subbyte_widths_roundtrip_codecs_append_and_split_bins() {
     let f = Fixture::new();
     let reference = f.write("ref.fa", &format!(">ref\n{}\n", dna(400, 42)));
     let inputs = f.write(
@@ -133,156 +133,163 @@ fn packed_plain_one_bit_roundtrips_codecs_append_and_split_bins() {
         "query.fa",
         &format!(">present\n{}\n>absent\n{}\n", dna(400, 42), dna(400, 999)),
     );
-    for split in [false, true] {
-        let index = f.path(&format!("plain-{split}"));
-        let mut args = vec![
-            "build",
-            "--plain",
-            "--fof",
-            &inputs,
-            "--output",
-            &index,
-            "--k",
-            "31",
-            "--fingerprint-bits",
-            "1",
-            "--slot-scale",
-            "8",
-            "--stack-compression",
-            "none",
-            "--union-graph",
-        ];
-        if split {
-            args.extend([
-                "--technical-layout",
-                "split-large",
-                "--target-technical-features",
-                "100",
-            ]);
-        }
-        ok(&args, "4");
-        let info = ok(&["info", "--index", &index], "1");
-        assert_eq!(stat(&info, "fingerprint_bits"), 1);
-        assert_eq!(
-            stat(&info, "stack_bytes"),
-            stat(&info, "slots_per_technical_bin") * stat(&info, "technical_bins").div_ceil(8)
-        );
-        let present = ok(&["query", "--index", &index, "--query", &reference], "4");
-        assert_eq!(scores(&present), vec![370; 9]);
-        let expected = ok(
-            &[
-                "query",
-                "--index",
-                &index,
-                "--query",
-                &query,
-                "--ignore-union",
-            ],
-            "1",
-        );
-        for codec in [
-            "lz4",
-            "lz4-lib",
-            "lz4-hc",
-            "snappy",
-            "svb32-0124",
-            "fastpfor256",
-            "fastpfor-pack",
-        ] {
-            let repacked = f.path(&format!("codec-{split}-{codec}"));
-            ok(
-                &[
-                    "repack",
-                    "--index",
-                    &index,
-                    "--output",
-                    &repacked,
-                    "--stack-compression",
-                    codec,
-                ],
-                "1",
-            );
-            let actual = ok(
-                &[
-                    "query",
-                    "--index",
-                    &repacked,
-                    "--query",
-                    &query,
-                    "--ignore-union",
-                ],
-                "4",
-            );
-            assert_eq!(
-                rows(&expected),
-                rows(&actual),
-                "codec {codec}, split {split}"
-            );
-            let decoded = ok(
-                &[
-                    "query",
-                    "--index",
-                    &repacked,
-                    "--query",
-                    &query,
-                    "--decode-stack",
-                    "--ignore-union",
-                ],
-                "4",
-            );
-            assert_eq!(rows(&expected), rows(&decoded));
-            let appended = f.path(&format!("append-{split}-{codec}"));
-            ok(
-                &[
-                    "append", "--index", &repacked, "--fof", &extra, "--output", &appended,
-                ],
-                "4",
-            );
-            let info = ok(&["info", "--index", &appended], "1");
-            assert_eq!(
-                stat(&info, "stack_bytes"),
-                stat(&info, "slots_per_technical_bin") * stat(&info, "technical_bins").div_ceil(8)
-            );
-            let result = ok(&["query", "--index", &appended, "--query", &reference], "4");
-            assert_eq!(scores(&result), vec![370; 17]);
-        }
-    }
-}
-
-#[test]
-fn one_bit_minimizer_and_findere_queries_keep_present_features() {
-    let f = Fixture::new();
-    let reference = f.write("ref.fa", &format!(">ref\n{}\n", dna(800, 987)));
-    let inputs = f.write("inputs.fof", &format!("a\t{reference}\n"));
-    for mode in ["minimizers", "findere"] {
-        for plain in [false, true] {
-            let index = f.path(&format!("{mode}-{plain}"));
+    for bits in ["1", "2", "4"] {
+        for split in [false, true] {
+            let width: u64 = bits.parse().unwrap();
+            let index = f.path(&format!("plain-{bits}-{split}"));
             let mut args = vec![
                 "build",
+                "--plain",
                 "--fof",
                 &inputs,
                 "--output",
                 &index,
                 "--k",
-                "49",
+                "31",
                 "--fingerprint-bits",
-                "1",
-                "--index-mode",
-                mode,
+                bits,
+                "--slot-scale",
+                "8",
+                "--stack-compression",
+                "none",
+                "--union-graph",
             ];
-            if mode == "findere" {
-                args.extend(["--findere-z", "20"]);
-            }
-            if plain {
-                args.extend(["--plain", "--slot-scale", "8"]);
+            if split {
+                args.extend([
+                    "--technical-layout",
+                    "split-large",
+                    "--target-technical-features",
+                    "100",
+                ]);
             }
             ok(&args, "4");
-            let one = ok(&["query", "--index", &index, "--query", &reference], "1");
-            let four = ok(&["query", "--index", &index, "--query", &reference], "4");
-            assert_eq!(rows(&one), rows(&four));
-            let record = rows(&one)[1];
-            assert!(record.split('\t').nth(1).unwrap().parse::<u64>().unwrap() > 0);
-            assert_eq!(record.split('\t').nth(2), Some("1.00000000"));
+            let info = ok(&["info", "--index", &index], "1");
+            assert_eq!(stat(&info, "fingerprint_bits"), width);
+            assert_eq!(
+                stat(&info, "stack_bytes"),
+                stat(&info, "slots_per_technical_bin")
+                    * (stat(&info, "technical_bins") * width).div_ceil(8)
+            );
+            let present = ok(&["query", "--index", &index, "--query", &reference], "4");
+            assert_eq!(scores(&present), vec![370; 9]);
+            let expected = ok(
+                &[
+                    "query",
+                    "--index",
+                    &index,
+                    "--query",
+                    &query,
+                    "--ignore-union",
+                ],
+                "1",
+            );
+            for codec in [
+                "lz4",
+                "lz4-lib",
+                "lz4-hc",
+                "snappy",
+                "svb32-0124",
+                "fastpfor256",
+                "fastpfor-pack",
+            ] {
+                let repacked = f.path(&format!("codec-{bits}-{split}-{codec}"));
+                ok(
+                    &[
+                        "repack",
+                        "--index",
+                        &index,
+                        "--output",
+                        &repacked,
+                        "--stack-compression",
+                        codec,
+                    ],
+                    "1",
+                );
+                let actual = ok(
+                    &[
+                        "query",
+                        "--index",
+                        &repacked,
+                        "--query",
+                        &query,
+                        "--ignore-union",
+                    ],
+                    "4",
+                );
+                assert_eq!(
+                    rows(&expected),
+                    rows(&actual),
+                    "codec {codec}, split {split}"
+                );
+                let decoded = ok(
+                    &[
+                        "query",
+                        "--index",
+                        &repacked,
+                        "--query",
+                        &query,
+                        "--decode-stack",
+                        "--ignore-union",
+                    ],
+                    "4",
+                );
+                assert_eq!(rows(&expected), rows(&decoded));
+                let appended = f.path(&format!("append-{bits}-{split}-{codec}"));
+                ok(
+                    &[
+                        "append", "--index", &repacked, "--fof", &extra, "--output", &appended,
+                    ],
+                    "4",
+                );
+                let info = ok(&["info", "--index", &appended], "1");
+                assert_eq!(
+                    stat(&info, "stack_bytes"),
+                    stat(&info, "slots_per_technical_bin")
+                        * (stat(&info, "technical_bins") * width).div_ceil(8)
+                );
+                let result = ok(&["query", "--index", &appended, "--query", &reference], "4");
+                assert_eq!(scores(&result), vec![370; 17]);
+            }
+        }
+    }
+}
+
+#[test]
+fn packed_minimizer_and_findere_queries_keep_present_features() {
+    let f = Fixture::new();
+    let reference = f.write("ref.fa", &format!(">ref\n{}\n", dna(800, 987)));
+    let inputs = f.write("inputs.fof", &format!("a\t{reference}\n"));
+    for bits in ["1", "2", "4"] {
+        for mode in ["minimizers", "findere"] {
+            for plain in [false, true] {
+                let index = f.path(&format!("{bits}-{mode}-{plain}"));
+                let mut args = vec![
+                    "build",
+                    "--fof",
+                    &inputs,
+                    "--output",
+                    &index,
+                    "--k",
+                    "49",
+                    "--fingerprint-bits",
+                    bits,
+                    "--index-mode",
+                    mode,
+                ];
+                if mode == "findere" {
+                    args.extend(["--findere-z", "20"]);
+                }
+                if plain {
+                    args.extend(["--plain", "--slot-scale", "8"]);
+                }
+                ok(&args, "4");
+                let one = ok(&["query", "--index", &index, "--query", &reference], "1");
+                let four = ok(&["query", "--index", &index, "--query", &reference], "4");
+                assert_eq!(rows(&one), rows(&four));
+                let record = rows(&one)[1];
+                assert!(record.split('\t').nth(1).unwrap().parse::<u64>().unwrap() > 0);
+                assert_eq!(record.split('\t').nth(2), Some("1.00000000"));
+            }
         }
     }
 }
