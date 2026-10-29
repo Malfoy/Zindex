@@ -227,7 +227,9 @@ fn merged_origins_and_serialized_size_classes_query_correctly() {
     let index = f.path("merged");
     build(&inputs, &index, &[]);
     let info = ok(&["info", "--index", &index], "1");
-    assert!(info.contains("construction_cell_storage\ttwo-pass-temporary-disk-packed-tiled-packing"));
+    assert!(
+        info.contains("construction_cell_storage\ttwo-pass-temporary-disk-packed-tiled-packing")
+    );
     assert!(info.contains("merge_planner\tstreaming"));
     assert!(info.contains("merge_column_order\tcompression"));
     assert!(!Path::new(&index).join("cells").exists());

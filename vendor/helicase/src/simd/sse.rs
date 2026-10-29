@@ -5,79 +5,39 @@ use crate::lexer::*;
 use core::arch::x86_64::*;
 use core::mem::transmute;
 
-const GREATER_THAN: __m128i = unsafe { transmute([b'>'; 16]) };
 const LINE_FEED: __m128i = unsafe { transmute([b'\n'; 16]) };
 const ASCII_N: __m128i = unsafe { transmute([b'N'; 16]) };
 const LUT_ACTG: __m128i = unsafe { transmute(*b"A_C_T_G_________") };
 
+type Vectors = (__m128i, __m128i, __m128i, __m128i);
+
 #[inline(always)]
-pub fn extract_fasta_bitmask<const CONFIG: Config>(buf: &[u8]) -> FastaBitmask {
+pub fn load(buf: &[u8]) -> Vectors {
     unsafe {
         let ptr = buf.as_ptr() as *const __m128i;
-        let v1 = _mm_loadu_si128(ptr);
-        let v2 = _mm_loadu_si128(ptr.add(1));
-        let v3 = _mm_loadu_si128(ptr.add(2));
-        let v4 = _mm_loadu_si128(ptr.add(3));
-
-        let open_bracket = u8_mask(v1, v2, v3, v4, GREATER_THAN);
-        let line_feeds = u8_mask(v1, v2, v3, v4, LINE_FEED);
-
-        let (is_dna, two_bits, high_bit, low_bit, mask_non_actg, mask_n) =
-            bitpack_dna::<CONFIG>(v1, v2, v3, v4);
-
-        FastaBitmask {
-            open_bracket,
-            line_feeds,
-            is_dna,
-            two_bits,
-            high_bit,
-            low_bit,
-            mask_non_actg,
-            mask_n,
-        }
+        (
+            _mm_loadu_si128(ptr),
+            _mm_loadu_si128(ptr.add(1)),
+            _mm_loadu_si128(ptr.add(2)),
+            _mm_loadu_si128(ptr.add(3)),
+        )
     }
 }
 
 #[inline(always)]
-pub fn extract_fastq_bitmask<const CONFIG: Config>(buf: &[u8]) -> FastqBitmask {
-    unsafe {
-        let ptr = buf.as_ptr() as *const __m128i;
-        let v1 = _mm_loadu_si128(ptr);
-        let v2 = _mm_loadu_si128(ptr.add(1));
-        let v3 = _mm_loadu_si128(ptr.add(2));
-        let v4 = _mm_loadu_si128(ptr.add(3));
-
-        let line_feeds = u8_mask(v1, v2, v3, v4, LINE_FEED);
-
-        let (is_dna, two_bits, high_bit, low_bit, mask_non_actg, mask_n) =
-            bitpack_dna::<CONFIG>(v1, v2, v3, v4);
-
-        FastqBitmask {
-            line_feeds,
-            is_dna,
-            two_bits,
-            high_bit,
-            low_bit,
-            mask_non_actg,
-            mask_n,
-        }
-    }
+pub fn line_feeds((v1, v2, v3, v4): Vectors) -> u64 {
+    u8_mask(v1, v2, v3, v4, LINE_FEED)
 }
 
 #[inline(always)]
-fn bitpack_dna<const CONFIG: Config>(
-    v1: __m128i,
-    v2: __m128i,
-    v3: __m128i,
-    v4: __m128i,
-) -> (u64, u128, u64, u64, u64, u64) {
+pub fn scan_line_feeds(buf: &[u8]) -> u64 {
+    line_feeds(load(buf))
+}
+
+#[inline(always)]
+pub fn bitpack_dna<const CONFIG: Config>((v1, v2, v3, v4): Vectors) -> Bitmask {
     unsafe {
-        let mut is_dna = !0;
-        let mut two_bits = 0;
-        let mut high_bit = 0;
-        let mut low_bit = 0;
-        let mut mask_non_actg = 0;
-        let mut mask_n = 0;
+        let mut mask = Bitmask::ALL_DNA;
 
         if flag_is_set(CONFIG, COMPUTE_DNA_COLUMNAR) {
             let (mm_hi_1, mm_lo_1, mm_hi_2, mm_lo_2, mm_hi_3, mm_lo_3, mm_hi_4, mm_lo_4) = (
@@ -90,8 +50,8 @@ fn bitpack_dna<const CONFIG: Config>(
                 _mm_movemask_epi8(_mm_slli_epi16(v4, 5)) as u16 as u64,
                 _mm_movemask_epi8(_mm_slli_epi16(v4, 6)) as u16 as u64,
             );
-            high_bit = mm_hi_1 | (mm_hi_2 << 16) | (mm_hi_3 << 32) | (mm_hi_4 << 48);
-            low_bit = mm_lo_1 | (mm_lo_2 << 16) | (mm_lo_3 << 32) | (mm_lo_4 << 48);
+            mask.high_bit = mm_hi_1 | (mm_hi_2 << 16) | (mm_hi_3 << 32) | (mm_hi_4 << 48);
+            mask.low_bit = mm_lo_1 | (mm_lo_2 << 16) | (mm_lo_3 << 32) | (mm_lo_4 << 48);
         }
 
         if flag_is_set(CONFIG, COMPUTE_DNA_PACKED) {
@@ -115,7 +75,7 @@ fn bitpack_dna<const CONFIG: Config>(
                     | _pdep_u64(mm_lo_12, 0x5555555555555555);
                 let mm_2 = _pdep_u64(mm_hi_34, 0xAAAAAAAAAAAAAAAA)
                     | _pdep_u64(mm_lo_34, 0x5555555555555555);
-                two_bits = (mm_1 as u128) | ((mm_2 as u128) << 64);
+                mask.two_bits = (mm_1 as u128) | ((mm_2 as u128) << 64);
             }
             #[cfg(any(not(target_feature = "bmi2"), feature = "no-pdep"))]
             {
@@ -142,11 +102,14 @@ fn bitpack_dna<const CONFIG: Config>(
                 );
                 let mm_1 = mm_lo_1 | (mm_hi_1 << 16) | (mm_lo_2 << 32) | (mm_hi_2 << 48);
                 let mm_2 = mm_lo_3 | (mm_hi_3 << 16) | (mm_lo_4 << 32) | (mm_hi_4 << 48);
-                two_bits = (mm_1 as u128) | ((mm_2 as u128) << 64);
+                mask.two_bits = (mm_1 as u128) | ((mm_2 as u128) << 64);
             }
         }
 
-        if flag_is_set(CONFIG, SPLIT_NON_ACTG | COMPUTE_MASK_NON_ACTG) {
+        if flag_is_set(
+            CONFIG,
+            SPLIT_NON_ACTG | COMPUTE_MASK_NON_ACTG | COMPUTE_MASK_N,
+        ) {
             let mask_two_bits = _mm_set1_epi8(0b110i8);
             let mask_upper = _mm_set1_epi8(0b11011111u8 as i8);
             let uv1 = _mm_and_si128(v1, mask_upper);
@@ -173,17 +136,17 @@ fn bitpack_dna<const CONFIG: Config>(
                 ),
             );
             if flag_is_set(CONFIG, SPLIT_NON_ACTG) {
-                is_dna = mask_actg;
+                mask.is_dna = mask_actg;
             }
             if flag_is_set(CONFIG, COMPUTE_MASK_NON_ACTG) {
-                mask_non_actg = !mask_actg;
+                mask.mask_non_actg = !mask_actg;
             }
             if flag_is_set(CONFIG, COMPUTE_MASK_N) {
-                mask_n = u8_mask(uv1, uv2, uv3, uv4, ASCII_N);
+                mask.mask_n = u8_mask(uv1, uv2, uv3, uv4, ASCII_N);
             }
         }
 
-        (is_dna, two_bits, high_bit, low_bit, mask_non_actg, mask_n)
+        mask
     }
 }
 

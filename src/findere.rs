@@ -183,7 +183,8 @@ fn query_parser_preprocessed<State: Send>(
     let mut result = Scorer::new(k, z, colors)?.result;
     let mut workers = Vec::new();
     let mut batch = Batch::new();
-    while parser.next().is_some() {
+    while let Some(event) = parser.next() {
+        event?;
         let seq = parser.get_dna_string();
         result.stats.bases += seq.len() as u64;
         result.stats.chunks += 1;
@@ -293,7 +294,8 @@ mod tests {
             let mut parser = FastxParser::<PARSER_CONFIG>::from_slice(&fasta).unwrap();
             let mut raw_bases = 0;
             let mut chunks = 0;
-            while parser.next().is_some() {
+            while let Some(event) = parser.next() {
+                event.unwrap();
                 let seq = parser.get_dna_string();
                 raw_bases += seq.len() as u64;
                 chunks += 1;
@@ -348,7 +350,8 @@ mod tests {
         for (k, z) in [(31, 10), (41, 10), (31, 0), (255, 224)] {
             let mut reference = Scorer::new(k, z, 3).unwrap();
             let mut parser = FastxParser::<PARSER_CONFIG>::from_slice(&fasta).unwrap();
-            while parser.next().is_some() {
+            while let Some(event) = parser.next() {
+                event.unwrap();
                 reference.sequence(parser.get_dna_string(), &mut |key, hits| {
                     synthetic_hits(key, hits);
                 });

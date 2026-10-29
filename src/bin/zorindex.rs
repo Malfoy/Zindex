@@ -2681,7 +2681,8 @@ fn query_features_from_parser_parallel(
     let mut accum = QueryAccum::new(index.colors.len());
     let mut batch = Vec::with_capacity(QUERY_BATCH_FEATURES);
 
-    while parser.next().is_some() {
+    while let Some(event) = parser.next() {
+        event?;
         let seq = parser.get_dna_string();
         stats.bases += seq.len() as u64;
         stats.chunks += 1;

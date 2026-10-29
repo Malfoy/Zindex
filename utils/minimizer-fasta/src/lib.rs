@@ -4,18 +4,15 @@ use anyhow::{ensure, Context, Result};
 use clap::ValueEnum;
 use deko::read::AnyDecoder;
 use flate2::{write::GzEncoder, Compression};
-use helicase::input::{FromReader, InputData};
-use helicase::lexer::{FastaLexer, Lexer};
+use helicase::input::FromReader;
+use helicase::lexer::{Lexer, SCAN_MODE_DNA};
 use helicase::ParserOptions;
 use packed_seq::{PackedSeqVec, SeqVec};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::{
     io::{Read, Write},
-    sync::{
-        mpsc::{self, SyncSender},
-        Arc, Mutex,
-    },
+    sync::mpsc::{self, SyncSender},
     thread,
 };
 
@@ -305,25 +302,16 @@ impl Producer {
     }
 }
 
-// Helicase currently panics on reader errors. Decode outside it, record the
-// actual failure, then present EOF so all bounded pipeline threads can join.
-struct CheckedReader<R: Read> {
-    decoder: AnyDecoder<R>,
-    error: Arc<Mutex<Option<std::io::Error>>>,
-}
-impl<R: Read> Read for CheckedReader<R> {
+// Keep magic-based support for every existing codec and retry transient reads;
+// Helicase 1.2 propagates other reader failures through its fallible block API.
+struct DecodedReader<R: Read>(AnyDecoder<R>);
+impl<R: Read> Read for DecodedReader<R> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        if self.error.lock().unwrap().is_some() {
-            return Ok(0);
-        }
         loop {
-            match self.decoder.read(out) {
+            match self.0.read(out) {
                 Ok(n) => return Ok(n),
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    *self.error.lock().unwrap() = Some(e);
-                    return Ok(0);
-                }
+                Err(e) => return Err(e),
             }
         }
     }
@@ -341,33 +329,30 @@ fn produce(reader: impl Read + Send, config: Config, send: SyncSender<Vec<Job>>)
         run_length: 0,
         stats: Stats::default(),
     };
-    let error = Arc::new(Mutex::new(None));
-    let mut lexer = FastaLexer::<PARSER_CONFIG, _>::from_reader(CheckedReader {
-        decoder: AnyDecoder::new(reader),
-        error: Arc::clone(&error),
-    })?;
+    let mut lexer = Lexer::<PARSER_CONFIG, _>::from_reader(DecodedReader(AnyDecoder::new(reader)))?;
     let mut line_start = true;
-    while let Some(block) = lexer.next() {
-        let bytes = lexer.input().current_block();
+    let mut in_header = false;
+    while let Some(block) = lexer.next_block::<SCAN_MODE_DNA>() {
+        let block = block.context("reading/decompressing FASTA stream")?;
+        let bytes = lexer.current_block();
         let mut i = 0;
         while i < block.len {
-            if block.header >> i & 1 != 0 {
-                let n = ((block.header >> i).trailing_ones() as usize).min(block.len - i);
-                // Adjacent empty FASTA records may share one contiguous header
-                // mask, including their separating line feeds.
-                for &base in &bytes[i..i + n] {
-                    if line_start && base == b'>' {
-                        producer.finish_record()?;
-                        producer.stats.records += 1;
-                    } else {
-                        ensure!(
-                            producer.stats.records > 0,
-                            "sequence before FASTA header (FASTA input required)"
-                        );
-                    }
-                    line_start = base == b'\n';
+            if in_header {
+                let newline = block.newline >> i;
+                if newline == 0 {
+                    break;
                 }
-                i += n;
+                i += newline.trailing_zeros() as usize + 1;
+                in_header = false;
+                line_start = true;
+                continue;
+            }
+            if line_start && bytes[i] == b'>' {
+                producer.finish_record()?;
+                producer.stats.records += 1;
+                in_header = true;
+                line_start = false;
+                i += 1;
                 continue;
             }
             if block.is_dna >> i & 1 != 0 {
@@ -392,9 +377,6 @@ fn produce(reader: impl Read + Send, config: Config, send: SyncSender<Vec<Job>>)
             }
             i += 1;
         }
-    }
-    if let Some(error) = error.lock().unwrap().take() {
-        return Err(error).context("reading/decompressing FASTA stream");
     }
     producer.finish_record()?;
     if !producer.batch.is_empty() {
