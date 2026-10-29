@@ -98,8 +98,9 @@ files or a manifest cause an error instead of being overwritten or resumed.
   and intermediate position vector.
 - FASTA parsing uses Helicase's SIMD block lexer, not its record-buffering API.
   DNA spans are normalized and counted in bulk, without retaining complete
-  chromosomes. `vendor/helicase` contains upstream0.1.1 with only the lexer API
-  made public; parsing algorithms are unchanged. Magic-based gzip/xz/zstd/bzip2
+  chromosomes. `vendor/helicase` contains upstream 1.2.0 with a small API-only
+  exposure of its SIMD block classifier; upstream parsing algorithms are unchanged.
+  Fallible block reads propagate errors. Magic-based gzip/xz/zstd/bzip2
   decoding also applies to stdin and the library `generate` API. Decoder errors
   are returned rather than triggering a parser panic or silently accepting EOF.
 - Long chromosomes are streamed in bounded chunks, with both left and right

@@ -25,7 +25,7 @@ utils/ocm-minimizers/   shared dependency-free optimized OCM iterator
 
 ## Requirements
 
-- Rust stable toolchain
+- Rust stable toolchain (Helicase 1.2 requires Rust 1.89 or newer)
 - Enough RAM to hold the parsed feature sets during construction
 
 ## Build

@@ -1,10 +1,13 @@
-use std::fmt::{self, Write};
+use alloc::vec::Vec;
+use core::fmt::{self, Write};
 
 type T = u64;
 const BITS_PER_BP: usize = 1;
 const BITS_PER_BLOCK: usize = T::BITS as usize;
 const BP_PER_BLOCK: usize = BITS_PER_BLOCK / BITS_PER_BP;
 
+/// DNA sequence stored as two bit vectors, with (high, low) bits
+/// A = (0, 0), C = (0, 1), T = (1, 0), G = (1, 1).
 #[derive(Clone, Default)]
 pub struct ColumnarDNA {
     high_bits: Vec<T>,
@@ -15,6 +18,7 @@ pub struct ColumnarDNA {
 }
 
 impl ColumnarDNA {
+    /// Creates an empty sequence without allocating.
     #[inline(always)]
     pub const fn new() -> Self {
         Self {
@@ -26,32 +30,45 @@ impl ColumnarDNA {
         }
     }
 
+    /// Creates an empty sequence with room for at least `capacity` bases.
     #[inline(always)]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            high_bits: Vec::with_capacity(capacity),
-            low_bits: Vec::with_capacity(capacity),
+            high_bits: Vec::with_capacity(capacity.div_ceil(BP_PER_BLOCK)),
+            low_bits: Vec::with_capacity(capacity.div_ceil(BP_PER_BLOCK)),
             cur_hi: 0,
             cur_lo: 0,
             len: 0,
         }
     }
 
+    /// Returns the number of bases.
     #[inline(always)]
     pub const fn len(&self) -> usize {
         self.len
     }
 
+    /// Returns `true` if there are no bases.
     #[inline(always)]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    /// Returns the number of bases that fit without reallocating.
     #[inline(always)]
     pub const fn capacity(&self) -> usize {
-        self.high_bits.capacity()
+        self.high_bits.capacity() * BP_PER_BLOCK
     }
 
+    /// Reserves room for at least `additional_bases` more bases.
+    #[inline(always)]
+    pub fn reserve(&mut self, additional_bases: usize) {
+        let additional_words = additional_bases / BP_PER_BLOCK + 2;
+        self.high_bits.reserve(additional_words);
+        self.low_bits.reserve(additional_words);
+    }
+
+    /// Removes all bases, keeping the allocated memory.
     #[inline(always)]
     pub fn clear(&mut self) {
         self.high_bits.clear();
@@ -62,40 +79,93 @@ impl ColumnarDNA {
     }
 
     #[inline(always)]
+    pub(crate) fn pop_base(&mut self) {
+        if self.len > 0 {
+            let rem = self.len % BITS_PER_BLOCK;
+            self.len -= 1;
+            if rem == 0 {
+                if let Some(last_hi) = self.high_bits.pop() {
+                    let last_lo = self.low_bits.pop().unwrap();
+                    self.cur_hi = last_hi & ((1u64 << (BITS_PER_BLOCK - 1)) - 1);
+                    self.cur_lo = last_lo & ((1u64 << (BITS_PER_BLOCK - 1)) - 1);
+                }
+            } else {
+                self.cur_hi &= (1u64 << (rem - 1)) - 1;
+                self.cur_lo &= (1u64 << (rem - 1)) - 1;
+            }
+        }
+    }
+
+    /// Appends 64 bases given by their high and low bits.
+    #[inline(always)]
+    pub fn append_full(&mut self, high: T, low: T) {
+        let rem = self.len % BITS_PER_BLOCK;
+        self.len += BITS_PER_BLOCK;
+        let len = self.high_bits.len();
+        if len + 1 > self.high_bits.capacity() {
+            self.high_bits.reserve(64);
+            self.low_bits.reserve(64);
+        }
+        unsafe {
+            let h_ptr = self.high_bits.as_mut_ptr().add(len);
+            let l_ptr = self.low_bits.as_mut_ptr().add(len);
+            if rem == 0 {
+                h_ptr.write(high);
+                l_ptr.write(low);
+            } else {
+                let inv = BITS_PER_BLOCK - rem;
+                h_ptr.write(self.cur_hi | (high << rem));
+                l_ptr.write(self.cur_lo | (low << rem));
+                self.cur_hi = high >> inv;
+                self.cur_lo = low >> inv;
+            }
+            self.high_bits.set_len(len + 1);
+            self.low_bits.set_len(len + 1);
+        }
+    }
+
+    /// Appends the `size` bases given by the low bits of `high` and `low`, other bits are ignored.
+    /// `size` must be at most 64.
+    #[inline(always)]
     pub fn append(&mut self, high: T, low: T, size: usize) {
+        debug_assert!(size <= BP_PER_BLOCK);
         if size == 0 {
-            // should not happen?
             return;
         }
         let rem = self.len % BITS_PER_BLOCK;
         let mask = !0 >> (BITS_PER_BLOCK - size);
-        let shift_mask = ((rem > 0) as u64).wrapping_neg();
         self.len += size;
         let hi = high & mask;
         let lo = low & mask;
         if rem + size >= BITS_PER_BLOCK {
-            self.cur_hi |= high << rem;
-            self.cur_lo |= low << rem;
-            self.high_bits.push(self.cur_hi);
-            self.low_bits.push(self.cur_lo);
-            self.cur_hi = hi.wrapping_shr((BITS_PER_BLOCK - rem) as u32) & shift_mask;
-            self.cur_lo = lo.wrapping_shr((BITS_PER_BLOCK - rem) as u32) & shift_mask;
+            self.high_bits.push(self.cur_hi | (hi << rem));
+            self.low_bits.push(self.cur_lo | (lo << rem));
+            if rem > 0 {
+                self.cur_hi = hi >> (BITS_PER_BLOCK - rem);
+                self.cur_lo = lo >> (BITS_PER_BLOCK - rem);
+            } else {
+                self.cur_hi = 0;
+                self.cur_lo = 0;
+            }
         } else {
             self.cur_hi |= hi << rem;
             self.cur_lo |= lo << rem;
         }
     }
 
+    /// Returns the high bits as complete words of 64 bases, and the last partial word.
     #[inline(always)]
     pub fn high_bits(&self) -> (&[T], T) {
         (&self.high_bits, self.cur_hi)
     }
 
+    /// Returns the low bits as complete words of 64 bases, and the last partial word.
     #[inline(always)]
     pub fn low_bits(&self) -> (&[T], T) {
         (&self.low_bits, self.cur_lo)
     }
 
+    /// Returns the (high, low) bits of base `i`, which must be lower than [`len`](Self::len).
     #[inline(always)]
     pub fn get(&self, i: usize) -> (bool, bool) {
         if i < self.len & (!0 << BITS_PER_BLOCK.trailing_zeros()) {
@@ -111,6 +181,7 @@ impl ColumnarDNA {
         }
     }
 
+    /// Returns base `i` as `A`, `C`, `T` or `G`.
     #[inline(always)]
     pub fn get_char(&self, i: usize) -> char {
         match self.get(i) {
@@ -121,7 +192,7 @@ impl ColumnarDNA {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn push_ascii(&mut self, s: &[u8]) {
         for &ch in s {
             let (cur_hi, cur_lo) = match ch {
@@ -135,7 +206,7 @@ impl ColumnarDNA {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn push_str(&mut self, s: &str) {
         self.push_ascii(s.as_bytes());
     }
@@ -223,7 +294,7 @@ mod tests {
                 v.push_str("A");
             }
 
-            // Write 1–10 bits after the boundary
+            // Write 1-10 bits after the boundary
             for size in 1..10 {
                 let ch = letters[size & 3];
                 v.push_str(&ch.to_string());
@@ -281,5 +352,39 @@ mod tests {
 
         assert_eq!(v.len(), 128);
         assert_eq!(v.to_string(), "T".repeat(64) + &"C".repeat(64));
+    }
+
+    #[test]
+    fn append_full_aligned_and_unaligned() {
+        let mut aligned = ColumnarDNA::new();
+        aligned.append_full(!0u64, 0u64); // 64 T
+        aligned.append_full(0u64, !0u64); // 64 C
+        assert_eq!(aligned.to_string(), "T".repeat(64) + &"C".repeat(64));
+
+        let mut unaligned = ColumnarDNA::new();
+        unaligned.append(0b111, 0b111, 3); // 3 G
+        unaligned.append_full(!0u64, 0u64); // 64 T
+        unaligned.append_full(0u64, !0u64); // 64 C
+        assert_eq!(
+            unaligned.to_string(),
+            "GGG".to_string() + &"T".repeat(64) + &"C".repeat(64)
+        );
+    }
+
+    #[test]
+    fn test_pop_base() {
+        let mut v = ColumnarDNA::new();
+        v.append_full(!0u64, 0u64); // 64 T
+        assert_eq!(v.len(), 64);
+        v.pop_base();
+        assert_eq!(v.len(), 63);
+        assert_eq!(v.to_string(), "T".repeat(63));
+
+        // Pop across block boundary
+        v.append_full(0u64, !0u64); // 64 C
+        assert_eq!(v.len(), 63 + 64);
+        v.pop_base();
+        assert_eq!(v.len(), 63 + 63);
+        assert_eq!(v.to_string(), "T".repeat(63) + &"C".repeat(63));
     }
 }

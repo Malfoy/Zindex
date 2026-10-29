@@ -233,9 +233,8 @@ pub struct FastxStats {
     pub chunks: u64,
 }
 
-// Helicase's streaming reader panics on Read errors. Decode here and retain the
-// original error while presenting EOF to the parser, then return it as Result.
-// This also checks the compression trailer instead of accepting a damaged tail.
+// Decode here to retain codec support and original decoder errors. Reading to
+// completion also verifies compression trailers rather than accepting damaged tails.
 struct CheckedSequenceReader<R: Read> {
     decoder: AnyDecoder<R>,
     error: Arc<Mutex<Option<std::io::Error>>>,
@@ -415,7 +414,8 @@ where
     F: FnMut(u64),
 {
     let mut stats = FastxStats::default();
-    while parser.next().is_some() {
+    while let Some(event) = parser.next() {
+        event?;
         let seq = parser.get_dna_string();
         stats.bases += seq.len() as u64;
         stats.chunks += 1;
@@ -447,7 +447,8 @@ fn visit_sequence_parser(
     on_sequence: &mut impl FnMut(&[u8]),
 ) -> Result<FastxStats> {
     let mut stats = FastxStats::default();
-    while parser.next().is_some() {
+    while let Some(event) = parser.next() {
+        event?;
         let seq = parser.get_dna_string();
         stats.bases += seq.len() as u64;
         stats.chunks += 1;
@@ -1162,5 +1163,100 @@ mod tests {
         assert!(
             parse_features_from_reader(Cursor::new(compressed), 49, 69, config, |_| {}).is_err()
         );
+    }
+
+    #[test]
+    fn wrapped_crlf_features_match_unwrapped_sequence() {
+        use helicase::input::FromSlice;
+        use std::io::Cursor;
+
+        let mut dna: Vec<u8> = (0..180_101)
+            .map(|i| b"ACGT"[(splitmix64(i ^ 123) & 3) as usize])
+            .collect();
+        dna[1_025..1_031].fill(b'N');
+        dna[70_003..70_901].make_ascii_lowercase();
+        let configs = [
+            (31, FeatureConfig::legacy_kmers()),
+            (49, FeatureConfig::new(IndexMode::Minimizers, 31, 1)),
+            (
+                49,
+                FeatureConfig::new(IndexMode::Minimizers, 31, 1)
+                    .with_minimizer_scheme(MinimizerScheme::OpenClosedMod),
+            ),
+            (31, FeatureConfig::new(IndexMode::Findere, 21, 1)),
+            (
+                31,
+                FeatureConfig::legacy_kmers()
+                    .with_seed_pattern(Some(format!("{}#", "#_".repeat(15)).parse().unwrap())),
+            ),
+            (
+                31,
+                FeatureConfig::legacy_kmers().with_randstrobemers(Some(RandstrobeConfig {
+                    min_distance: 31,
+                    max_distance: 93,
+                })),
+            ),
+            (
+                31,
+                FeatureConfig::legacy_kmers().with_homopolymer_compression(true),
+            ),
+        ];
+        for (k, config) in configs {
+            // Compute the oracle directly from the original sequence, independently
+            // of FASTA parsing and line endings; N still separates feature runs.
+            let mut expected = Vec::new();
+            for run in dna.split(|base| encode_base(*base).is_none()) {
+                scan_index_features(run, k, 69, config, &mut |key| expected.push(key));
+            }
+            for eol in [&b"\n"[..], &b"\r\n"[..]] {
+                let mut raw = b">wrapped".to_vec();
+                raw.extend_from_slice(eol);
+                for line in dna.chunks(79) {
+                    raw.extend_from_slice(line);
+                    raw.extend_from_slice(eol);
+                }
+                let mut actual = Vec::new();
+                parse_features_from_parser(
+                    FastxParser::<PARSER_CONFIG>::from_slice(&raw).unwrap(),
+                    k,
+                    69,
+                    config,
+                    |key| actual.push(key),
+                )
+                .unwrap();
+                assert_eq!(actual, expected, "slice {config:?}, eol={eol:?}");
+                actual.clear();
+                parse_features_from_reader(Cursor::new(raw), k, 69, config, |key| actual.push(key))
+                    .unwrap();
+                assert_eq!(actual, expected, "stream {config:?}, eol={eol:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_fastq_events_propagate_for_slice_and_stream_inputs() {
+        use helicase::input::FromSlice;
+        use std::io::Cursor;
+        // These errors occur while iterating, rather than in the constructor.
+        // Treating Result<Event> as merely Some would silently accept truncation.
+        for raw in [&b"@header_without_newline"[..], &b"@read\nACGT\n+\nII"[..]] {
+            let parser = FastxParser::<PARSER_CONFIG>::from_slice(raw).unwrap();
+            assert!(parse_features_from_parser(
+                parser,
+                3,
+                69,
+                FeatureConfig::legacy_kmers(),
+                |_| {}
+            )
+            .is_err());
+            assert!(parse_features_from_reader(
+                Cursor::new(raw.to_vec()),
+                3,
+                69,
+                FeatureConfig::legacy_kmers(),
+                |_| {}
+            )
+            .is_err());
+        }
     }
 }

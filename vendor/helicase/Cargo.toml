@@ -11,8 +11,9 @@
 
 [package]
 edition = "2024"
+rust-version = "1.89"
 name = "helicase"
-version = "0.1.1"
+version = "1.2.0"
 authors = [
     "Igor Martayan",
     "Charles Paperman",
@@ -39,63 +40,186 @@ repository = "https://github.com/imartayan/helicase"
 
 [package.metadata.docs.rs]
 all-features = true
+rustdoc-args = [
+    "--cfg",
+    "docsrs",
+]
 
 [features]
-bz2 = ["deko/bzip2"]
+bz2 = [
+    "std",
+    "deko/bzip2",
+]
 default = [
+    "std",
     "gz",
     "zstd",
 ]
 gz = [
-    "deko/flate2",
-    "flate2",
+    "std",
+    "dep:sirocco",
 ]
+needletail = ["std"]
 no-pdep = []
-xz = ["deko/xz"]
-zstd = ["deko/zstd"]
+packed-seq = [
+    "std",
+    "dep:packed-seq",
+]
+paraseq = [
+    "std",
+    "dep:paraseq",
+]
+std = [
+    "dep:deko",
+    "dep:memmap2",
+    "memchr/std",
+    "sirocco?/std",
+]
+xz = [
+    "std",
+    "deko/xz",
+]
+zstd = [
+    "std",
+    "dep:zstd",
+]
 
 [lib]
 name = "helicase"
 path = "src/lib.rs"
+bench = false
 
 [[example]]
 name = "fq_to_fa"
 path = "examples/fq_to_fa.rs"
+required-features = ["std"]
 
 [[example]]
 name = "histogram"
 path = "examples/histogram.rs"
+required-features = ["std"]
 
 [[example]]
 name = "minimal"
 path = "examples/minimal.rs"
+required-features = ["std"]
+
+[[example]]
+name = "needletail_kmers"
+path = "examples/needletail_kmers.rs"
+required-features = ["needletail"]
 
 [[example]]
 name = "packed"
 path = "examples/packed.rs"
 required-features = ["packed-seq"]
 
+[[example]]
+name = "parallel_len"
+path = "examples/parallel_len.rs"
+required-features = ["std"]
+
+[[example]]
+name = "paraseq_parallel_len"
+path = "examples/paraseq_parallel_len.rs"
+required-features = ["paraseq"]
+
+[[test]]
+name = "buffer_boundaries"
+path = "tests/buffer_boundaries.rs"
+
+[[test]]
+name = "configurations"
+path = "tests/configurations.rs"
+
+[[test]]
+name = "differential_needletail"
+path = "tests/differential_needletail.rs"
+
+[[test]]
+name = "edge_cases"
+path = "tests/edge_cases.rs"
+
+[[test]]
+name = "error_handling"
+path = "tests/error_handling.rs"
+
+[[test]]
+name = "generic_inputs"
+path = "tests/generic_inputs.rs"
+
+[[test]]
+name = "needletail_helpers"
+path = "tests/needletail_helpers.rs"
+
+[[test]]
+name = "parallel"
+path = "tests/parallel.rs"
+
+[[test]]
+name = "parsers"
+path = "tests/parsers.rs"
+
+[[test]]
+name = "random_inputs"
+path = "tests/random_inputs.rs"
+
+[[test]]
+name = "reject_non_actg"
+path = "tests/reject_non_actg.rs"
+
+[[test]]
+name = "sirocco_test"
+path = "tests/sirocco_test.rs"
+
+[[test]]
+name = "wrapped"
+path = "tests/wrapped.rs"
+
+[[test]]
+name = "zstd_test"
+path = "tests/zstd_test.rs"
+
 [dependencies.deko]
 version = "0.6"
-default-features = false
-
-[dependencies.flate2]
-version = "1.1"
-features = ["zlib-rs"]
 optional = true
+default-features = false
 
 [dependencies.memchr]
 version = "2.8"
+default-features = false
 
 [dependencies.memmap2]
 version = "0.9"
+optional = true
 
 [dependencies.packed-seq]
-version = "4.4"
+version = "5.1"
 optional = true
 default-features = false
 
 [dependencies.paraseq]
-version = "0.4"
+version = "0.6"
 optional = true
 default-features = false
+
+[dependencies.sirocco]
+version = "0.3"
+optional = true
+default-features = false
+
+[dependencies.zstd]
+version = "0.14"
+optional = true
+default-features = false
+
+[dev-dependencies.flate2]
+version = "1.1"
+features = ["zlib-rs"]
+
+[dev-dependencies.needletail]
+version = "0.7"
+default-features = false
+
+[dev-dependencies.zstd]
+version = "0.14"

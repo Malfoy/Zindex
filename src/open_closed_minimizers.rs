@@ -284,7 +284,8 @@ mod tests {
                 }
                 let mut parser =
                     FastxParser::<{ crate::PARSER_CONFIG }>::from_slice(&data).unwrap();
-                while parser.next().is_some() {
+                while let Some(event) = parser.next() {
+                    event.unwrap();
                     records.push(parser.get_dna_string().to_vec());
                 }
             }
