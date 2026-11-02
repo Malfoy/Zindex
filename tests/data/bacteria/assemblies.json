@@ -1,0 +1,20 @@
+[
+  {
+    "accession": "GCF_000005845.2",
+    "organism": "Escherichia coli str. K-12 substr. MG1655",
+    "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/005/845/GCF_000005845.2_ASM584v2/GCF_000005845.2_ASM584v2_genomic.fna.gz",
+    "ncbi_md5": "c13d459b5caa702ff7e1f26fe44b8ad7"
+  },
+  {
+    "accession": "GCF_000008865.2",
+    "organism": "Escherichia coli O157:H7 str. Sakai",
+    "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/008/865/GCF_000008865.2_ASM886v2/GCF_000008865.2_ASM886v2_genomic.fna.gz",
+    "ncbi_md5": "e7bf4b6a0fa4cbd17a2cac69125311e0"
+  },
+  {
+    "accession": "GCF_000009045.1",
+    "organism": "Bacillus subtilis subsp. subtilis str. 168",
+    "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/009/045/GCF_000009045.1_ASM904v1/GCF_000009045.1_ASM904v1_genomic.fna.gz",
+    "ncbi_md5": "87378255941a61ec4b4384af8ba28ff5"
+  }
+]

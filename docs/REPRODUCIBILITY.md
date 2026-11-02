@@ -9,11 +9,12 @@ defaults must not be described as reproducing those large-collection results.
 
 | Material | Location | What it establishes |
 |---|---|---|
-| Fixed tiny inputs and expected hits | `examples/tiny/`, `scripts/demo.sh` | Installation and functional behavior |
+| Fixed tiny inputs and expected hits | `tests/data/tiny/`, `utils/scripts/demo.sh` | Installation and functional behavior |
 | Correctness tests | `tests/`, workspace unit tests | Covered extraction, storage, query and CLI combinations |
-| One-run measurement runner | `scripts/benchmark_zindex.py` | Reproducible commands, timing boundaries and artifact capture on a supplied collection |
+| One-run measurement runner | `utils/scripts/benchmark_zindex.py` | Reproducible commands, timing boundaries and artifact capture on a supplied collection |
 | Historical optimization summaries | `docs/OPTIMIZATION_BENCHMARK.txt`, `docs/GENERAL_CASE_OPTIMIZATIONS.md` | Recorded measurements of their explicitly identified historical versions |
-| Small bacterial accession list | `benchmarks/accessions_128_bacterial.txt` | A list of 128 accessions, not the manuscript collections |
+| Small bacterial accession list | `docs/benchmarks/accessions_128_bacterial.txt` | A list of 128 accessions, not the manuscript collections |
+| Optional three-genome example | `tests/data/bacteria/`, `utils/scripts/prepare_bacteria_example.py` | Verified downloads and source-mapped forward/reverse queries |
 
 Historical summaries refer to local, git-ignored experiment directories. Those
 paths identify provenance; they are not downloadable artifacts. Their frozen
@@ -44,8 +45,8 @@ bundle needs:
 Large input files can be distributed through a stable external archive; the
 repository should provide the archive identifiers, checksums and retrieval
 instructions. No archive URL, DOI, paper citation or missing historical command
-is invented here. The current working tree is an unreleased candidate until it
-has been reviewed, committed and given an identified release.
+is invented here. For publication replication, identify an exact commit or an
+immutable tagged release together with its experiment artifacts; main can change.
 
 ## Measurement conventions
 

@@ -8,7 +8,7 @@ The example checker additionally uses Bash and Python 3.
   cd Zindex
   cargo build --release --locked
   ./target/release/zorindex --version
-  bash scripts/demo.sh
+  bash utils/scripts/demo.sh
 
 Build locally: target-cpu=native is enabled. Do not copy native binaries to a
 different CPU without rebuilding. For portable x86-64, set

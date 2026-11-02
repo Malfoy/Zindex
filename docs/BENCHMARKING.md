@@ -1,6 +1,6 @@
 # Benchmarking
 
-Start with `bash scripts/demo.sh` to verify installation. Keep real datasets,
+Start with `bash utils/scripts/demo.sh` to verify installation. Keep real datasets,
 indexes and measurement directories outside the versioned source tree.
 
 ## One-run measurement runner
@@ -9,7 +9,7 @@ On Linux with Python 3 and GNU `/usr/bin/time`:
 
 ```bash
 cargo build --release --locked
-python3 scripts/benchmark_zindex.py \
+python3 utils/scripts/benchmark_zindex.py \
   --fof /data/samples.fof --positive /data/positive.fa.gz \
   --negative /data/negative.fa.gz --threads 32 \
   --output /results/zindex-one-run
@@ -26,7 +26,7 @@ slot-scale 1.0, planning margin 0.03, streaming planning, compression column
 order, no-heuristic/tie-scan 1 and fixed 64-cell segments. The full build command
 and actual manifest are retained. Parameter options include hash/fingerprint
 width, planner, maximum subindexes, minimum documents, maximum subindex bytes,
-and query memory mode; see `python3 scripts/benchmark_zindex.py --help`.
+and query memory mode; see `python3 utils/scripts/benchmark_zindex.py --help`.
 
 The runner disables skipping oversized documents and checks the final document
 count. A failed full-collection build is a failed point, not a smaller benchmark.
