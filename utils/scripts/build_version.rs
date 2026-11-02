@@ -16,7 +16,7 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
 pub fn emit(root: &Path) {
     println!(
         "cargo:rerun-if-changed={}",
-        root.join("scripts/build_version.rs").display()
+        root.join("utils/scripts/build_version.rs").display()
     );
     let package = std::env::var("CARGO_PKG_VERSION").unwrap();
     let version = if git(root, &["rev-parse", "--show-toplevel"])

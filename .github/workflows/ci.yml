@@ -25,17 +25,19 @@ jobs:
           components: rustfmt
       - name: Format
         run: cargo fmt --all --check
+      - name: Offline example-download tests
+        run: python3 -m unittest discover -s tests -p 'test_bacteria_example.py'
       - name: Test
         run: cargo test --workspace --release --locked
       - name: Build command-line tools
         run: cargo build --workspace --release --locked --bins
       - name: Checked demonstration
-        run: bash scripts/demo.sh "$RUNNER_TEMP/zindex-demo-${{ matrix.cpu }}"
+        run: bash utils/scripts/demo.sh "$RUNNER_TEMP/zindex-demo-${{ matrix.cpu }}"
       - name: Check benchmark recorder on tiny inputs
         run: >-
-          python3 scripts/benchmark_zindex.py
-          --fof examples/tiny/samples.fof
-          --positive examples/tiny/a-only.fa --negative examples/tiny/negative.fa
+          python3 utils/scripts/benchmark_zindex.py
+          --fof tests/data/tiny/samples.fof
+          --positive tests/data/tiny/a-only.fa --negative tests/data/tiny/negative.fa
           --threads 2 --hash-inputs --hash-index
           --output "$RUNNER_TEMP/zindex-recorder-${{ matrix.cpu }}"
       - name: Preserve failed example logs

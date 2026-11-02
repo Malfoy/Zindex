@@ -1,6 +1,6 @@
 # Small functional example
 
-Run `bash scripts/demo.sh` from the repository root after
+Run `bash utils/scripts/demo.sh` from the repository root after
 `cargo build --release --locked`. No genome downloads are required.
 
 The three references each contain 8,192 synthetic DNA bases. `a` and `b` share
@@ -20,7 +20,7 @@ false positives on other data.
 
 `samples.fof` uses paths relative to the repository root. The demonstration uses
 native open-closed mod minimizers for Zindex and SIMD minimizers for Bindex;
-these select different seed sets. See `docs/COLLABORATOR.txt` for a comparison
+these select different seed sets. See the [comparison commands](../../../docs/COLLABORATOR.txt) for a comparison
 that deliberately uses the same SIMD selector in both tools.
 
 Output files are generated outside this example directory. The script preserves

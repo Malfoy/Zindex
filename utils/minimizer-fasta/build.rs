@@ -1,4 +1,4 @@
-#[path = "../../scripts/build_version.rs"]
+#[path = "../scripts/build_version.rs"]
 mod build_version;
 
 fn main() {

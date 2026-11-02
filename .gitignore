@@ -38,7 +38,9 @@
 *.swp
 *.swo
 *~
+__pycache__/
+*.py[cod]
 
 # Small, versioned demonstration inputs are intentional source fixtures.
-!/examples/tiny/*.fa
-!/examples/tiny/*.tsv
+!/tests/data/tiny/*.fa
+!/tests/data/tiny/*.tsv

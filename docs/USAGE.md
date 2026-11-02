@@ -1,7 +1,7 @@
 # Detailed usage and implementation notes
 
 Start with the [getting-started guide](../README.md) and
-`bash scripts/demo.sh` for a runnable example. All commands below run from the
+`bash utils/scripts/demo.sh` for a runnable example. All commands below run from the
 repository root after building. This guide also describes the legacy comparison
 layouts and advanced implementation choices.
 
@@ -30,7 +30,7 @@ utils/ocm-minimizers/   shared dependency-free optimized OCM iterator
 
 ## Requirements
 
-- Rust stable toolchain (Helicase 1.2 requires Rust 1.89 or newer)
+- Rust through rustup, which selects the pinned Rust 1.97.0 toolchain (language minimum 1.89)
 - Enough RAM to hold the parsed feature sets during construction
 
 ## Build
@@ -637,7 +637,7 @@ or `--merge-planner naive` for ordered placement without dataset unions.
 The streaming planner merges each dataset into the best existing group as it
 arrives, so the input order matters: an order that keeps related genomes
 adjacent gives smaller groups, fewer candidate evaluations and a smaller index.
-`scripts/sort_fof_by_lineage.py LINEAGE_TSV IN.fof OUT.fof` orders a FOF by
+`utils/scripts/sort_fof_by_lineage.py LINEAGE_TSV IN.fof OUT.fof` orders a FOF by
 phylum, class, order, family, genus and species from a lineage table (the
 661k-bacteria `File2_taxid_lineage` layout); datasets without a lineage go last.
 All modes default to `--merge-column-order compression`: within each bank's

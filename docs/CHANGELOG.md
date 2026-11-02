@@ -2,8 +2,14 @@
 
 ## Unreleased
 
-This section describes the local candidate for review. It is not a published
-release, and no existing release tag has been moved.
+This section describes development changes on main that are not part of a
+tagged release. Existing published release tags have not been moved.
+
+- Simplify the landing page and consolidate the repository into five main
+  directories: src, tests, utils, docs and vendor. Move fixtures under tests/data,
+  helper scripts under utils/scripts, and build support under .cargo.
+- Add an optional, checksum-verified three-genome bacterial example alongside
+  the bundled synthetic demonstration.
 
 - Pin the tested Rust 1.97.0 toolchain for local and CI builds, avoiding the
   Rust 1.99.1 native-target LLVM failure observed in the Bzip2 dependency.
@@ -27,7 +33,7 @@ Subindex partitioning changes filter cells and approximate false-positive
 identities. Memory guards can exclude oversized input documents; their reports
 must be checked before treating an index as the complete requested collection.
 Feature extraction identities and index format versions are described in
-[FORMAT.md](docs/FORMAT.md). Package version numbers are separate from those
+[FORMAT.md](FORMAT.md). Package version numbers are separate from those
 format versions. Build output reports the Git revision and dirty status so two
 builds sharing package version `0.1.0` can be distinguished.
 
