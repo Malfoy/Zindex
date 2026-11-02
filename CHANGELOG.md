@@ -5,6 +5,10 @@
 This section describes the local candidate for review. It is not a published
 release, and no existing release tag has been moved.
 
+- Pin the tested Rust 1.97.0 toolchain for local and CI builds, avoiding the
+  Rust 1.99.1 native-target LLVM failure observed in the Bzip2 dependency.
+  Make the findere worker-participation test independent of scheduler speed.
+
 - Integrate Helicase 1.2.0, propagate parsing errors and retain seeds crossing
   CRLF-wrapped sequence lines. Preserve bounded streaming in minimizer-fasta.
 - Default merged queries to one resident subindex, extracting queries and

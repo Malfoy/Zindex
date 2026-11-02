@@ -23,6 +23,10 @@ baseline. AVX2 accelerates supported kernels; portable fallbacks are available.
 Other platforms are not currently covered by CI.
 
 Requirements: Git, Rust 1.89 or newer with Cargo, and a C/C++ toolchain.
+The repository pins Rust 1.97.0 in `rust-toolchain.toml` for reproducible builds;
+rustup selects it automatically. CI uses the same version. This also avoids an
+LLVM code-generation failure observed with Rust 1.99.1 when compiling the
+Bzip2 dependency for an AVX-512-capable native target.
 On Debian/Ubuntu, install native build tools with
 `sudo apt install build-essential pkg-config`. Python 3 and Bash are additionally
 needed for the demonstration and benchmark runner.

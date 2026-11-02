@@ -395,6 +395,9 @@ mod tests {
 
     #[test]
     fn multiple_workers_execute_both_long_record_and_short_record_queries() {
+        use std::sync::{Condvar, Mutex};
+        use std::time::Duration;
+
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(4)
             .build()
@@ -405,6 +408,7 @@ mod tests {
         ] {
             let seen = AtomicUsize::new(0);
             let calls = AtomicUsize::new(0);
+            let started = (Mutex::new(0usize), Condvar::new());
             let result = pool.install(|| {
                 query_parser(
                     FastxParser::<PARSER_CONFIG>::from_slice(fasta.as_bytes()).unwrap(),
@@ -414,10 +418,25 @@ mod tests {
                     || 0usize,
                     |local, _, hits| {
                         *local += 1;
-                        seen.fetch_or(
-                            1 << rayon::current_thread_index().expect("Rayon worker"),
-                            Ordering::Relaxed,
-                        );
+                        let worker = 1 << rayon::current_thread_index().expect("Rayon worker");
+                        seen.fetch_or(worker, Ordering::Relaxed);
+                        if *local == 1 {
+                            // A cheap workload can legitimately finish on one
+                            // Rayon worker before another gets scheduled. Keep
+                            // the first lookup pending until a second worker
+                            // participates, instead of relying on machine speed.
+                            // The timeout still rejects a serial regression.
+                            let (lock, ready) = &started;
+                            let mut mask = lock.lock().unwrap();
+                            *mask |= worker;
+                            ready.notify_all();
+                            let (mask, _) = ready
+                                .wait_timeout_while(mask, Duration::from_secs(10), |mask| {
+                                    mask.count_ones() < 2
+                                })
+                                .unwrap();
+                            assert!(mask.count_ones() > 1, "no second lookup worker started");
+                        }
                         calls.fetch_add(1, Ordering::Relaxed);
                         let probed = *local % 2 == 0;
                         hits[0] = u64::from(probed);
