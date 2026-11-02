@@ -238,6 +238,9 @@ pub struct FastxStats {
 struct CheckedSequenceReader<R: Read> {
     decoder: AnyDecoder<R>,
     error: Arc<Mutex<Option<std::io::Error>>>,
+    byte_limit: Option<u64>,
+    decoded_bytes: u64,
+    limit_exceeded: Arc<std::sync::atomic::AtomicBool>,
 }
 impl<R: Read> Read for CheckedSequenceReader<R> {
     fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
@@ -245,8 +248,28 @@ impl<R: Read> Read for CheckedSequenceReader<R> {
             return Ok(0);
         }
         loop {
-            match self.decoder.read(output) {
-                Ok(n) => return Ok(n),
+            let remaining = self
+                .byte_limit
+                .map(|n| n.saturating_sub(self.decoded_bytes));
+            let length = remaining.map_or(output.len(), |n| {
+                output.len().min(n.min(usize::MAX as u64) as usize)
+            });
+            let mut probe = [0u8; 1];
+            let target = if length == 0 && !output.is_empty() {
+                &mut probe[..]
+            } else {
+                &mut output[..length]
+            };
+            match self.decoder.read(target) {
+                Ok(n) => {
+                    if remaining == Some(0) && n != 0 {
+                        self.limit_exceeded
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        return Ok(0);
+                    }
+                    self.decoded_bytes = self.decoded_bytes.saturating_add(n as u64);
+                    return Ok(n);
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) => {
                     *self.error.lock().unwrap() = Some(error);
@@ -261,12 +284,36 @@ fn with_streaming_parser<R: Read + Send + 'static, T>(
     reader: R,
     visit: impl FnOnce(FastxParser<'static, PARSER_CONFIG>) -> Result<T>,
 ) -> Result<T> {
+    with_streaming_parser_limit(reader, None, visit)
+}
+
+#[derive(Debug)]
+pub struct DecodedInputTooLarge(pub u64);
+impl std::fmt::Display for DecodedInputTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "decompressed input exceeds {} byte guard", self.0)
+    }
+}
+impl std::error::Error for DecodedInputTooLarge {}
+
+fn with_streaming_parser_limit<R: Read + Send + 'static, T>(
+    reader: R,
+    byte_limit: Option<u64>,
+    visit: impl FnOnce(FastxParser<'static, PARSER_CONFIG>) -> Result<T>,
+) -> Result<T> {
     let error = Arc::new(Mutex::new(None));
+    let limit_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let parser = FastxParser::from_reader(CheckedSequenceReader {
         decoder: AnyDecoder::new(reader),
         error: Arc::clone(&error),
+        byte_limit,
+        decoded_bytes: 0,
+        limit_exceeded: Arc::clone(&limit_exceeded),
     });
     let result = parser.map_err(anyhow::Error::from).and_then(visit);
+    if limit_exceeded.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(DecodedInputTooLarge(byte_limit.unwrap()).into());
+    }
     if let Some(error) = error.lock().unwrap().take() {
         return Err(error).context("reading/decompressing sequence stream");
     }
@@ -404,7 +451,7 @@ pub fn parse_features_from_reader<R: Read + Send + 'static, F: FnMut(u64)>(
 }
 
 pub fn parse_features_from_parser<F>(
-    mut parser: FastxParser<'_, PARSER_CONFIG>,
+    parser: FastxParser<'_, PARSER_CONFIG>,
     k: usize,
     seed: u64,
     feature_config: FeatureConfig,
@@ -413,13 +460,67 @@ pub fn parse_features_from_parser<F>(
 where
     F: FnMut(u64),
 {
+    try_parse_features_from_parser(parser, k, seed, feature_config, |key| {
+        on_feature(key);
+        Ok(())
+    })
+}
+
+/// Fallible extraction stops after the current record on callback error. This
+/// lets construction abandon an oversized document without growing its vector.
+pub fn try_parse_features_from_file<F>(
+    path: &Path,
+    k: usize,
+    seed: u64,
+    feature_config: FeatureConfig,
+    max_decoded_bytes: Option<u64>,
+    on_feature: F,
+) -> Result<FastxStats>
+where
+    F: FnMut(u64) -> Result<()>,
+{
+    if is_compressed_path(path) {
+        return with_streaming_parser_limit(File::open(path)?, max_decoded_bytes, |parser| {
+            try_parse_features_from_parser(parser, k, seed, feature_config, on_feature)
+        })
+        .with_context(|| format!("parsing compressed {}", path.display()));
+    }
+    try_parse_features_from_parser(
+        FastxParser::<PARSER_CONFIG>::from_file_mmap(path)?,
+        k,
+        seed,
+        feature_config,
+        on_feature,
+    )
+}
+
+fn try_parse_features_from_parser<F>(
+    mut parser: FastxParser<'_, PARSER_CONFIG>,
+    k: usize,
+    seed: u64,
+    feature_config: FeatureConfig,
+    mut on_feature: F,
+) -> Result<FastxStats>
+where
+    F: FnMut(u64) -> Result<()>,
+{
     let mut stats = FastxStats::default();
     while let Some(event) = parser.next() {
         event?;
         let seq = parser.get_dna_string();
         stats.bases += seq.len() as u64;
         stats.chunks += 1;
-        scan_index_features(seq, k, seed, feature_config, &mut on_feature);
+        let mut failure = None;
+        scan_index_features(seq, k, seed, feature_config, &mut |key| {
+            if failure.is_none() {
+                if let Err(error) = on_feature(key) {
+                    failure = Some(error);
+                }
+            }
+        });
+        if let Some(error) = failure {
+            return Err(error);
+        }
     }
     Ok(stats)
 }

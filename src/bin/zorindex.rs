@@ -36,8 +36,8 @@ const SPLIT_SEED_XOR: u64 = 0xA54D_BA5E_1F2C_8D93;
 #[derive(Parser, Debug)]
 #[command(
     name = "zorindex",
-    version,
-    about = "Approximate colored k-mer index using stacked pure ZOR filters"
+    version = env!("ZINDEX_BUILD_VERSION"),
+    about = "Approximate sequence-collection queries using interleaved ZOR filters"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -52,11 +52,18 @@ struct Cli {
 enum Command {
     /// Build an index from a file-of-files.
     Build(BuildArgs),
-    /// Append colors from a file-of-files to an existing index.
+    /// Append datasets to a legacy --plain index (merged directories require a rebuild).
     Append(AppendArgs),
-    /// Rewrite an index with a different stack compression mode.
+    /// Change slice compression in a legacy --plain index.
     Repack(RepackArgs),
-    /// Query all k-mers from a FASTA/FASTQ file against the color stack.
+    /// Reframe merged subindexes for parallel decoding; preserve all filter bytes.
+    RepackSubindexes {
+        #[arg(long)]
+        index: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Query seeds from FASTA/FASTQ, reusing the index's extraction settings.
     Query(QueryArgs),
     /// Print index metadata.
     Info(IndexArg),
@@ -389,6 +396,10 @@ struct QueryArgs {
     #[arg(long, alias = "bench-batch", default_value_t = 4096)]
     record_batch_size: usize,
 
+    /// Merged-index loading: one subindex at a time (default), or all in RAM.
+    #[arg(long, value_enum, default_value = "subindex")]
+    query_memory: zorindex::power_merge::QueryMemory,
+
     /// Skip the global abandoned-key recovery map for merged indexes.
     #[arg(long)]
     ignore_abandoned: bool,
@@ -578,6 +589,9 @@ fn main() -> Result<()> {
         Command::Build(args) => build_command(args),
         Command::Append(args) => append_command(args),
         Command::Repack(args) => repack_command(args),
+        Command::RepackSubindexes { index, output } => {
+            zorindex::power_merge::repack_subindexes(&index, &output)
+        }
         Command::Query(args) => query_command(args),
         Command::Info(args) => info_command(args),
     }
@@ -987,20 +1001,22 @@ fn repack_command(args: RepackArgs) -> Result<()> {
 fn query_command(args: QueryArgs) -> Result<()> {
     if args.records {
         ensure!(args.index.is_dir(), "--records requires a merged index");
-        return zorindex::power_merge::query_records_command(
+        return zorindex::power_merge::query_records_command_with_memory(
             &args.index,
             &args.query,
             args.min_ratio,
             !args.ignore_abandoned,
             args.record_batch_size,
+            args.query_memory,
         );
     }
     if args.index.is_dir() {
-        return zorindex::power_merge::query_command_with_recovery(
+        return zorindex::power_merge::query_command_with_memory(
             &args.index,
             &args.query,
             args.min_ratio,
             !args.ignore_abandoned,
+            args.query_memory,
         );
     }
     ensure!(
@@ -3073,6 +3089,22 @@ fn peel_zor_graph_impl<I: GraphIndex, Q: DegreeQueue>(
         }
     }
 
+    zorindex::power_merge::trace_memory(
+        "graph-finished",
+        serde_json::json!({
+            "distinct":edge_count,"slots":config.layout.array_length,"hashes":config.hashes,
+            "index_bytes":std::mem::size_of::<I>(),
+            "incidence_capacity_bytes":(edge_slots.capacity()+adjacency.capacity())*std::mem::size_of::<I>(),
+            "degree_capacity_bytes":degrees.capacity()*4,
+            "offset_cursor_capacity_bytes":(offsets.capacity()+cursor.capacity())*std::mem::size_of::<I>(),
+            "active_capacity_bytes":active.capacity(),
+            "peel_order_capacity_bytes":peel_order.capacity()*std::mem::size_of::<(I,I)>(),
+            "abandoned_capacity_bytes":abandoned_edges.capacity()*std::mem::size_of::<I>(),
+            "degree_one_queue_capacity_bytes":queue.capacity()*std::mem::size_of::<I>(),
+            "degree_heap_capacity_bytes":multi_heap.allocated_bytes(),
+            "peeled":peel_order.len(),"abandoned":abandoned_edges.len()
+        }),
+    );
     Ok(TypedPeelGraph {
         positions: edge_slots,
         order: peel_order,
@@ -4948,6 +4980,31 @@ mod tests {
     use zorindex::{scan_canonical_kmers, ZSTD_FRAME_MAGIC};
 
     #[test]
+    fn queries_default_to_one_resident_subindex_with_explicit_all_ram_opt_in() {
+        let args = [
+            "zorindex", "query", "--index", "index", "--query", "reads.fa",
+        ];
+        let Command::Query(defaults) = Cli::try_parse_from(args).unwrap().command else {
+            panic!()
+        };
+        assert_eq!(
+            defaults.query_memory,
+            zorindex::power_merge::QueryMemory::Subindex
+        );
+        let Command::Query(all) =
+            Cli::try_parse_from(args.into_iter().chain(["--query-memory", "all"]))
+                .unwrap()
+                .command
+        else {
+            panic!()
+        };
+        assert_eq!(all.query_memory, zorindex::power_merge::QueryMemory::All);
+        assert!(
+            Cli::try_parse_from(args.into_iter().chain(["--query-memory", "unknown"])).is_err()
+        );
+    }
+
+    #[test]
     fn cli_defaults_choose_optimized_merged_layout_and_allow_plain_opt_out() {
         let base = [
             "zorindex",
@@ -4974,6 +5031,7 @@ mod tests {
         );
         assert_eq!(defaults.slot_scale, 1.0);
         assert_eq!(defaults.merge.sketch_size, 128);
+        assert_eq!(defaults.merge.max_subindex_size, 8 * 1024 * 1024 * 1024);
         assert_eq!(zorindex::power_merge::MergeArgs::default().sketch_size, 128);
         assert_eq!(defaults.merge.plan_margin, 0.03);
         assert!(!defaults.merge.low_disk);

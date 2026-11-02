@@ -21,8 +21,8 @@ const SPLIT_SEED_XOR: u64 = 0xA54D_BA5E_1F2C_8D93;
 #[derive(Parser, Debug)]
 #[command(
     name = "bloomindex",
-    version,
-    about = "Approximate colored k-mer index using interleaved per-color Bloom filters"
+    version = env!("ZINDEX_BUILD_VERSION"),
+    about = "Approximate sequence-collection queries using interleaved Bloom filters"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -51,7 +51,8 @@ struct BuildArgs {
     #[arg(long)]
     fof: PathBuf,
 
-    /// Query k-mer length. Findere stores shorter (k-z)-mers of length 1..=31.
+    /// Window length: 1..=31 for k-mers/modimizers, odd 1..=255 for minimizers.
+    /// Findere stores shorter (k-z)-mers of length 1..=31.
     #[arg(short = 'k', long)]
     k: usize,
 
@@ -736,9 +737,6 @@ fn info_command(args: IndexArg) -> Result<()> {
 }
 
 fn validate_build_args(args: &BuildArgs) -> Result<()> {
-    if args.index_mode != IndexMode::Findere {
-        ensure!((1..=31).contains(&args.k), "k must be in 1..=31");
-    }
     ensure!(
         (1..=MAX_HASHES).contains(&args.hashes),
         "--hashes must be in 1..={}",
@@ -797,18 +795,22 @@ fn validate_feature_config(k: usize, config: FeatureConfig) -> Result<()> {
         IndexMode::Findere => {
             zorindex::findere::indexed_length(k, config.findere_z)?;
         }
-        IndexMode::Kmers => {}
+        IndexMode::Kmers | IndexMode::Modimizers => {
+            ensure!(
+                (1..=31).contains(&k),
+                "k must be in 1..=31 for k-mers/modimizers"
+            );
+        }
         IndexMode::Minimizers => {
             ensure!(
-                k % 2 == 1,
-                "minimizer indexes require odd k with canonical SIMD minimizers"
+                (1..=255).contains(&k) && k % 2 == 1,
+                "minimizer indexes require odd k in 1..=255"
             );
             ensure!(
                 (1..=k).contains(&config.minimizer_size),
                 "--minimizer-size must be in 1..=k for minimizer indexes"
             );
         }
-        IndexMode::Modimizers => {}
     }
     Ok(())
 }
@@ -1390,9 +1392,6 @@ impl BloomIndex {
         let target_fp_rate = read_f64(&mut reader)?;
         let bit_count = read_u64(&mut reader)? as usize;
         let color_count = read_u64(&mut reader)? as usize;
-        if mode != IndexMode::Findere {
-            ensure!((1..=31).contains(&k), "invalid k in index");
-        }
         ensure!(
             (1..=MAX_HASHES).contains(&hashes),
             "invalid Bloom hash count in index"

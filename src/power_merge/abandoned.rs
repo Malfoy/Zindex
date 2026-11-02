@@ -36,6 +36,8 @@ pub(super) struct OriginMap {
     associations: usize,
     last_hash: Option<u32>,
     finalized: bool,
+    #[cfg(test)]
+    directory_allocations: usize,
 }
 
 impl OriginMap {
@@ -76,6 +78,8 @@ impl OriginMap {
         let extra = origins.saturating_sub(keys);
         Ok(Self {
             directory: vec![EMPTY_ENTRY; capacity],
+            #[cfg(test)]
+            directory_allocations: usize::from(capacity != 0),
             multiple: Vec::with_capacity(extra),
             // At most twice the excess associations belong to non-singletons.
             // Do not reserve a posting for every inline singleton.
@@ -105,6 +109,10 @@ impl OriginMap {
         }
         let capacity = Self::capacity(self.hashes + 1)?;
         let mut directory = vec![EMPTY_ENTRY; capacity];
+        #[cfg(test)]
+        {
+            self.directory_allocations += 1;
+        }
         for &entry in &self.directory {
             if entry.value != EMPTY {
                 Self::insert(&mut directory, entry);
@@ -208,6 +216,11 @@ impl OriginMap {
             + self.multiple.capacity() * std::mem::size_of::<std::ops::Range<usize>>()
             + self.wide.capacity() * std::mem::size_of::<(u32, std::ops::Range<usize>)>()
             + self.origins.capacity() * 4
+    }
+
+    #[cfg(test)]
+    pub(super) fn directory_allocations(&self) -> usize {
+        self.directory_allocations
     }
 }
 

@@ -2,7 +2,7 @@
 //! Compare bytes, but retain full minima for exact unions (never min the bytes).
 use super::BucketSketch;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MergeableSketch {
     minima: Vec<u32>,
     fingerprints: Vec<u8>,

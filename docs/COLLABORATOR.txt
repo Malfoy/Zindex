@@ -1,73 +1,99 @@
 Zindex / Bindex collaborator quick start
 
-Requirements: Git, a current stable Rust toolchain (Cargo), and a C/C++ compiler
-with standard build tools. On Debian/Ubuntu: sudo apt install build-essential
-pkg-config. Compile on the machine where the binaries will run: the repository
-uses target-cpu=native, so do not assume a binary is portable to another CPU.
+Run commands from the repository root. Requirements: Rust 1.89 or newer, Cargo,
+Git and a C/C++ toolchain (Debian/Ubuntu: build-essential pkg-config).
+The example checker additionally uses Bash and Python 3.
 
-Get and build:
   git clone https://github.com/Malfoy/Zindex.git
   cd Zindex
   cargo build --release --locked
+  ./target/release/zorindex --version
+  bash scripts/demo.sh
 
-Create samples.fof with one absolute FASTA/FASTQ path per line, or
-name<TAB>absolute-path (an actual tab). Gzip, zstd, xz and bzip2 inputs work.
-Example:
-  sample_a<TAB>/absolute/path/sample_a.fasta.gz
-  sample_b<TAB>/absolute/path/sample_b.fasta.gz
+Build locally: target-cpu=native is enabled. Do not copy native binaries to a
+different CPU without rebuilding. For portable x86-64, set
+RUSTFLAGS='-C target-cpu=x86-64' for the build.
 
-Recommended merged Zindex minimizer build (approximately one minimizer per
-ten valid sequence positions, depending on the input):
+Create samples.fof with a path per line or name<TAB>path (an actual tab).
+Relative paths are relative to the command's working directory. FASTA/FASTQ
+and gzip, zstd, xz and bzip2 compression are accepted; use the compression suffix.
+
+Recommended Zindex minimizer build:
   ./target/release/zorindex build --fof samples.fof --output samples.zindex \
-    --k 49 --index-mode minimizers --minimizer-size 31 \
-    --fingerprint-bits 16
-  ./target/release/zorindex query --index samples.zindex --query reads.fasta.gz
+    --k 49 --index-mode minimizers --minimizer-size 31 --fingerprint-bits 16
+  ./target/release/zorindex query --index samples.zindex --query reads.fa.gz \
+    --records --min-ratio 0.8
   ./target/release/zorindex info --index samples.zindex
 
-Zindex defaults to merged power-of-two banks, streaming planning, compression
-column ordering, slot-scale 1.0, most-deg2 cycle breaking, tie-scan 8 and 4 hashes.
-The old --power-of-two-merge flag still works but is unnecessary.
+Zindex defaults: merged power-of-two subindexes, streaming planner, compression
+column ordering, 128 sketch cells, slot-scale 1.0, planning margin 0.03,
+no-heuristic cycle breaking, tie-scan 1, 4 hashes and 8-bit fingerprints.
+Minimizer mode defaults to open-closed-mod; the overall mode defaults to kmers.
+The old --power-of-two-merge flag is unnecessary.
 
-All-pairs planner comparison: run the same build command with
---merge-planner all-pairs and a different --output directory. The old streaming
-planner is available as --merge-planner streaming-unpruned. No merge reverts.
+Queries prepare seeds once, scan the global abandoned-key file once, and load
+one subindex at a time by default. Results stay in RAM. --query-memory all
+loads everything; --max-subindex-size 8GiB is the default construction cap on
+uncompressed filter payload, not total process RAM.
 
-Plain Zindex baseline, using the same feature and graph settings:
-  ./target/release/zorindex build --plain --fof samples.fof --output samples.plain.zoridx \
-    --k 49 --index-mode minimizers --minimizer-size 31 \
+Matched SIMD-minimizer comparison with Bindex:
+Bindex uses the SIMD selector. Explicitly choose it in Zindex too, otherwise
+the two default minimizer schemes select different seed sets.
+
+  ./target/release/zorindex build --fof samples.fof --output samples.simd.zindex \
+    --k 49 --index-mode minimizers --minimizer-size 31 --minimizer-scheme simd \
     --fingerprint-bits 16
-  ./target/release/zorindex query --index samples.plain.zoridx --query reads.fasta.gz
-
-Bindex minimizer baseline (Bloom backend, without Zindex merging):
   ./target/release/bloomindex build --fof samples.fof --output samples.blmidx \
     --k 49 --index-mode minimizers --minimizer-size 31 \
     --false-positive-rate 0.0000152587890625 --hashes 4
-  ./target/release/bloomindex query --index samples.blmidx --query reads.fasta.gz
+  ./target/release/bloomindex query --index samples.blmidx --query reads.fa.gz
   ./target/release/bloomindex info --index samples.blmidx
 
-All-k-mer mode: use --k 31 --index-mode kmers, removing --minimizer-size.
-Findere mode: use --k 31 --index-mode findere --findere-z 10, removing
---minimizer-size. Findere is available in both tools; z defaults to 10.
+Bloom's target and ZOR's fingerprint width approximately match the per-feature
+false-positive scale here; whole-sequence errors and recovery-map collisions
+are not controlled by those parameters alone. Bloom sizing depends on its hash
+count. Use identical seeds, query files, thresholds and timing boundaries.
 
-Threads default to all available hardware threads. Add --threads N to any
-command to choose a limit; --build-jobs N limits concurrent construction jobs.
-Query uses the feature/hash settings stored in the index: do not repeat them.
-Results aggregate feature matches per dataset over the entire query file;
-they are not per-read classifications. Minimizer matches count minimizers,
-not all k-mers. Findere matches count reconstructed k-mer positions.
+Other configurations:
+  --merge-planner all-pairs   full maximum-saving planner (alias: full)
+  --merge-planner naive       ordered placement without dataset unions
+  --merge-planner streaming-unpruned   unpruned streaming comparison
+  --k 31 --index-mode kmers  dense k-mers
+  --k 31 --index-mode findere   reconstruct 31-mers from indexed 21-mers;
+                               --findere-z defaults to 10
 
-Merged Zindex keeps all abandoned keys in one global 32-bit-hash multimap by
-default. --drop-abandoned during build omits it, allowing misses;
---ignore-abandoned during query skips an existing map, also allowing misses.
-Plain Zindex has no corresponding multimap; abandoned keys may cause misses.
-Neither probabilistic tool guarantees exact membership.
+Thread count defaults to all available CPUs; use --threads N to limit it.
+No seed/hash settings need to be repeated at query time.
 
-Merged --output must be a new directory. Do not use append/repack on merged
-directories: these operations are not supported. New merged layout version 3
-requires the current reader; current readers also accept old merged layouts.
+Without --records, query output aggregates over the entire FASTA/FASTQ file.
+Merged Zindex --records accepts FASTA except in findere mode; document IDs
+refer to manifest.json's colors array. In minimizer mode the denominator is
+selected seed occurrences, not all k-mer windows or covered bases.
+Findere aggregate ratios count reconstructed windows. Randstrobemer counts
+use the per-record maximum of independently queried orientations.
+See README.md for exact output columns and denominator meanings.
 
-Tests and command help:
-  cargo fmt --check
-  cargo test --release --locked
+Merged recovery is enabled through one global map of 32-bit abandoned-key
+hashes. --drop-abandoned during construction and --ignore-abandoned during
+query permit missing present seeds. Hash collisions union origin lists.
+
+Construction stages both completed filters and abandoned keys on disk by
+default. --low-disk retains both in RAM. Default oversized-document handling
+may skip inputs: inspect info and the skipped-document report before accepting
+an index as representing the complete collection. Do not mistake an estimate
+or a subindex payload cap for a total-RAM guarantee.
+
+Merged --output must be a new directory. append and ordinary repack apply only
+to legacy --plain files. repack-subindexes can losslessly reframe a merged
+directory into a separate output for parallel decoding. A query-memory choice
+does not require rebuilding. Format versions and package versions are separate.
+
+Validation:
+  cargo fmt --all -- --check
+  cargo test --workspace --release --locked
   ./target/release/zorindex build --help
+  ./target/release/zorindex query --help
   ./target/release/bloomindex build --help
+
+See docs/USAGE.md for advanced options, docs/BENCHMARKING.md for the measurement
+runner, and docs/REPRODUCIBILITY.md for manuscript artifact availability.

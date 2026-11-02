@@ -12,7 +12,7 @@ use std::{
 
 #[derive(Debug, Parser)]
 #[command(
-    version,
+    version = env!("ZINDEX_BUILD_VERSION"),
     about = "Parallel streaming canonical SIMD/open-closed-mod minimizer FASTA generator"
 )]
 struct Args {

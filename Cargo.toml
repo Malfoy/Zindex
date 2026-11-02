@@ -2,11 +2,13 @@
 name = "zorindex"
 version = "0.1.0"
 edition = "2021"
-description = "Approximate colored k-mer indexes with ZOR and Bloom filter backends"
+rust-version = "1.89"
+description = "Approximate membership indexes for sequence collections, minimizers and other seeds"
 license = "MIT"
 readme = "README.md"
 default-run = "zorindex"
-keywords = ["bioinformatics", "kmer", "debruijn", "bloom-filter"]
+repository = "https://github.com/Malfoy/Zindex"
+keywords = ["bioinformatics", "minimizer", "seeds", "membership", "zor-filter"]
 categories = ["command-line-utilities", "science"]
 
 [workspace]

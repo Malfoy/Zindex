@@ -1,8 +1,9 @@
 use super::{
     abandoned::{self, OriginMap},
+    document_guard::{self, Guard, SkippedDocument},
     planner,
     sketch::Sketch,
-    Backend, BuildConfig, ColumnOrder, MergePlanner, PeelGraph,
+    Backend, BuildConfig, ColumnOrder, MergePlanner, PeelGraph, QueryMemory,
 };
 use crate::{
     create_index_writer, finish_index_writer, open_index_reader, parse_features_from_file,
@@ -34,6 +35,11 @@ const ABANDONED_DELTA_MAGIC: &[u8; 8] = b"ZORABN2\0";
 const ABANDONED_FILE: &str = "abandoned.zormap.zst";
 const FINGERPRINT_SEED: u64 = 0x8E2D_4F6A_9B13_C5D7;
 
+#[path = "bank_io.rs"]
+mod bank_io;
+
+#[path = "query_stream.rs"]
+mod query_stream;
 #[path = "record_query.rs"]
 mod record_query;
 
@@ -62,6 +68,36 @@ struct BankMeta {
     groups: Vec<GroupMeta>,
     #[serde(default)]
     fingerprint_first: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    routing: Option<Routing>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Routing {
+    source_slots: usize,
+    partition: usize,
+    partitions: usize,
+}
+
+fn partition_id(key: u64, seed: u64, partitions: usize) -> usize {
+    (splitmix64(key ^ seed ^ 0x34B6_1D8F_29A7_C053) as usize) & (partitions - 1)
+}
+
+impl BankMeta {
+    fn source_slots(&self) -> usize {
+        self.routing.map_or(self.slots, |r| r.source_slots)
+    }
+    fn filename(slots: usize, routing: Option<Routing>) -> String {
+        match routing {
+            Some(r) => format!(
+                "bank-{}-part-{}-of-{}.zorbank.zst",
+                r.source_slots.ilog2(),
+                r.partition,
+                r.partitions
+            ),
+            None => format!("bank-{}.zorbank.zst", slots.ilog2()),
+        }
+    }
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct Manifest {
@@ -116,6 +152,8 @@ struct Manifest {
     min_subindex_documents: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_subindexes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_subindex_size: Option<u64>,
     #[serde(default)]
     promoted_groups: usize,
     singleton_logical_bits: u64,
@@ -129,6 +167,16 @@ struct Manifest {
     sketch_seconds: f64,
     plan_seconds: f64,
     build_seconds: f64,
+    #[serde(default)]
+    input_document_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    source_document_ids: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    skipped_documents: Vec<SkippedDocument>,
+    #[serde(default)]
+    memory_guard_split_groups: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    merge_memory_budget_bytes: Option<u64>,
     colors: Vec<Color>,
     banks: Vec<BankMeta>,
 }
@@ -176,6 +224,7 @@ struct BuiltGroup {
     // global dataset multimap before publication, never consulted during queries.
     fallback: Vec<(u32, u64)>,
     fallback_path: Option<PathBuf>,
+    routing: Option<Routing>,
 }
 
 impl BuiltGroup {
@@ -409,10 +458,18 @@ fn cache_read(path: &Path) -> Result<Vec<u64>> {
 pub fn build(
     fof: &Path,
     output: &Path,
-    config: BuildConfig,
+    mut config: BuildConfig,
     graph: impl Fn(&[u64], usize) -> Result<PeelGraph> + Sync,
 ) -> Result<()> {
+    if config.merge.planner == MergePlanner::Naive {
+        // Naive means ordered placement only: neither a global size-class
+        // promotion pass nor sample-based physical reordering is performed.
+        config.merge.min_subindex_documents = 1;
+        config.merge.max_subindexes = None;
+        config.merge.column_order = ColumnOrder::Width;
+    }
     config.validate()?;
+    let rss_guard = super::memory::RssGuard::start(config.merge.max_ram_gb)?;
     config.feature_config.validate_anchors(config.k)?;
     ensure!(
         !output.exists(),
@@ -420,7 +477,63 @@ pub fn build(
         output.display()
     );
     let start = Instant::now();
-    let inputs = read_fof(fof)?;
+    let original_inputs = read_fof(fof)?;
+    let input_document_count = original_inputs.len();
+    let extraction_budget = super::memory::workspace_budget(&config.merge);
+    let guard = Guard::new(&config, extraction_budget);
+    config.merge.planning_memory_budget_bytes = Some(guard.budget);
+    let skip_report = document_guard::report_path(output);
+    ensure!(
+        !skip_report.exists(),
+        "skip report {} already exists; choose a new output",
+        skip_report.display()
+    );
+    let original_costs = original_inputs
+        .par_iter()
+        // The file-size heuristic only schedules extraction concurrency. It
+        // cannot reject a document: the bounded collector measures its keys.
+        .map(|input| {
+            super::memory::input_estimate(&input.path)
+                .map(|hint| hint.min((guard.budget / 4).max(1)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut inputs = Vec::new();
+    let mut input_costs = Vec::new();
+    let mut prefiltered_source_ids = Vec::new();
+    let mut skipped_documents = Vec::new();
+    for (id, (input, &cost)) in original_inputs.into_iter().zip(&original_costs).enumerate() {
+        if let Err(error) = guard.check("input-size", cost) {
+            let skipped = guard.skipped(id, &input, &error).unwrap();
+            eprintln!("skipping document {id} {}: {}", input.name, skipped.reason);
+            skipped_documents.push(skipped);
+        } else {
+            inputs.push(input);
+            input_costs.push(cost);
+            prefiltered_source_ids.push(id);
+        }
+    }
+    document_guard::report(
+        &skip_report,
+        input_document_count,
+        0,
+        &skipped_documents,
+        "filtering",
+        guard.budget,
+    )?;
+    if inputs.is_empty() && !skipped_documents.is_empty() {
+        document_guard::report(
+            &skip_report,
+            input_document_count,
+            0,
+            &skipped_documents,
+            "all_skipped",
+            guard.budget,
+        )?;
+        anyhow::bail!(
+            "all documents were skipped by the memory guard; see {}",
+            skip_report.display()
+        );
+    }
     ensure!(!inputs.is_empty(), "{} contains no inputs", fof.display());
     ensure!(
         inputs.len() <= u32::MAX as usize,
@@ -442,13 +555,8 @@ pub fn build(
             fs::create_dir(stage.0.join("abandoned"))?;
         }
     }
-    let input_costs = inputs
-        .par_iter()
-        .map(|input| super::memory::input_estimate(&input.path))
-        .collect::<Result<Vec<_>>>()?;
-    let extraction_budget = super::memory::budget(config.merge.build_memory_gib);
-    eprintln!("build workspace admission: extraction budget={} bytes, workers={}; estimates, not an RSS cap; oversized jobs run alone",
-        extraction_budget, rayon::current_num_threads());
+    eprintln!("build workspace admission: extraction budget={} bytes, workers={}; document guard={}, document budget={} bytes; estimates, not an RSS cap",
+        extraction_budget, rayon::current_num_threads(), guard.enabled, guard.budget);
     eprintln!(
         "sketching {} datasets with {} SimdSketch buckets (8-bit fingerprints, 32-bit union minima)",
         inputs.len(),
@@ -461,31 +569,37 @@ pub fn build(
     let mut plan_seconds = 0.0;
     let mut sketch_seconds = 0.0;
     let mut input_signatures = Vec::with_capacity(inputs.len());
+    let mut included_inputs = Vec::new();
+    let mut included_costs = Vec::new();
+    let mut source_document_ids = Vec::new();
     // Every dataset is parsed as a task on the rayon pool while this loop, itself on a pool thread, inserts the
     // results into the planner in FOF order. Idle threads take the oldest queued task first, so they parse while
     // this thread plans, and the planner's own parallel scans split onto the same pool when it is free.
     rayon::scope(|_| {
-        pull_jobs_budgeted(
+        pull_jobs_budgeted_with_policy(
             &inputs,
             PLANNER_LOOKAHEAD,
             &input_costs,
             extraction_budget,
+            !guard.enabled,
+            config.merge.build_memory_gib.is_some(),
+            super::memory::total_bytes(config.merge.max_ram_gb),
             |id, input| {
-                let mut keys = Vec::new();
-                let mut occurrences = 0;
-                parse_features_from_file(
-                    &input.path,
-                    config.k,
-                    config.seed,
-                    config.feature_config,
-                    |key| {
-                        occurrences += 1;
-                        keys.push(key);
-                    },
-                )?;
-                super::sort::sort_unique(&mut keys);
+                let (keys, occurrences) = match guard.collect(input, &config) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        return match guard.skipped(prefiltered_source_ids[id], input, &error) {
+                            Some(skipped) => Ok(Err(skipped)),
+                            None => Err(error),
+                        }
+                    }
+                };
                 let sketch_start = Instant::now();
-                let sketch = Sketch::new(&keys, config.merge.sketch_size, config.seed);
+                let sketch = if config.merge.planner == MergePlanner::Naive {
+                    Sketch::default()
+                } else {
+                    Sketch::new(&keys, config.merge.sketch_size, config.seed)
+                };
                 let sketch_sec = sketch_start.elapsed().as_secs_f64();
                 if config.merge.disk_backed {
                     cache_write(&cache_path(&stage.0, id), &keys)?;
@@ -497,14 +611,37 @@ pub fn build(
                     occurrences,
                     unique_kmers: keys.len(),
                 };
-                Ok((
-                    color,
-                    planner::singleton(keys.len(), sketch, id, &config)?,
-                    sketch_sec,
-                    signature,
-                ))
+                Ok(Ok((color, sketch, sketch_sec, signature)))
             },
-            |_, (color, group, seconds, signature)| {
+            |original_id, result| {
+                let (color, sketch, seconds, signature) = match result {
+                    Ok(result) => result,
+                    Err(skipped) => {
+                        eprintln!(
+                            "skipping document {} {}: {}",
+                            skipped.source_document_id, skipped.name, skipped.reason
+                        );
+                        skipped_documents.push(skipped);
+                        document_guard::report(
+                            &skip_report,
+                            input_document_count,
+                            colors.len(),
+                            &skipped_documents,
+                            "filtering",
+                            guard.budget,
+                        )?;
+                        return Ok(());
+                    }
+                };
+                let id = colors.len();
+                if config.merge.disk_backed && original_id != id {
+                    fs::rename(cache_path(&stage.0, original_id), cache_path(&stage.0, id))?;
+                }
+                let mut group = planner::singleton(color.unique_kmers, sketch, id, &config)?;
+                group.input_peak_bytes = super::memory::feature_resident_bytes(color.occurrences);
+                included_inputs.push(inputs[original_id].clone());
+                included_costs.push(super::memory::feature_resident_bytes(color.occurrences));
+                source_document_ids.push(prefiltered_source_ids[original_id]);
                 input_signatures.push(signature);
                 colors.push(color);
                 singleton_logical_bits += planner::cost(group.slots, group.width);
@@ -520,6 +657,22 @@ pub fn build(
             },
         )
     })?;
+    if colors.is_empty() {
+        document_guard::report(
+            &skip_report,
+            input_document_count,
+            0,
+            &skipped_documents,
+            "all_skipped",
+            guard.budget,
+        )?;
+        anyhow::bail!(
+            "all documents were skipped by the memory guard; see {}",
+            skip_report.display()
+        );
+    }
+    let inputs = included_inputs;
+    let input_costs = included_costs;
     eprintln!(
         "sketched {} datasets in {:.3}s; the planner was busy for {:.3}s of it",
         colors.len(),
@@ -536,7 +689,8 @@ pub fn build(
     plan_seconds += plan_start.elapsed().as_secs_f64();
     let planning_pair_evaluations = plan.pair_evaluations;
     let planning_possible_pair_evaluations = plan.possible_pair_evaluations;
-    let planned = plan.groups;
+    let (planned, memory_guard_split_groups) =
+        guard_groups(plan.groups, &colors, &input_costs, &config, guard)?;
     let predicted_logical_bits = u64::try_from(
         planned
             .iter()
@@ -571,14 +725,17 @@ pub fn build(
         .iter()
         .map(|group| group_workspace(group, &colors, &input_costs, &config, 0))
         .collect::<Result<Vec<_>>>()?;
-    let construction_budget = super::memory::budget(config.merge.build_memory_gib);
+    let construction_budget = super::memory::workspace_budget(&config.merge);
     eprintln!("build workspace admission: construction budget={} bytes, workers={}; completed filters and abandoned keys retained in {}",
         construction_budget, rayon::current_num_threads(), if config.merge.low_disk && !config.merge.disk_backed { "RAM (additional to workspace)" } else { "temporary disk files" });
-    pull_jobs_budgeted(
+    pull_jobs_budgeted_with_policy(
         &planned,
         usize::MAX,
         &group_costs,
         construction_budget,
+        !guard.enabled,
+        config.merge.build_memory_gib.is_some(),
+        super::memory::total_bytes(config.merge.max_ram_gb),
         |_, group| {
             if config.merge.disk_backed {
                 build_group(group, &stage.0, &config, &graph)
@@ -611,6 +768,31 @@ pub fn build(
         &config,
         &graph,
     )?;
+    built = partition_large_subindexes(
+        built,
+        &planned,
+        &inputs,
+        &colors,
+        &input_signatures,
+        &input_costs,
+        &stage.0,
+        &config,
+        &graph,
+    )?;
+    let partitioned = built.iter().any(|g| g.routing.is_some());
+    if partitioned {
+        exact_group_verifications = built
+            .iter()
+            .map(|g| {
+                (g.meta.union_cardinality
+                    - if config.merge.drop_abandoned {
+                        g.meta.abandoned_keys.unwrap_or(0)
+                    } else {
+                        0
+                    }) as u64
+            })
+            .sum();
+    }
     let (abandoned_hashes, abandoned_origins) = if config.merge.drop_abandoned {
         (0, 0)
     } else {
@@ -631,8 +813,11 @@ pub fn build(
             fs::remove_dir(stage.0.join("abandoned"))?;
         }
     }
+    if stage.0.join("partitions").exists() {
+        fs::remove_dir_all(stage.0.join("partitions"))?;
+    }
     let mut manifest = Manifest {
-        version: if config.segment_length.is_some() { 8 } else { 7 },
+        version: if partitioned { 9 } else if config.segment_length.is_some() { 8 } else { 7 },
         abandoned_recovery: !config.merge.drop_abandoned,
         abandoned_file: (!config.merge.drop_abandoned).then(|| ABANDONED_FILE.into()),
         abandoned_hashes,
@@ -680,6 +865,7 @@ pub fn build(
         slot_scale: config.slot_scale,
         min_subindex_documents: config.merge.min_subindex_documents,
         max_subindexes: config.merge.max_subindexes,
+        max_subindex_size: Some(config.merge.max_subindex_size),
         promoted_groups,
         singleton_logical_bits,
         predicted_logical_bits,
@@ -690,6 +876,11 @@ pub fn build(
         sketch_seconds,
         plan_seconds,
         build_seconds: 0.0,
+        input_document_count,
+        source_document_ids,
+        skipped_documents: skipped_documents.clone(),
+        memory_guard_split_groups,
+        merge_memory_budget_bytes: config.merge.planning_memory_budget_bytes,
         colors,
         banks,
     };
@@ -697,11 +888,23 @@ pub fn build(
     let mut writer = BufWriter::new(File::create(stage.0.join("manifest.json"))?);
     serde_json::to_writer_pretty(&mut writer, &manifest)?;
     writer.flush()?;
+    if !skipped_documents.is_empty() {
+        document_guard::report(
+            &skip_report,
+            input_document_count,
+            manifest.colors.len(),
+            &skipped_documents,
+            "indexed",
+            guard.budget,
+        )?;
+        fs::copy(&skip_report, stage.0.join("skipped-documents.json"))?;
+    }
     ensure!(
         !output.exists(),
         "output appeared during build: {}",
         output.display()
     );
+    rss_guard.check()?;
     fs::rename(&stage.0, output)?;
     eprintln!("built {} in {:.3}s: banks={}, groups={}, stack_bytes={}, fallback_bytes={}, rejected_groups={}, overflow_groups={}",
         output.display(), start.elapsed().as_secs_f64(), manifest.banks.len(), manifest.banks.iter().map(|b| b.groups.len()).sum::<usize>(),
@@ -734,6 +937,7 @@ fn pull_jobs<T: Sync, R: Send>(
     )
 }
 
+#[cfg(test)]
 fn pull_jobs_budgeted<T: Sync, R: Send>(
     items: &[T],
     in_flight: usize,
@@ -742,10 +946,35 @@ fn pull_jobs_budgeted<T: Sync, R: Send>(
     work: impl Fn(usize, &T) -> Result<R> + Sync,
     mut consume: impl FnMut(usize, R) -> Result<()>,
 ) -> Result<()> {
+    pull_jobs_budgeted_with_policy(
+        items,
+        in_flight,
+        estimates,
+        budget,
+        true,
+        false,
+        None,
+        work,
+        &mut consume,
+    )
+}
+
+fn pull_jobs_budgeted_with_policy<T: Sync, R: Send>(
+    items: &[T],
+    in_flight: usize,
+    estimates: &[u64],
+    budget: u64,
+    allow_oversized: bool,
+    explicit_budget: bool,
+    total_ram_budget: Option<u64>,
+    work: impl Fn(usize, &T) -> Result<R> + Sync,
+    mut consume: impl FnMut(usize, R) -> Result<()>,
+) -> Result<()> {
     ensure!(
         in_flight > 0 && budget > 0 && estimates.len() == items.len(),
         "invalid admission limits"
     );
+    let baseline = super::memory::rss_bytes().unwrap_or(0);
     let failed = AtomicBool::new(false);
     let (tx, rx) = mpsc::channel();
     rayon::in_place_scope(|scope| {
@@ -761,18 +990,20 @@ fn pull_jobs_budgeted<T: Sync, R: Send>(
                 // Admission events also account for retained recovery/filter
                 // buffers and other processes consuming RAM since stage start.
                 // No timer or monitor thread is involved.
-                let limit = if estimate == 0 {
+                let limit = if let Some(total) = total_ram_budget {
+                    super::memory::total_admission_limit(total, baseline)
+                } else if estimate == 0 {
                     budget
                 } else {
-                    super::memory::available_bytes()
-                        .map(|n| budget.min(n.saturating_mul(4) / 5))
-                        .unwrap_or(budget)
+                    super::memory::admission_limit(budget,explicit_budget)
                 };
                 // Reserve before spawning, never block a Rayon worker on a
                 // semaphore: the same pool may be needed to finish active jobs.
                 if started != next && (reserved > limit || estimate > limit.saturating_sub(reserved)) {
                     break;
                 }
+                ensure!(allow_oversized || estimate <= limit,
+                    "build workspace job {i} estimate {estimate} exceeds available admission budget {limit}; memory guard refuses an uncapped job");
                 if estimate > limit && oversized_warnings < 8 {
                     eprintln!("build workspace: job {i} estimate={estimate} exceeds admission budget={limit}; running it alone (single-job memory is not capped)");
                     oversized_warnings += 1;
@@ -817,6 +1048,22 @@ fn group_workspace(
     config: &BuildConfig,
     slot_floor: usize,
 ) -> Result<u64> {
+    let slot_floor = if config.merge.planner == MergePlanner::Naive {
+        slot_floor.max(group.slots)
+    } else {
+        slot_floor
+    };
+    if config.merge.planning_memory_budget_bytes.is_some() {
+        return Ok(super::memory::group_estimate(
+            group.feature_count_upper_bound,
+            config
+                .slots(group.feature_count_upper_bound as f64)?
+                .max(slot_floor),
+            config.hashes,
+            group.width,
+            group.input_peak_bytes,
+        ));
+    }
     let sum = group.members.iter().fold(0usize, |sum, &id| {
         sum.saturating_add(colors[id].unique_kmers)
     });
@@ -836,7 +1083,9 @@ fn group_workspace(
         .map(|&id| {
             // Include actual first-pass occurrence count (before dedup), not just
             // compressed size, for highly repetitive genomes.
-            input_costs[id].max(colors[id].occurrences.saturating_mul(16))
+            input_costs[id].max(super::memory::feature_resident_bytes(
+                colors[id].occurrences,
+            ))
         })
         .max()
         .unwrap_or(0);
@@ -847,6 +1096,69 @@ fn group_workspace(
         group.width,
         input_peak,
     ))
+}
+
+fn guard_groups(
+    groups: Vec<planner::Group>,
+    colors: &[Color],
+    input_costs: &[u64],
+    config: &BuildConfig,
+    guard: Guard,
+) -> Result<(Vec<planner::Group>, usize)> {
+    let mut result = Vec::new();
+    let mut split = 0;
+    for group in groups {
+        // Sum of exact document cardinalities is a safe union bound. Avoid
+        // discarding individually admissible documents because a merge is large.
+        let sum = group
+            .members
+            .iter()
+            .fold(0usize, |n, &id| n.saturating_add(colors[id].unique_kmers));
+        let input_peak = group
+            .members
+            .iter()
+            .map(|&id| {
+                input_costs[id].max(super::memory::feature_resident_bytes(
+                    colors[id].occurrences,
+                ))
+            })
+            .fold(0u64, u64::saturating_add);
+        let cost = super::memory::group_estimate(
+            sum,
+            config
+                .slots(sum as f64)?
+                .max(if config.merge.planner == MergePlanner::Naive {
+                    group.slots
+                } else {
+                    0
+                }),
+            config.hashes,
+            group.width,
+            input_peak,
+        );
+        if cost > guard.budget && group.members.len() > 1 {
+            split += 1;
+            for &id in &group.members {
+                result.push(planner::Group {
+                    members: vec![id],
+                    cardinality: colors[id].unique_kmers as f64,
+                    slots: config.slots(colors[id].unique_kmers as f64)?,
+                    width: config.width(1),
+                    sketch: group.sketch.clone(),
+                    feature_count_upper_bound: colors[id].unique_kmers,
+                    input_peak_bytes: input_costs[id].max(super::memory::feature_resident_bytes(
+                        colors[id].occurrences,
+                    )),
+                });
+            }
+        } else {
+            result.push(group);
+        }
+    }
+    if split != 0 {
+        eprintln!("memory guard: split {split} oversized merged groups into admissible singleton filters; no included documents were dropped");
+    }
+    Ok((result, split))
 }
 
 fn union_features(group: &planner::Group, stage: &Path) -> Result<(Vec<u64>, Vec<u64>)> {
@@ -990,7 +1302,7 @@ fn build_group(
 fn construct_group(
     group: &planner::Group,
     keys: Vec<u64>,
-    mut values: Vec<u64>,
+    values: Vec<u64>,
     cache_stage: Option<&Path>,
     config: &BuildConfig,
     graph: &(impl Fn(&[u64], usize) -> Result<PeelGraph> + Sync),
@@ -998,7 +1310,24 @@ fn construct_group(
 ) -> Result<(BuiltGroup, u64)> {
     let slots = config
         .slots(keys.len() as f64)?
-        .max(slot_floor.unwrap_or(0));
+        .max(slot_floor.unwrap_or(0))
+        .max(if config.merge.planner == MergePlanner::Naive {
+            group.slots
+        } else {
+            0
+        });
+    construct_group_at_slots(group, keys, values, cache_stage, config, graph, slots)
+}
+
+fn construct_group_at_slots(
+    group: &planner::Group,
+    keys: Vec<u64>,
+    mut values: Vec<u64>,
+    cache_stage: Option<&Path>,
+    config: &BuildConfig,
+    graph: &(impl Fn(&[u64], usize) -> Result<PeelGraph> + Sync),
+    slots: usize,
+) -> Result<(BuiltGroup, u64)> {
     for (&key, value) in keys.iter().zip(&mut values) {
         *value = fingerprint(key, config.seed, config.fingerprint_bits)
             | if group.members.len() == 1 {
@@ -1007,6 +1336,23 @@ fn construct_group(
                 *value << config.fingerprint_bits
             };
     }
+    super::memory::trace_memory(
+        "graph-start",
+        serde_json::json!({
+        "members":group.members,"distinct":keys.len(),"hashes":config.hashes,"slots":slots,
+        "key_capacity_bytes":keys.capacity().saturating_mul(8),
+        "payload_capacity_bytes":values.capacity().saturating_mul(8),
+        "key_resident_estimate_bytes":group.input_peak_bytes.max((keys.len() as u64).saturating_mul(8)),
+        "prediction_model":super::memory::prediction_kind(keys.len(),slots,config.hashes),
+        "predicted_peak_rss_bytes":super::memory::group_prediction(keys.len(),slots,config.hashes,
+            group.width,group.input_peak_bytes),
+        "admission_workspace_bytes":super::memory::group_estimate(keys.len(),slots,config.hashes,
+            group.width,group.input_peak_bytes),
+        "conservative_capacity_bound_bytes":super::memory::capacity_bound(keys.len(),slots,config.hashes,
+            group.width,group.input_peak_bytes),
+        "estimated_workspace_bytes":super::memory::group_estimate(keys.len(),slots,config.hashes,
+            group.width,group.input_peak_bytes)}),
+    );
     let mut peeled = graph(&keys, slots)?;
     let cells = peeled.assign_verified_narrow(&keys, &values, slots, config.hashes, group.width)?;
     // Recover all dropped origins, including when the unconstrained cells happen
@@ -1111,6 +1457,7 @@ fn construct_group(
             cells,
             fallback,
             fallback_path,
+            routing: None,
         },
         verified,
     ))
@@ -1174,11 +1521,18 @@ fn promote_small_subindexes(
         .iter()
         .map(|(_, slots, group)| group_workspace(group, colors, input_costs, config, *slots))
         .collect::<Result<Vec<_>>>()?;
-    pull_jobs_budgeted(
+    if let Some(budget) = config.merge.planning_memory_budget_bytes {
+        ensure!(costs.iter().all(|&cost| cost <= budget),
+            "requested subindex promotion exceeds the memory guard budget {budget}; reduce layout promotion requirements");
+    }
+    pull_jobs_budgeted_with_policy(
         &jobs,
         usize::MAX,
         &costs,
-        super::memory::budget(config.merge.build_memory_gib),
+        super::memory::workspace_budget(&config.merge),
+        !config.merge.skip_oversized_documents,
+        config.merge.build_memory_gib.is_some(),
+        super::memory::total_bytes(config.merge.max_ram_gb),
         |_, &(id, slots, group)| {
             let (keys, values) = union_input_features(group, inputs, colors, signatures, config)?;
             let cache = (config.merge.disk_backed || !config.merge.low_disk).then_some(stage);
@@ -1188,6 +1542,131 @@ fn promote_small_subindexes(
         |_, (id, new)| std::mem::replace(&mut built[id], new).discard(),
     )?;
     Ok(promoted)
+}
+
+/// Final geometry includes exact union sizes and promotions. Only oversized
+/// classes are reconstructed, using the original merge plan and original keys.
+/// Each key belongs to one partition; its H locations use that partition's
+/// local power-of-two geometry. Unpartitioned classes are byte-for-byte unchanged.
+#[allow(clippy::too_many_arguments)]
+fn partition_large_subindexes(
+    built: Vec<BuiltGroup>,
+    planned: &[planner::Group],
+    inputs: &[ColorInput],
+    colors: &[Color],
+    signatures: &[u64],
+    input_costs: &[u64],
+    stage: &Path,
+    config: &BuildConfig,
+    graph: &(impl Fn(&[u64], usize) -> Result<PeelGraph> + Sync),
+) -> Result<Vec<BuiltGroup>> {
+    let mut widths = BTreeMap::<usize, usize>::new();
+    for group in &built {
+        *widths.entry(group.slots).or_default() += group.meta.width;
+    }
+    let mut splits = BTreeMap::new();
+    let minimum = config
+        .segment_length
+        .unwrap_or(1)
+        .checked_mul(config.hashes.next_power_of_two())
+        .context("partition segment geometry overflow")?;
+    for (&slots, &bits) in &widths {
+        let bytes = slots
+            .checked_mul(bits.div_ceil(8))
+            .context("subindex size overflow")?;
+        if bytes as u64 <= config.merge.max_subindex_size {
+            continue;
+        }
+        let mut local = slots;
+        while (local as u128) * (bits.div_ceil(8) as u128) > config.merge.max_subindex_size as u128
+        {
+            local /= 2;
+        }
+        ensure!(local >= minimum,
+            "--max-subindex-size={} bytes is too small for {} bytes per slice and minimum {} slots; raise the cap",
+            config.merge.max_subindex_size, bits.div_ceil(8), minimum);
+        splits.insert(slots, (local, slots / local));
+    }
+    if splits.is_empty() {
+        return Ok(built);
+    }
+    eprintln!(
+        "hash partitioning {} oversized size classes; maximum uncompressed subindex={} bytes",
+        splits.len(),
+        config.merge.max_subindex_size
+    );
+    let plans: BTreeMap<_, _> = planned.iter().map(|g| (g.members[0], g)).collect();
+    let mut result = Vec::new();
+    let mut jobs = Vec::new();
+    for old in built {
+        if let Some(&(local, partitions)) = splits.get(&old.slots) {
+            let source = old.slots;
+            let plan = plans[&old.meta.members[0]];
+            // Release the superseded cells and abandoned records first.
+            old.discard()?;
+            jobs.push((plan, source, local, partitions));
+        } else {
+            result.push(old);
+        }
+    }
+    let costs = jobs
+        .iter()
+        .map(|(g, source, _, _)| group_workspace(g, colors, input_costs, config, *source))
+        .collect::<Result<Vec<_>>>()?;
+    pull_jobs_budgeted_with_policy(
+        &jobs,
+        usize::MAX,
+        &costs,
+        super::memory::workspace_budget(&config.merge),
+        !config.merge.skip_oversized_documents,
+        config.merge.build_memory_gib.is_some(),
+        super::memory::total_bytes(config.merge.max_ram_gb),
+        |_, &(group, source_slots, local, partitions)| {
+            let (keys, masks) = union_input_features(group, inputs, colors, signatures, config)?;
+            let mut counts = vec![0usize; partitions];
+            for &key in &keys {
+                counts[partition_id(key, config.seed, partitions)] += 1;
+            }
+            let mut keys_by_part: Vec<_> = counts.iter().map(|&n| Vec::with_capacity(n)).collect();
+            let mut masks_by_part: Vec<_> = counts.iter().map(|&n| Vec::with_capacity(n)).collect();
+            for (key, mask) in keys.into_iter().zip(masks) {
+                let id = partition_id(key, config.seed, partitions);
+                keys_by_part[id].push(key);
+                masks_by_part[id].push(mask);
+            }
+            let mut built = Vec::with_capacity(partitions);
+            for (partition, (keys, masks)) in
+                keys_by_part.into_iter().zip(masks_by_part).enumerate()
+            {
+                let part_stage = stage
+                    .join("partitions")
+                    .join(format!("{source_slots}-{partition}"));
+                let cache = if config.merge.low_disk && !config.merge.disk_backed {
+                    None
+                } else {
+                    fs::create_dir_all(part_stage.join("cells"))?;
+                    if !config.merge.drop_abandoned {
+                        fs::create_dir_all(part_stage.join("abandoned"))?;
+                    }
+                    Some(part_stage.as_path())
+                };
+                let (mut part, _) =
+                    construct_group_at_slots(group, keys, masks, cache, config, graph, local)?;
+                part.routing = Some(Routing {
+                    source_slots,
+                    partition,
+                    partitions,
+                });
+                built.push(part);
+            }
+            Ok(built)
+        },
+        |_, parts| {
+            result.extend(parts);
+            Ok(())
+        },
+    )?;
+    Ok(result)
 }
 
 // Sample eight short windows across the complete filter, including its ends.
@@ -1287,6 +1766,7 @@ fn transpose(groups: Vec<BuiltGroup>, order: ColumnOrder) -> Result<Vec<Bank>> {
             row_bits,
             groups: groups.iter().map(|g| g.meta.clone()).collect(),
             fingerprint_first: false,
+            routing: None,
         };
         banks.push(Bank {
             meta,
@@ -1338,12 +1818,23 @@ fn pack_banks_streaming(
     fp_bits: usize,
     directory: &Path,
 ) -> Result<Vec<BankMeta>> {
-    let mut by_size = BTreeMap::<usize, Vec<BuiltGroup>>::new();
+    let mut by_size = BTreeMap::<(usize, usize), Vec<BuiltGroup>>::new();
     for group in groups {
-        by_size.entry(group.slots).or_default().push(group);
+        let key = group
+            .routing
+            .map_or((group.slots, 0), |r| (r.source_slots, r.partition));
+        by_size.entry(key).or_default().push(group);
     }
     let mut banks = Vec::new();
-    for (slots, mut groups) in by_size {
+    for (_, mut groups) in by_size {
+        let slots = groups[0].slots;
+        let routing = groups[0].routing;
+        ensure!(
+            groups
+                .iter()
+                .all(|g| g.slots == slots && g.routing == routing),
+            "inconsistent partition geometry"
+        );
         order_columns(&mut groups, order)?;
         let mut row_bits = 0usize;
         for group in &mut groups {
@@ -1354,15 +1845,16 @@ fn pack_banks_streaming(
             group.cells.validate(slots, group.meta.width)?;
         }
         let meta = BankMeta {
-            file: format!("bank-{}.zorbank.zst", slots.ilog2()),
+            file: BankMeta::filename(slots, routing),
             slots,
             row_bits,
             groups: groups.iter().map(|g| g.meta.clone()).collect(),
             fingerprint_first: true,
+            routing,
         };
         let row_bytes = row_bits.div_ceil(8);
         let expected_bytes = slots.checked_mul(row_bytes).context("bank size overflow")?;
-        let mut writer = create_index_writer(&directory.join(&meta.file))?;
+        let mut writer = bank_io::Writer::new(&directory.join(&meta.file))?;
         writer.write_all(PLANE_MAGIC)?;
         for n in [slots, row_bits, groups.len(), expected_bytes] {
             writer.write_all(&(n as u64).to_le_bytes())?;
@@ -1433,7 +1925,7 @@ fn pack_banks_streaming(
             }
             writer.write_all(output)?;
         }
-        finish_index_writer(writer)?;
+        writer.finish()?;
         drop(files);
         for group in groups {
             group.cells.remove()?;
@@ -1700,6 +2192,45 @@ fn read_u32(reader: &mut impl Read) -> Result<u32> {
 }
 
 fn load_abandoned(directory: &Path, manifest: &Manifest) -> Result<OriginMap> {
+    load_abandoned_selected(directory, manifest, None)
+}
+
+fn load_abandoned_selected(
+    directory: &Path,
+    manifest: &Manifest,
+    remap: Option<&[u32]>,
+) -> Result<OriginMap> {
+    let mut map = if remap.is_some() {
+        OriginMap::default()
+    } else {
+        OriginMap::with_capacity(manifest.abandoned_hashes, manifest.abandoned_origins)?
+    };
+    let mut selected = Vec::new();
+    visit_abandoned_file(directory, manifest, |hash, origins| {
+        if let Some(remap) = remap {
+            selected.clear();
+            selected.extend(
+                origins.iter().filter_map(|&id| {
+                    (remap[id as usize] != u32::MAX).then_some(remap[id as usize])
+                }),
+            );
+            if !selected.is_empty() {
+                map.push(hash, &selected)?;
+            }
+        } else {
+            map.push(hash, origins)?;
+        }
+        Ok(())
+    })?;
+    map.finish()?;
+    Ok(map)
+}
+
+fn visit_abandoned_file(
+    directory: &Path,
+    manifest: &Manifest,
+    mut visit: impl FnMut(u32, &[u32]) -> Result<()>,
+) -> Result<()> {
     ensure!(
         manifest.abandoned_file.as_deref() == Some(ABANDONED_FILE),
         "invalid abandoned map filename"
@@ -1717,10 +2248,10 @@ fn load_abandoned(directory: &Path, manifest: &Manifest) -> Result<OriginMap> {
         "invalid abandoned map magic"
     );
     let delta_encoded = &magic == ABANDONED_DELTA_MAGIC;
-    let mut map = OriginMap::with_capacity(manifest.abandoned_hashes, manifest.abandoned_origins)?;
     let mut origins = Vec::new();
     let mut bytes = vec![0; 64 * 1024];
     let mut previous_hash = 0u32;
+    let mut associations = 0usize;
     for record in 0..manifest.abandoned_hashes {
         let hash = if delta_encoded {
             let delta = read_var_u32(&mut reader)?;
@@ -1734,6 +2265,10 @@ fn load_abandoned(directory: &Path, manifest: &Manifest) -> Result<OriginMap> {
         } else {
             read_u32(&mut reader)?
         };
+        ensure!(
+            record == 0 || previous_hash < hash,
+            "unsorted/duplicate abandoned hashes"
+        );
         previous_hash = hash;
         let count = if delta_encoded {
             read_var_u32(&mut reader)?
@@ -1745,9 +2280,10 @@ fn load_abandoned(directory: &Path, manifest: &Manifest) -> Result<OriginMap> {
             "invalid abandoned origin count"
         );
         ensure!(
-            count <= manifest.abandoned_origins.saturating_sub(map.origins_len()),
+            count <= manifest.abandoned_origins.saturating_sub(associations),
             "abandoned origins exceed manifest"
         );
+        associations += count;
         origins.clear();
         let mut remaining = count;
         if delta_encoded {
@@ -1780,10 +2316,14 @@ fn load_abandoned(directory: &Path, manifest: &Manifest) -> Result<OriginMap> {
             }
             remaining -= n;
         }
-        map.push(hash, &origins)?;
+        ensure!(
+            origins.windows(2).all(|pair| pair[0] < pair[1]),
+            "unsorted/duplicate abandoned origins"
+        );
+        visit(hash, &origins)?;
     }
     ensure!(
-        map.origins_len() == manifest.abandoned_origins,
+        associations == manifest.abandoned_origins,
         "abandoned origin count differs from manifest"
     );
     let mut extra = [0];
@@ -1791,8 +2331,7 @@ fn load_abandoned(directory: &Path, manifest: &Manifest) -> Result<OriginMap> {
         reader.read(&mut extra)? == 0,
         "unexpected abandoned map data"
     );
-    map.finish()?;
-    Ok(map)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1822,12 +2361,57 @@ fn read_u64(reader: &mut impl Read) -> Result<u64> {
 
 // Modern banks are independent compressed streams. Validate the manifest first,
 // then decompress banks in parallel, concurrently with the auxiliary map.
-fn load_modern_bank(directory: &Path, meta: &BankMeta) -> Result<Bank> {
-    let expected_bytes = meta
-        .slots
-        .checked_mul(meta.row_bits.div_ceil(8))
-        .context("bank size overflow")?;
-    let mut reader = open_index_reader(&directory.join(&meta.file))?;
+/// Reframe existing subindexes for parallel loading without rebuilding filters.
+/// The original index is read-only and the new directory is published atomically.
+pub fn repack_subindexes(source: &Path, output: &Path) -> Result<()> {
+    ensure!(!output.exists(), "output already exists");
+    let index = Index::load_mode(source, false, None, true)?;
+    ensure!(
+        index.manifest.version >= 2,
+        "repacking requires a modern merged index"
+    );
+    let parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let path = parent.join(format!(".zor-repack-{}-{stamp}", std::process::id()));
+    fs::create_dir(&path)?;
+    let stage = Staging(path);
+    fs::copy(source.join("manifest.json"), stage.0.join("manifest.json"))?;
+    if let Some(name) = &index.manifest.abandoned_file {
+        fs::copy(source.join(name), stage.0.join(name))?;
+    }
+    for meta in &index.manifest.banks {
+        let expected = meta
+            .slots
+            .checked_mul(meta.row_bits.div_ceil(8))
+            .context("bank size overflow")?;
+        let mut reader = open_index_reader(&source.join(&meta.file))?;
+        let mut header = [0; 40];
+        reader.read_exact(&mut header)?;
+        validate_bank_header(&mut header.as_slice(), meta, expected)?;
+        let mut writer = bank_io::Writer::new(&stage.0.join(&meta.file))?;
+        writer.write_all(&header)?;
+        let limit = u64::try_from(expected)?
+            .checked_add(1)
+            .context("bank size overflow")?;
+        ensure!(
+            std::io::copy(&mut reader.take(limit), &mut writer)? == expected as u64,
+            "bank payload differs from manifest"
+        );
+        writer.finish()?;
+    }
+    fs::rename(&stage.0, output)?;
+    Ok(())
+}
+
+fn validate_bank_header(
+    reader: &mut impl Read,
+    meta: &BankMeta,
+    expected_bytes: usize,
+) -> Result<()> {
     let mut magic = [0; 8];
     reader.read_exact(&mut magic)?;
     ensure!(
@@ -1841,14 +2425,30 @@ fn load_modern_bank(directory: &Path, meta: &BankMeta) -> Result<Bank> {
     );
     for expected in [meta.slots, meta.row_bits, meta.groups.len(), expected_bytes] {
         ensure!(
-            read_u64(&mut reader)? == expected as u64,
+            read_u64(reader)? == expected as u64,
             "bank header differs from manifest"
         );
     }
-    let mut data = vec![0; expected_bytes];
-    reader.read_exact(&mut data)?;
-    let mut extra = [0];
-    ensure!(reader.read(&mut extra)? == 0, "unexpected bank data");
+    Ok(())
+}
+fn load_modern_bank(directory: &Path, meta: &BankMeta) -> Result<Bank> {
+    let expected_bytes = meta
+        .slots
+        .checked_mul(meta.row_bits.div_ceil(8))
+        .context("bank size overflow")?;
+    let path = directory.join(&meta.file);
+    let data = if let Some((header, data)) = bank_io::read_parallel(&path, expected_bytes)? {
+        validate_bank_header(&mut header.as_slice(), meta, expected_bytes)?;
+        data
+    } else {
+        let mut reader = open_index_reader(&path)?;
+        validate_bank_header(&mut reader, meta, expected_bytes)?;
+        let mut data = bank_io::zeroed(expected_bytes);
+        reader.read_exact(&mut data)?;
+        let mut extra = [0];
+        ensure!(reader.read(&mut extra)? == 0, "unexpected bank data");
+        data
+    };
     Ok(Bank {
         meta: meta.clone(),
         data,
@@ -1863,11 +2463,45 @@ impl Index {
     }
 
     fn load_with_recovery(directory: &Path, recover: bool) -> Result<Self> {
-        let manifest: Manifest =
+        Self::load_selected(directory, recover, None)
+    }
+
+    // Validate all metadata, but materialize only the selected subindex and its
+    // abandoned-key associations. Local document IDs keep worker state small.
+    fn load_selected(directory: &Path, recover: bool, selected: Option<usize>) -> Result<Self> {
+        Self::load_mode(directory, recover, selected, false)
+    }
+
+    fn load_mode(
+        directory: &Path,
+        recover: bool,
+        selected: Option<usize>,
+        metadata_only: bool,
+    ) -> Result<Self> {
+        let mut manifest: Manifest =
             serde_json::from_reader(BufReader::new(File::open(directory.join("manifest.json"))?))?;
+        let remap = if let Some(id) = selected {
+            let meta = manifest
+                .banks
+                .get(id)
+                .context("invalid selected subindex")?;
+            let mut ids: Vec<_> = meta
+                .groups
+                .iter()
+                .flat_map(|g| g.members.iter().copied())
+                .collect();
+            ids.sort_unstable();
+            let mut remap = vec![u32::MAX; manifest.colors.len()];
+            for (local, global) in ids.into_iter().enumerate() {
+                ensure!(global < remap.len(), "invalid dataset mapping");
+                remap[global] = u32::try_from(local).context("dataset IDs must fit in 32 bits")?;
+            }
+            Some(remap)
+        } else {
+            None
+        };
         ensure!(
-            [1, 2, 3, 4, 5, 6, 7, 8].contains(&manifest.version)
-                && manifest.backend == Backend::Zor,
+            (1..=9).contains(&manifest.version) && manifest.backend == Backend::Zor,
             "unsupported power-of-two index format"
         );
         ensure!(
@@ -1875,7 +2509,11 @@ impl Index {
             "invalid hash count"
         );
         ensure!(
-            if manifest.version >= 8 {
+            if manifest.version == 9 {
+                manifest
+                    .segment_length
+                    .is_none_or(|n| n.is_power_of_two() && n <= 4096)
+            } else if manifest.version == 8 {
                 manifest
                     .segment_length
                     .is_some_and(|n| n.is_power_of_two() && n <= 4096)
@@ -1930,16 +2568,30 @@ impl Index {
             (1..=31).contains(&features.minimizer_size) && features.modimizer_sampling > 0,
             "invalid feature parameters"
         );
-        let mut seen = vec![false; manifest.colors.len()];
+        let mut seen = vec![None; manifest.colors.len()];
+        let mut groups_seen = vec![None; manifest.colors.len()];
+        let classes = manifest
+            .banks
+            .iter()
+            .map(BankMeta::source_slots)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
         ensure!(
             manifest
                 .max_subindexes
-                .is_none_or(|limit| limit > 0 && manifest.banks.len() <= limit),
+                .is_none_or(|limit| limit > 0 && classes <= limit),
             "invalid maximum subindex count"
         );
         let mut banks = Vec::new();
+        ensure!(
+            manifest.max_subindex_size.is_none_or(u64::is_power_of_two),
+            "invalid maximum subindex size"
+        );
         let mut previous_slots = 0;
-        for meta in &manifest.banks {
+        let mut next_partition = 0;
+        let mut partition_count = 1;
+        let mut first_class_bank = 0;
+        for (bank_id, meta) in manifest.banks.iter().enumerate() {
             ensure!(
                 !meta.fingerprint_first || manifest.version >= 3,
                 "unsupported bank layout"
@@ -1947,10 +2599,37 @@ impl Index {
             ensure!(
                 meta.slots.is_power_of_two()
                     && meta.slots >= manifest.hashes
-                    && meta.slots > previous_slots,
+                    && meta.source_slots().is_power_of_two(),
                 "invalid bank size/order"
             );
-            previous_slots = meta.slots;
+            let (partition, partitions) =
+                meta.routing.map_or((0, 1), |r| (r.partition, r.partitions));
+            ensure!(
+                meta.routing.is_none()
+                    || (manifest.version >= 9
+                        && partitions > 1
+                        && partitions.is_power_of_two()
+                        && meta.slots.checked_mul(partitions) == Some(meta.source_slots())),
+                "invalid hash partition geometry"
+            );
+            if meta.source_slots() != previous_slots {
+                ensure!(
+                    meta.source_slots() > previous_slots
+                        && (previous_slots == 0 || next_partition == partition_count),
+                    "invalid/incomplete partition order"
+                );
+                previous_slots = meta.source_slots();
+                next_partition = 0;
+                partition_count = partitions;
+                first_class_bank = bank_id;
+            }
+            ensure!(
+                partitions == partition_count
+                    && partition == next_partition
+                    && partition < partitions,
+                "invalid/duplicate/missing hash partition"
+            );
+            next_partition += 1;
             if let Some(length) = manifest.segment_length {
                 ensure!(
                     meta.slots % length == 0 && meta.slots / length >= manifest.hashes,
@@ -1958,11 +2637,12 @@ impl Index {
                 );
             }
             ensure!(
-                meta.file == format!("bank-{}.zorbank.zst", meta.slots.ilog2()),
+                meta.file == BankMeta::filename(meta.slots, meta.routing),
                 "invalid bank file name"
             );
             let mut offset = 0;
-            for group in &meta.groups {
+            let mut local_seen = std::collections::HashSet::new();
+            for (group_id, group) in meta.groups.iter().enumerate() {
                 ensure!(
                     !group.members.is_empty()
                         && group.members.len() <= 64 - manifest.fingerprint_bits,
@@ -1981,10 +2661,24 @@ impl Index {
                 offset = offset.checked_add(width).context("row width overflow")?;
                 for &id in &group.members {
                     ensure!(
-                        id < seen.len() && !seen[id],
+                        id < seen.len()
+                            && local_seen.insert(id)
+                            && seen[id].is_none_or(|source| source == meta.source_slots()),
                         "invalid/duplicate dataset mapping"
                     );
-                    seen[id] = true;
+                    if partition == 0 {
+                        seen[id] = Some(meta.source_slots());
+                        groups_seen[id] = Some((bank_id, group_id));
+                    } else {
+                        let (first_bank, first_group) =
+                            groups_seen[id].context("missing partition dataset")?;
+                        ensure!(
+                            seen[id] == Some(meta.source_slots())
+                                && manifest.banks[first_bank].groups[first_group].members
+                                    == group.members,
+                            "inconsistent partition dataset mapping"
+                        );
+                    }
                 }
                 ensure!(
                     group.fallback_keys <= group.union_cardinality,
@@ -2010,12 +2704,35 @@ impl Index {
                 }
             }
             ensure!(offset == meta.row_bits && offset > 0, "invalid row width");
+            if partition > 0 {
+                let first = &manifest.banks[first_class_bank];
+                ensure!(
+                    first.row_bits == meta.row_bits
+                        && first.groups.len() == meta.groups.len()
+                        && local_seen.len()
+                            == first.groups.iter().map(|g| g.members.len()).sum::<usize>(),
+                    "incomplete partition dataset mapping"
+                );
+            }
+            let bytes = meta
+                .slots
+                .checked_mul(meta.row_bits.div_ceil(8))
+                .context("bank size overflow")?;
+            ensure!(
+                manifest
+                    .max_subindex_size
+                    .is_none_or(|limit| bytes as u64 <= limit),
+                "subindex exceeds maximum uncompressed size"
+            );
             // All versions retain the same validation. Version 1 needs its
             // embedded legacy records converted below; newer banks load later.
             if manifest.version >= 2 {
                 meta.slots
                     .checked_mul(meta.row_bits.div_ceil(8))
                     .context("bank size overflow")?;
+                continue;
+            }
+            if metadata_only || selected.is_some_and(|id| id != bank_id) {
                 continue;
             }
             let expected_bytes = meta
@@ -2051,7 +2768,13 @@ impl Index {
                     let group_id =
                         u32::try_from(legacy_members.len()).context("group ID exceeds 32 bits")?;
                     if recover {
-                        legacy_members.push(group.members.clone());
+                        legacy_members.push(
+                            group
+                                .members
+                                .iter()
+                                .map(|&id| remap.as_ref().map_or(id, |remap| remap[id] as usize))
+                                .collect(),
+                        );
                     }
                     let mut previous = None;
                     for _ in 0..group.fallback_keys {
@@ -2098,21 +2821,37 @@ impl Index {
             });
         }
         ensure!(
-            !manifest.banks.is_empty() && seen.iter().all(|&s| s),
+            !manifest.banks.is_empty()
+                && seen.iter().all(Option::is_some)
+                && next_partition == partition_count,
             "incomplete dataset mapping"
         );
+        if metadata_only {
+            return Ok(Self {
+                manifest,
+                banks: Vec::new(),
+                abandoned: None,
+                row_scratch_bytes: 0,
+            });
+        }
         let abandoned = if manifest.version >= 2 {
             let (loaded_banks, loaded_map) = rayon::join(
                 || {
                     manifest
                         .banks
                         .par_iter()
-                        .map(|meta| load_modern_bank(directory, meta))
+                        .enumerate()
+                        .filter(|(id, _)| selected.is_none_or(|selected| selected == *id))
+                        .map(|(_, meta)| load_modern_bank(directory, meta))
                         .collect::<Result<Vec<_>>>()
                 },
                 || {
                     if recover {
-                        load_abandoned(directory, &manifest).map(Some)
+                        if let Some(remap) = &remap {
+                            load_abandoned_selected(directory, &manifest, Some(remap)).map(Some)
+                        } else {
+                            load_abandoned(directory, &manifest).map(Some)
+                        }
                     } else {
                         Ok(None)
                     }
@@ -2133,6 +2872,22 @@ impl Index {
             Some(map)
         };
         let abandoned = abandoned.filter(|map| map.len() != 0);
+        if let Some(remap) = &remap {
+            for bank in &mut banks {
+                for group in &mut bank.meta.groups {
+                    for member in &mut group.members {
+                        *member = remap[*member] as usize;
+                    }
+                }
+            }
+            manifest.colors = manifest
+                .colors
+                .into_iter()
+                .enumerate()
+                .filter_map(|(id, color)| (remap[id] != u32::MAX).then_some(color))
+                .collect();
+            manifest.banks = banks.iter().map(|bank| bank.meta.clone()).collect();
+        }
         let row_scratch_bytes = banks
             .iter()
             // Fingerprint-first banks now compare directly in registers. Only
@@ -2151,6 +2906,40 @@ impl Index {
 
     fn lookup(&self, key: u64, scores: &mut [u64], scratch: &mut Vec<u8>) {
         self.lookup_into(key, scores, scratch);
+    }
+
+    // Full-RAM indexes contain complete contiguous partition runs. Jump over
+    // the run directly: H-position preparation, prefetch and lookup must not
+    // grow linearly with the number of physical partitions. A selectively
+    // loaded index can contain just one member of such a run.
+    fn selected_banks(&self, key: u64) -> impl Iterator<Item = (usize, &Bank)> {
+        let mut next = 0;
+        std::iter::from_fn(move || {
+            while next < self.banks.len() {
+                let start = next;
+                let bank = &self.banks[start];
+                if let Some(routing) = bank.meta.routing {
+                    let target = partition_id(key, self.manifest.seed, routing.partitions);
+                    if routing.partition == 0 && routing.partitions <= self.banks.len() - start {
+                        next += routing.partitions;
+                        let id = start + target;
+                        debug_assert_eq!(
+                            self.banks[id].meta.routing.unwrap().source_slots,
+                            routing.source_slots
+                        );
+                        return Some((id, &self.banks[id]));
+                    }
+                    next += 1;
+                    if target == routing.partition {
+                        return Some((start, bank));
+                    }
+                } else {
+                    next += 1;
+                    return Some((start, bank));
+                }
+            }
+            None
+        })
     }
 
     fn lookup_into<S: ScoreSink + ?Sized>(&self, key: u64, scores: &mut S, scratch: &mut Vec<u8>) {
@@ -2199,7 +2988,7 @@ impl Index {
         let position_hash = prepared
             .is_none()
             .then(|| PositionHash::new(key, self.manifest.seed));
-        for (bank_id, bank) in self.banks.iter().enumerate() {
+        for (bank_id, bank) in self.selected_banks(key) {
             let ranges = selected.map(|banks| banks[bank_id].as_slice());
             if ranges.is_some_and(|ranges| ranges.is_empty()) {
                 continue;
@@ -2356,8 +3145,13 @@ impl Index {
             positions.resize(block.len() * stride, 0);
             for (&key, slots) in block.iter().zip(positions.chunks_exact_mut(stride)) {
                 let hash = PositionHash::new(key, self.manifest.seed);
-                for (bank, slots) in self.banks.iter().zip(slots.chunks_exact_mut(hashes)) {
-                    hash.positions(bank.meta.slots, hashes, self.manifest.segment_length, slots);
+                for (id, bank) in self.selected_banks(key) {
+                    hash.positions(
+                        bank.meta.slots,
+                        hashes,
+                        self.manifest.segment_length,
+                        &mut slots[id * hashes..(id + 1) * hashes],
+                    );
                 }
             }
             for i in 0..block.len().min(AHEAD) {
@@ -2393,12 +3187,8 @@ impl Index {
             if let Some(map) = &self.abandoned {
                 map.prefetch(abandoned::hash(key, self.manifest.seed));
             }
-            for (id, (bank, slots)) in self
-                .banks
-                .iter()
-                .zip(positions.chunks_exact(self.manifest.hashes))
-                .enumerate()
-            {
+            for (id, bank) in self.selected_banks(key) {
+                let slots = &positions[id * self.manifest.hashes..(id + 1) * self.manifest.hashes];
                 let first = match selected {
                     Some(ranges) => match ranges[id].first() {
                         Some(range) => range.start,
@@ -2436,11 +3226,8 @@ impl Index {
             if let Some(map) = &self.abandoned {
                 map.prefetch(abandoned::hash(key, self.manifest.seed));
             }
-            for (bank, slots) in self
-                .banks
-                .iter()
-                .zip(positions.chunks_exact(self.manifest.hashes))
-            {
+            for (id, bank) in self.selected_banks(key) {
+                let slots = &positions[id * self.manifest.hashes..(id + 1) * self.manifest.hashes];
                 let row_bytes = bank.meta.row_bits.div_ceil(8);
                 let bytes = if bank.meta.fingerprint_first {
                     (bank.meta.groups.len() * self.manifest.fingerprint_bits).div_ceil(8)
@@ -2970,12 +3757,33 @@ pub fn query_records_command(
     recover: bool,
     batch_size: usize,
 ) -> Result<()> {
+    query_records_command_with_memory(
+        directory,
+        query,
+        min_ratio,
+        recover,
+        batch_size,
+        QueryMemory::default(),
+    )
+}
+
+pub fn query_records_command_with_memory(
+    directory: &Path,
+    query: &Path,
+    min_ratio: f64,
+    recover: bool,
+    batch_size: usize,
+    memory: QueryMemory,
+) -> Result<()> {
     let load_start = Instant::now();
     ensure!(
         (0.0..=1.0).contains(&min_ratio),
         "--min-ratio must be in [0, 1]"
     );
     ensure!(batch_size > 0, "record batch size must be positive");
+    if memory == QueryMemory::Subindex {
+        return query_stream::query_records(directory, query, min_ratio, recover, batch_size);
+    }
     let index = Index::load_with_recovery(directory, recover)
         .with_context(|| format!("loading {}", directory.display()))?;
     let load_seconds = load_start.elapsed().as_secs_f64();
@@ -3005,13 +3813,48 @@ pub fn query_command_with_recovery(
     min_ratio: f64,
     recover: bool,
 ) -> Result<()> {
+    query_command_with_memory(directory, query, min_ratio, recover, QueryMemory::default())
+}
+
+pub fn query_command_with_memory(
+    directory: &Path,
+    query: &Path,
+    min_ratio: f64,
+    recover: bool,
+    memory: QueryMemory,
+) -> Result<()> {
     ensure!(
         (0.0..=1.0).contains(&min_ratio),
         "--min-ratio must be in [0, 1]"
     );
+    if memory == QueryMemory::Subindex {
+        return query_stream::query_aggregate(directory, query, min_ratio, recover);
+    }
     let index = Index::load_with_recovery(directory, recover)
         .with_context(|| format!("loading {}", directory.display()))?;
     let start = Instant::now();
+    let (scores, total, probes) = query_index(&index, query)?;
+    print_aggregate(
+        &index.manifest,
+        query,
+        &scores,
+        total,
+        probes,
+        probes
+            * index
+                .manifest
+                .banks
+                .iter()
+                .map(BankMeta::source_slots)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len() as u64,
+        min_ratio,
+        start.elapsed().as_secs_f64(),
+    );
+    Ok(())
+}
+
+fn query_index(index: &Index, query: &Path) -> Result<(Vec<u64>, u64, u64)> {
     let features = index.manifest.features()?;
     let (scores, total, probes) = if features.mode == IndexMode::Findere {
         let result = crate::findere::query_file_with_homopolymer_compression(
@@ -3055,10 +3898,25 @@ pub fn query_command_with_recovery(
         }
         (scores, total, total)
     };
+    Ok((scores, total, probes))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_aggregate(
+    manifest: &Manifest,
+    query: &Path,
+    scores: &[u64],
+    total: u64,
+    probes: u64,
+    bank_probes: u64,
+    min_ratio: f64,
+    seconds: f64,
+) {
+    let mode = IndexMode::from_u8(manifest.index_mode).expect("validated index mode");
     println!("#query\t{}\tk={}\tindex_mode={}\ttotal_features={}\tstack_probes={}\tbank_probes={}\telapsed_s={:.6}",
-        query.display(), index.manifest.k, features.mode.label(), total, probes, probes * index.banks.len() as u64, start.elapsed().as_secs_f64());
+        query.display(), manifest.k, mode.label(), total, probes, bank_probes, seconds);
     println!("color\tmatches\tratio\tunique_kmers\tabandoned");
-    for (color, &matches) in index.manifest.colors.iter().zip(&scores) {
+    for (color, &matches) in manifest.colors.iter().zip(scores) {
         let ratio = if total == 0 {
             0.0
         } else {
@@ -3071,7 +3929,6 @@ pub fn query_command_with_recovery(
             );
         }
     }
-    Ok(())
 }
 
 fn query_strobe_file(
@@ -3130,12 +3987,27 @@ fn query_strobe_file(
 }
 
 pub fn info_command(directory: &Path) -> Result<()> {
-    let index = Index::load(directory)?;
+    let mut index = Index::load_mode(directory, false, None, true)?;
+    if index.manifest.version == 1 {
+        index = Index::load(directory)?;
+    } else {
+        // Validate payloads one at a time; info must not defeat the query cap.
+        for meta in &index.manifest.banks {
+            drop(load_modern_bank(directory, meta)?);
+        }
+        if index.manifest.abandoned_recovery {
+            index.abandoned = Some(load_abandoned(directory, &index.manifest)?);
+        }
+    }
     let m = &index.manifest;
     let features = m.features()?;
     let groups: usize = m.banks.iter().map(|b| b.groups.len()).sum();
     let logical_bits: usize = m.banks.iter().map(|b| b.slots * b.row_bits).sum();
-    let stack_bytes: usize = index.banks.iter().map(|b| b.data.len()).sum();
+    let stack_bytes: usize = m
+        .banks
+        .iter()
+        .map(|b| b.slots * b.row_bits.div_ceil(8))
+        .sum();
     let fallback_bytes: usize = if m.version == 1 {
         m.banks
             .iter()
@@ -3146,7 +4018,7 @@ pub fn info_command(directory: &Path) -> Result<()> {
         m.abandoned_hashes * 8 + m.abandoned_origins * 4
     };
     let metadata_bytes = fs::metadata(directory.join("manifest.json"))?.len() as usize
-        + index.banks.len() * 40
+        + m.banks.len() * 40
         + if m.version == 1 {
             groups * 8
         } else if m.abandoned_file.is_some() {
@@ -3161,6 +4033,28 @@ pub fn info_command(directory: &Path) -> Result<()> {
         .sum();
     println!("index\t{}\nk\t{}\nhashes\t{}\nseed\t{}\nfingerprint_bits\t{}\nindex_mode\t{}\ntechnical_layout\tmerge-pow2\ncolors\t{}\ngroups\t{}\nbanks\t{}",
         directory.display(), m.k, m.hashes, m.seed, m.fingerprint_bits, features.mode.label(), m.colors.len(), groups, m.banks.len());
+    println!(
+        "size_classes\t{}\nmax_subindex_size\t{}\nlargest_subindex_bytes\t{}\nhash_partitions\t{}",
+        m.banks
+            .iter()
+            .map(BankMeta::source_slots)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        m.max_subindex_size
+            .map_or_else(|| "unlimited".into(), |v| v.to_string()),
+        m.banks
+            .iter()
+            .map(|b| b.slots * b.row_bits.div_ceil(8))
+            .max()
+            .unwrap_or(0),
+        m.banks.iter().filter(|b| b.routing.is_some()).count()
+    );
+    println!(
+        "input_documents\t{}\nskipped_documents\t{}\nmemory_guard_split_groups\t{}",
+        m.input_document_count.max(m.colors.len()),
+        m.skipped_documents.len(),
+        m.memory_guard_split_groups
+    );
     if features.mode == IndexMode::Findere {
         println!(
             "findere_z\t{}\nindexed_k\t{}",
@@ -3186,6 +4080,9 @@ pub fn info_command(directory: &Path) -> Result<()> {
         m.merge_reverts_enabled
     );
     println!("construction_cell_storage\t{}", m.construction_cell_storage);
+    if let Some(budget) = m.merge_memory_budget_bytes {
+        println!("merge_memory_budget_bytes\t{budget}");
+    }
     println!(
         "construction_abandoned_storage\t{}",
         m.construction_abandoned_storage
@@ -3259,6 +4156,70 @@ pub fn info_command(directory: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guarded_admission_never_runs_an_oversized_job_alone() {
+        let called = std::sync::atomic::AtomicBool::new(false);
+        let error = pull_jobs_budgeted_with_policy(
+            &[1],
+            1,
+            &[101],
+            100,
+            false,
+            false,
+            None,
+            |_, _| {
+                called.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+        assert!(!called.load(Ordering::Relaxed));
+        assert!(error.to_string().contains("refuses an uncapped job"));
+    }
+
+    #[test]
+    fn oversized_merge_is_split_without_skipping_admissible_documents() {
+        let mut config = scratch_free_config(false);
+        config.hashes = 8;
+        let colors: Vec<_> = (0..2)
+            .map(|id| Color {
+                name: id.to_string(),
+                path: id.to_string(),
+                occurrences: 100_000,
+                unique_kmers: 100_000,
+            })
+            .collect();
+        let group = planner::Group {
+            members: vec![0, 1],
+            cardinality: 200_000.0,
+            slots: config.slots(200_000.0).unwrap(),
+            width: 10,
+            sketch: Sketch::new(&[], 64, 69),
+            feature_count_upper_bound: 200_000,
+            input_peak_bytes: 16 << 20,
+        };
+        let (groups, count) = guard_groups(
+            vec![group],
+            &colors,
+            &[8 << 20; 2],
+            &config,
+            Guard {
+                enabled: true,
+                budget: 32 << 20,
+            },
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            groups.iter().map(|g| g.members.clone()).collect::<Vec<_>>(),
+            vec![vec![0], vec![1]]
+        );
+        assert!(groups
+            .iter()
+            .all(|g| group_workspace(g, &colors, &[8 << 20; 2], &config, 0).unwrap() <= 32 << 20));
+    }
 
     #[test]
     fn workspace_admission_limits_live_and_pending_results_without_deadlock() {
@@ -3536,6 +4497,8 @@ mod tests {
             slots: 8,
             width: 8,
             sketch: Sketch::new(&keys, 64, 69),
+            feature_count_upper_bound: keys.len(),
+            input_peak_bytes: 0,
         };
         let (first, _) = construct_group(
             &group,
@@ -3607,6 +4570,7 @@ mod tests {
                 },
                 fallback: Vec::new(),
                 fallback_path: None,
+                routing: None,
             };
             let mut memory = group();
             memory.fallback = records.clone();
@@ -4107,6 +5071,7 @@ mod tests {
             cells: CompletedCells::Disk(path),
             fallback: vec![(id as u32, cells[0])],
             fallback_path: None,
+            routing: None,
         }
     }
 
@@ -4120,6 +5085,8 @@ mod tests {
             slots: 8,
             width: 11,
             sketch: Sketch::new(&[], 4096, 69),
+            feature_count_upper_bound: 5,
+            input_peak_bytes: 0,
         };
         cache_write(&cache_path(&stage.0, 0), &[1, 3, 5]).unwrap();
         cache_write(&cache_path(&stage.0, 1), &[2, 3, 5]).unwrap();
@@ -4341,6 +5308,7 @@ mod tests {
         let meta = BankMeta {
             file: "bank-2.zorbank.zst".into(),
             fingerprint_first: false,
+            routing: None,
             slots: 4,
             row_bits: 10,
             groups: vec![group],
@@ -4397,6 +5365,7 @@ mod tests {
             singleton_logical_bits: 64,
             min_subindex_documents: 1,
             max_subindexes: None,
+            max_subindex_size: None,
             promoted_groups: 0,
             predicted_logical_bits: 40,
             planned_groups: 1,
@@ -4406,6 +5375,11 @@ mod tests {
             sketch_seconds: 0.0,
             plan_seconds: 0.0,
             build_seconds: 0.0,
+            input_document_count: 2,
+            source_document_ids: Vec::new(),
+            skipped_documents: Vec::new(),
+            memory_guard_split_groups: 0,
+            merge_memory_budget_bytes: None,
             colors: ["a", "b"]
                 .into_iter()
                 .map(|name| Color {
@@ -4786,6 +5760,7 @@ mod tests {
         let meta = BankMeta {
             file: "bank-3.zorbank.zst".into(),
             fingerprint_first: false,
+            routing: None,
             slots: 8,
             row_bits: 8,
             groups: vec![GroupMeta {
@@ -4844,6 +5819,68 @@ mod tests {
         let mut raw = [0; 3];
         skipped.lookup(key, &mut raw, &mut scratch);
         assert_eq!(raw, [1, 0, 1]);
+
+        // A shared abandoned hash spans both subindexes. Loading either one
+        // must retain only its own origins, remap IDs, and never double count.
+        for (selected, expected, expected_raw) in
+            [(0, vec![1, 1], vec![1, 0]), (1, vec![1], vec![1])]
+        {
+            let other_path = stage.0.join(&index.manifest.banks[1 - selected].file);
+            let other_data = fs::read(&other_path).unwrap();
+            fs::remove_file(&other_path).unwrap();
+            // The other subindex is absent: this also proves it is not read.
+            for (recover, expected) in [(true, &expected), (false, &expected_raw)] {
+                let partial = Index::load_selected(&stage.0, recover, Some(selected)).unwrap();
+                assert_eq!(partial.banks.len(), 1);
+                assert_eq!(partial.manifest.colors.len(), expected.len());
+                if recover {
+                    assert_eq!(partial.abandoned.as_ref().unwrap().origins_len(), 1);
+                } else {
+                    assert!(partial.abandoned.is_none());
+                }
+                let mut actual = vec![0; expected.len()];
+                partial.lookup(key, actual.as_mut_slice(), &mut Vec::new());
+                assert_eq!(&actual, expected);
+            }
+            fs::write(other_path, other_data).unwrap();
+        }
+
+        // Version 1 embeds abandoned keys after each subindex rather than in
+        // the global file. In particular, subindex 1's original ID 2 must map
+        // to local ID 0, including the abandoned-key association.
+        index.manifest.version = 1;
+        index.manifest.abandoned_file = None;
+        index.manifest.abandoned_hashes = 0;
+        index.manifest.abandoned_origins = 0;
+        for bank in &index.banks {
+            let mut writer = create_index_writer(&stage.0.join(&bank.meta.file)).unwrap();
+            writer.write_all(MAGIC).unwrap();
+            for n in [
+                bank.meta.slots,
+                bank.meta.row_bits,
+                bank.meta.groups.len(),
+                bank.data.len(),
+            ] {
+                writer.write_all(&(n as u64).to_le_bytes()).unwrap();
+            }
+            writer.write_all(&bank.data).unwrap();
+            writer.write_all(&1u64.to_le_bytes()).unwrap();
+            writer.write_all(&key.to_le_bytes()).unwrap();
+            let value = fingerprint(key, 69, 8) | if bank.meta.row_bits == 10 { 2 << 8 } else { 0 };
+            writer.write_all(&value.to_le_bytes()).unwrap();
+            finish_index_writer(writer).unwrap();
+        }
+        serde_json::to_writer(
+            File::create(stage.0.join("manifest.json")).unwrap(),
+            &index.manifest,
+        )
+        .unwrap();
+        for selected in 0..2 {
+            let partial = Index::load_selected(&stage.0, true, Some(selected)).unwrap();
+            let mut actual = vec![0; partial.manifest.colors.len()];
+            partial.lookup(key, actual.as_mut_slice(), &mut Vec::new());
+            assert_eq!(actual, vec![1; if selected == 0 { 2 } else { 1 }]);
+        }
     }
 
     #[test]
@@ -4894,5 +5931,9 @@ mod tests {
         assert_eq!(scores, [1, 1]);
         let skipped = Index::load_with_recovery(&stage.0, false).unwrap();
         assert!(skipped.abandoned.is_none());
+        let partial = Index::load_selected(&stage.0, true, Some(0)).unwrap();
+        let mut scores = [0; 2];
+        partial.lookup(key, &mut scores, &mut Vec::new());
+        assert_eq!(scores, [1, 1]);
     }
 }

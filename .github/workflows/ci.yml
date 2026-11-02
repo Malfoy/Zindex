@@ -13,6 +13,7 @@ jobs:
       matrix:
         cpu: [native, x86-64]
     env:
+      CARGO_INCREMENTAL: "0"
       # Override the local native default to also compile/test the portable
       # baseline. Explicit scalar-kernel tests run in both configurations.
       RUSTFLAGS: -C target-cpu=${{ matrix.cpu }}
@@ -22,4 +23,24 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Test
-        run: cargo test --workspace --release
+        run: cargo test --workspace --release --locked
+      - name: Build command-line tools
+        run: cargo build --workspace --release --locked --bins
+      - name: Checked demonstration
+        run: bash scripts/demo.sh "$RUNNER_TEMP/zindex-demo-${{ matrix.cpu }}"
+      - name: Check benchmark recorder on tiny inputs
+        run: >-
+          python3 scripts/benchmark_zindex.py
+          --fof examples/tiny/samples.fof
+          --positive examples/tiny/a-only.fa --negative examples/tiny/negative.fa
+          --threads 2 --hash-inputs --hash-index
+          --output "$RUNNER_TEMP/zindex-recorder-${{ matrix.cpu }}"
+      - name: Preserve failed example logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: example-logs-${{ matrix.cpu }}
+          path: |
+            ${{ runner.temp }}/zindex-demo-${{ matrix.cpu }}/
+            ${{ runner.temp }}/zindex-recorder-${{ matrix.cpu }}/
+            !${{ runner.temp }}/zindex-recorder-${{ matrix.cpu }}/*.binary

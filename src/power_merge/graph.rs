@@ -222,8 +222,13 @@ pub trait DegreeQueue {
     fn pop(&mut self) -> Option<(Reverse<u32>, usize)>;
     fn peek(&self) -> Option<(Reverse<u32>, usize)>;
     fn update(&mut self, cell: usize, degree: u32);
+    fn allocated_bytes(&self) -> usize;
 }
 impl DegreeQueue for BinaryHeap<(Reverse<u32>, usize)> {
+    fn allocated_bytes(&self) -> usize {
+        self.capacity()
+            .saturating_mul(std::mem::size_of::<(Reverse<u32>, usize)>())
+    }
     fn new(slots: usize) -> Self {
         Self::with_capacity(slots)
     }
@@ -304,6 +309,12 @@ impl IndexedDegreeHeap {
     }
 }
 impl DegreeQueue for IndexedDegreeHeap {
+    fn allocated_bytes(&self) -> usize {
+        self.nodes
+            .capacity()
+            .saturating_mul(8)
+            .saturating_add(self.location.capacity().saturating_mul(4))
+    }
     fn new(slots: usize) -> Self {
         Self {
             nodes: Vec::with_capacity(slots),

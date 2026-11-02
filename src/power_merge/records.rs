@@ -26,6 +26,21 @@ pub(super) fn query_file<S: Send>(
     init: impl Fn() -> S,
     query: impl Fn(&mut S, &[Record], &mut Vec<u8>) -> Result<()> + Sync,
 ) -> Result<()> {
+    let stdout = std::io::stdout();
+    // StdoutLock cannot cross threads; the pipeline owns the buffered writer.
+    let mut out = BufWriter::with_capacity(1024 * 1024, stdout);
+    query_file_to(path, &mut out, batch_size, init, query)?;
+    out.flush()?;
+    Ok(())
+}
+
+pub(super) fn query_file_to<S: Send>(
+    path: &Path,
+    out: &mut (impl Write + Send),
+    batch_size: usize,
+    init: impl Fn() -> S,
+    query: impl Fn(&mut S, &[Record], &mut Vec<u8>) -> Result<()> + Sync,
+) -> Result<()> {
     ensure!(batch_size > 0, "record batch size must be positive");
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let input: Box<dyn Read + Send> = if crate::is_compressed_path(path) {
@@ -33,13 +48,44 @@ pub(super) fn query_file<S: Send>(
     } else {
         Box::new(file)
     };
-    let stdout = std::io::stdout();
-    // StdoutLock cannot cross threads. Stdout itself locks only the large
-    // buffered writes, while the dedicated writer overlaps lookup and parsing.
-    let mut out = BufWriter::with_capacity(1024 * 1024, stdout);
-    query_reader_chunks(BufReader::new(input), &mut out, batch_size, init, query)?;
-    out.flush()?;
-    Ok(())
+    query_reader_chunks(BufReader::new(input), out, batch_size, init, query)
+}
+
+/// Parse the file once, prepare each read on the Rayon pool, and retain only
+/// prepared objects. Raw sequence batches are recycled, never spooled to disk.
+pub(super) fn prepare_file<T: Send>(
+    path: &Path,
+    batch_size: usize,
+    prepare: impl Fn(&Record) -> Result<T> + Sync,
+) -> Result<Vec<T>> {
+    ensure!(batch_size > 0, "record batch size must be positive");
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let input: Box<dyn Read + Send> = if crate::is_compressed_path(path) {
+        Box::new(AnyDecoder::new(file))
+    } else {
+        Box::new(file)
+    };
+    let (tx, rx) = mpsc::sync_channel(2);
+    let (recycle_tx, recycle_rx) = mpsc::channel();
+    thread::scope(|scope| {
+        let parser =
+            scope.spawn(move || read_batches(BufReader::new(input), batch_size, tx, recycle_rx));
+        let result: Result<Vec<T>> = (|| {
+            let mut prepared = Vec::new();
+            while let Ok(batch) = rx.recv() {
+                prepared.extend(batch.par_iter().map(&prepare).collect::<Result<Vec<_>>>()?);
+                let _ = recycle_tx.send(batch);
+            }
+            Ok(prepared)
+        })();
+        drop(rx);
+        let parsing = parser
+            .join()
+            .map_err(|_| anyhow::anyhow!("record parser panicked"))?;
+        let prepared = result?;
+        parsing?;
+        Ok(prepared)
+    })
 }
 
 fn query_reader_chunks<S: Send>(

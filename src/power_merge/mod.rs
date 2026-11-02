@@ -1,5 +1,6 @@
 //! Merge-only colored indexes with one slot-major bank per power of two.
 mod abandoned;
+mod document_guard;
 mod graph;
 mod layout;
 mod planner;
@@ -14,22 +15,61 @@ use crate::FeatureConfig;
 use anyhow::{ensure, Context, Result};
 use clap::{Args, ValueEnum};
 pub use graph::{DegreeQueue, GraphIndex, IndexedDegreeHeap, PeelGraph, TypedPeelGraph};
+pub use memory::trace_memory;
 use serde::{Deserialize, Serialize};
 /// Fixed segment size for newly built merged indexes, independent of filter size.
 pub const DEFAULT_SEGMENT_LENGTH: usize = 64;
+pub const DEFAULT_MAX_SUBINDEX_SIZE: u64 = 8 * 1024 * 1024 * 1024;
+
+fn parse_subindex_size(value: &str) -> std::result::Result<u64, String> {
+    let value = value.trim();
+    let (number, scale) = [
+        ("GiB", 1u64 << 30),
+        ("MiB", 1u64 << 20),
+        ("KiB", 1u64 << 10),
+        ("B", 1),
+    ]
+    .into_iter()
+    .find_map(|(suffix, scale)| value.strip_suffix(suffix).map(|n| (n, scale)))
+    .unwrap_or((value, 1));
+    let bytes = number
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(scale))
+        .ok_or_else(|| "expected bytes or an integer followed by KiB, MiB or GiB".to_owned())?;
+    if !bytes.is_power_of_two() {
+        return Err("maximum subindex size must be a non-zero power of two".into());
+    }
+    Ok(bytes)
+}
 pub use storage::{
-    build, info_command, query_command, query_command_with_recovery, query_records_command,
+    build, info_command, query_command, query_command_with_memory, query_command_with_recovery,
+    query_records_command, query_records_command_with_memory, repack_subindexes,
 };
 mod memory;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum QueryMemory {
+    /// Prepare query seeds once, scan abandoned keys once, and load one subindex at a time.
+    #[default]
+    Subindex,
+    /// Load all subindexes and the global abandoned-key map together for maximum throughput.
+    All,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MergePlanner {
+    /// Full maximum-saving agglomeration (compatibility name: all-pairs).
+    #[value(alias = "full")]
+    #[serde(alias = "full")]
     AllPairs,
     #[default]
     Streaming,
     /// Original streaming planner, retained as an unpruned benchmark baseline.
     StreamingUnpruned,
+    /// No dataset unions: append each dataset to the smallest sufficient existing subindex in FOF order.
+    Naive,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
@@ -55,11 +95,15 @@ impl MergePlanner {
             Self::AllPairs => "all-pairs",
             Self::Streaming => "streaming",
             Self::StreamingUnpruned => "streaming-unpruned",
+            Self::Naive => "naive",
         }
     }
 
     pub fn is_streaming(self) -> bool {
-        matches!(self, Self::Streaming | Self::StreamingUnpruned)
+        matches!(
+            self,
+            Self::Streaming | Self::StreamingUnpruned | Self::Naive
+        )
     }
 }
 
@@ -68,7 +112,7 @@ pub struct MergeArgs {
     /// Compatibility flag: merged power-of-two banks are already the default.
     #[arg(long, action = clap::ArgAction::SetTrue, default_value_t = true)]
     pub power_of_two_merge: bool,
-    /// Streaming uses lossless cost-bound pruning; streaming-unpruned retains the exhaustive scan.
+    /// streaming (default), full/all-pairs, streaming-unpruned, or naive (ordered placement without unions).
     #[arg(long = "merge-planner", value_enum, default_value_t = MergePlanner::Streaming)]
     pub planner: MergePlanner,
     /// Physical group order within each bank; does not change planning or query output order.
@@ -92,9 +136,13 @@ pub struct MergeArgs {
     /// Collections smaller than this use one subindex. Set 1 for the legacy layout.
     #[arg(long, default_value_t = 128)]
     pub min_subindex_documents: usize,
-    /// Maximum subindex count; promote smaller filters, never fold. Omit for unlimited.
+    /// Maximum size-class count before hash partitioning; promote smaller filters. Omit for unlimited.
     #[arg(long)]
     pub max_subindexes: Option<usize>,
+    /// Maximum uncompressed merged-subindex payload. Hash-partition larger size classes.
+    /// A power of two, in bytes or with KiB/MiB/GiB suffix (default: 8 GiB).
+    #[arg(long, default_value = "8GiB", value_parser = parse_subindex_size)]
+    pub max_subindex_size: u64,
     /// Keep singleton power-of-two banks, for measuring sizing independently of merging.
     #[arg(long = "merge-disabled")]
     pub disabled: bool,
@@ -121,6 +169,29 @@ pub struct MergeArgs {
     /// a single oversized genome still need enough memory. Feature sorting stays in RAM.
     #[arg(long)]
     pub build_memory_gib: Option<f64>,
+
+    /// Total process resident-memory ceiling in decimal GB (500 = 500000000000
+    /// bytes). Fixed admission budget, without automatic available-RAM discount.
+    /// Measured RSS is checked every 20 ms; this is not a virtual-address limit.
+    #[arg(long, conflicts_with_all = ["build_memory_gib", "plain"])]
+    pub max_ram_gb: Option<f64>,
+
+    /// Skip documents whose estimated extraction/graph workspace exceeds the
+    /// per-document budget (merged builds). Skips are recorded, never silent.
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1,
+        require_equals = true, default_missing_value = "true", default_value_t = true,
+        conflicts_with = "plain")]
+    pub skip_oversized_documents: bool,
+
+    /// Per-document workspace ceiling in GiB (merged builds). Defaults to the
+    /// build workspace budget, and cannot raise that budget. Estimates are
+    /// conservative, not a hard process RSS limit.
+    #[arg(long, conflicts_with = "plain")]
+    pub max_document_memory_gib: Option<f64>,
+
+    /// Runtime-only frozen workspace limit shared with merge candidate checks.
+    #[arg(skip)]
+    pub planning_memory_budget_bytes: Option<u64>,
 }
 impl Default for MergeArgs {
     fn default() -> Self {
@@ -134,11 +205,16 @@ impl Default for MergeArgs {
             plan_margin: 0.03,
             min_subindex_documents: 128,
             max_subindexes: None,
+            max_subindex_size: DEFAULT_MAX_SUBINDEX_SIZE,
             disabled: false,
             drop_abandoned: false,
             disk_backed: false,
             low_disk: false,
             build_memory_gib: None,
+            max_ram_gb: None,
+            skip_oversized_documents: true,
+            max_document_memory_gib: None,
+            planning_memory_budget_bytes: None,
         }
     }
 }
@@ -165,6 +241,27 @@ pub struct BuildConfig {
 }
 impl BuildConfig {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.merge.max_subindex_size.is_power_of_two(),
+            "--max-subindex-size must be a non-zero power of two"
+        );
+        ensure!(
+            self.merge.max_ram_gb.is_none_or(|v| v.is_finite()
+                && v > 0.0
+                && v * 1_000_000_000.0 >= 1.0
+                && v * 1_000_000_000.0 < u64::MAX as f64),
+            "--max-ram-gb must be a positive finite decimal GB value of at least one byte"
+        );
+        ensure!(
+            self.merge.max_ram_gb.is_none() || self.merge.build_memory_gib.is_none(),
+            "--max-ram-gb conflicts with --build-memory-gib"
+        );
+        ensure!(
+            self.merge
+                .max_document_memory_gib
+                .is_none_or(|v| v.is_finite() && v > 0.0 && v * 1073741824.0 < u64::MAX as f64),
+            "--max-document-memory-gib must be a positive finite GiB value"
+        );
         ensure!(
             self.merge
                 .build_memory_gib
