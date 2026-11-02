@@ -1,0 +1,7 @@
+query_id	datasets
+shared	a,b
+a_only	a
+b_only	b
+c_only	c
+reverse_a	a
+negative	-

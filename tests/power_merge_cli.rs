@@ -98,6 +98,142 @@ fn build(fof: &str, output: &str, extra: &[&str]) {
 }
 
 #[test]
+fn naive_ocm_keeps_singletons_and_first_capacity_with_identical_query_engines() {
+    let f = Fixture::new();
+    let large = dna(30_000, 901);
+    let small = dna(600, 902);
+    let a = f.write("large.fa", format!(">large\n{large}\n"));
+    let b = f.write("small.fa", format!(">small\n{small}\n"));
+    let fof = f.write("naive.fof", format!("large\t{a}\nsmall\t{b}\n"));
+    let index = f.path("naive-index");
+    ok(
+        &[
+            "build",
+            "--fof",
+            &fof,
+            "--output",
+            &index,
+            "--k",
+            "49",
+            "--index-mode",
+            "minimizers",
+            "--minimizer-size",
+            "31",
+            "--minimizer-scheme",
+            "open-closed-mod",
+            "--hashes",
+            "8",
+            "--fingerprint-bits",
+            "8",
+            "--merge-planner",
+            "naive",
+            "--merge-plan-margin",
+            "0",
+            "--max-subindexes",
+            "1",
+        ],
+        "4",
+    );
+    let m: serde_json::Value =
+        serde_json::from_slice(&fs::read(Path::new(&index).join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(m["merge_planner"], "naive");
+    assert_eq!(m["planning_pair_evaluations"], 0);
+    assert_eq!(m["column_order"], "width");
+    let subindexes = m["banks"].as_array().unwrap();
+    assert_eq!(subindexes.len(), 1);
+    let groups = subindexes[0]["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0]["members"], serde_json::json!([0]));
+    assert_eq!(groups[1]["members"], serde_json::json!([1]));
+    assert!(groups.iter().all(|g| g["width"] == 8));
+    let query = f.write(
+        "queries.fa",
+        format!(
+            ">positive-large\n{}\n>positive-small\n{small}\n>negative\n{}\n",
+            &large[..1000],
+            dna(1000, 903)
+        ),
+    );
+    let mut baseline = None;
+    for threads in ["1", "4"] {
+        for memory in ["subindex", "all"] {
+            let result = ok(
+                &[
+                    "query",
+                    "--index",
+                    &index,
+                    "--query",
+                    &query,
+                    "--records",
+                    "--min-ratio",
+                    "0.8",
+                    "--query-memory",
+                    memory,
+                ],
+                threads,
+            );
+            if let Some(expected) = &baseline {
+                assert_eq!(&result, expected);
+            } else {
+                baseline = Some(result);
+            }
+        }
+    }
+    // The reverse order creates the small capacity before the larger one;
+    // --max-subindexes must not trigger a global reassignment in naive mode.
+    let reverse = f.write("reverse.fof", format!("small\t{b}\nlarge\t{a}\n"));
+    let reverse_index = f.path("reverse-index");
+    ok(
+        &[
+            "build",
+            "--fof",
+            &reverse,
+            "--output",
+            &reverse_index,
+            "--k",
+            "49",
+            "--index-mode",
+            "minimizers",
+            "--hashes",
+            "8",
+            "--fingerprint-bits",
+            "8",
+            "--merge-planner",
+            "naive",
+            "--max-subindexes",
+            "1",
+        ],
+        "4",
+    );
+    let m: serde_json::Value =
+        serde_json::from_slice(&fs::read(Path::new(&reverse_index).join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(m["banks"].as_array().unwrap().len(), 2);
+    // The public name full is accepted and retains all-pairs on-disk metadata.
+    let full = f.path("full-index");
+    ok(
+        &[
+            "build",
+            "--fof",
+            &fof,
+            "--output",
+            &full,
+            "--k",
+            "49",
+            "--index-mode",
+            "minimizers",
+            "--merge-planner",
+            "full",
+        ],
+        "4",
+    );
+    let m: serde_json::Value =
+        serde_json::from_slice(&fs::read(Path::new(&full).join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(m["merge_planner"], "all-pairs");
+}
+
+#[test]
 fn short_default_command_matches_explicit_optimized_settings() {
     let f = Fixture::new();
     let shared = dna(1100, 42);
@@ -860,12 +996,16 @@ fn all_cell_storage_modes_build_identical_filters_and_queries() {
                             "temporary-disk-sorted-runs"
                         }
                     );
+                    assert!(json["merge_memory_budget_bytes"].as_u64().unwrap() > 0);
                     for key in [
                         "construction_cell_storage",
                         "construction_abandoned_storage",
                         "sketch_seconds",
                         "plan_seconds",
                         "build_seconds",
+                        // Auto budget snapshots available RAM separately for
+                        // each build; it is provenance, not filter content.
+                        "merge_memory_budget_bytes",
                     ] {
                         json.as_object_mut().unwrap().remove(key);
                     }
@@ -1167,6 +1307,699 @@ fn record_queries_match_aggregate_counts_and_preserve_order_across_workers() {
 }
 
 #[test]
+fn sequential_queries_match_full_loading_for_seed_modes_widths_and_thresholds() {
+    let f = Fixture::new();
+    let shared = dna(700, 310);
+    let large = dna(6000, 311);
+    let mut inputs = String::new();
+    // Input order interleaves size classes; shared small documents can merge.
+    for (id, sequence) in [&large, &shared, &shared, &large[..2000].to_owned(), &shared]
+        .into_iter()
+        .enumerate()
+    {
+        let path = f.write(&format!("stream-{id}.fa"), format!(">doc\n{sequence}\n"));
+        inputs.push_str(&format!("doc{id}\t{path}\n"));
+    }
+    let fof = f.write("stream.fof", inputs);
+    let negative = dna(600, 312);
+    let reverse = String::from_utf8(zorindex::reverse_complement(shared.as_bytes())).unwrap();
+    let reads = format!(">duplicate description\n{shared}\n>negative\n{negative}\n>duplicate\n{reverse}\n>empty\n\n>ambiguous\nNNNN\n");
+    let query = f.write(
+        "stream-reads.fa.zst",
+        zstd::bulk::compress(reads.as_bytes(), 1).unwrap(),
+    );
+    let modes: &[(&str, &[&str])] = &[
+        ("kmers", &[]),
+        (
+            "minimizers",
+            &[
+                "--index-mode",
+                "minimizers",
+                "--k",
+                "49",
+                "--minimizer-size",
+                "31",
+            ],
+        ),
+        (
+            "simd-minimizers",
+            &[
+                "--index-mode",
+                "minimizers",
+                "--k",
+                "49",
+                "--minimizer-size",
+                "31",
+                "--minimizer-scheme",
+                "simd",
+            ],
+        ),
+        (
+            "spaced",
+            &["--seed-pattern", "#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#"],
+        ),
+        (
+            "spaced-minimizers",
+            &[
+                "--index-mode",
+                "minimizers",
+                "--k",
+                "49",
+                "--minimizer-size",
+                "31",
+                "--seed-pattern",
+                "#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#",
+            ],
+        ),
+        ("hpc", &["--homopolymer-compression"]),
+        (
+            "strobes",
+            &[
+                "--randstrobemers",
+                "--strobe-min",
+                "9",
+                "--strobe-max",
+                "80",
+            ],
+        ),
+        (
+            "minimizer-strobes",
+            &[
+                "--index-mode",
+                "minimizers",
+                "--k",
+                "49",
+                "--minimizer-size",
+                "31",
+                "--randstrobemers",
+                "--strobe-min",
+                "9",
+                "--strobe-max",
+                "80",
+            ],
+        ),
+        (
+            "modimizers",
+            &["--index-mode", "modimizers", "--modimizer-sampling", "7"],
+        ),
+        ("findere", &["--index-mode", "findere"]),
+    ];
+    for bits in ["1", "2", "4", "8", "16"] {
+        for &(name, mode) in modes {
+            let index = f.path(&format!("stream-{bits}-{name}"));
+            // Keep genuinely different size classes while still exercising
+            // shared colored filters; otherwise this tiny fixture can collapse
+            // entirely into one subindex for some seed schemes.
+            let mut extra = vec!["--fingerprint-bits", bits, "--merge-max-colors", "2"];
+            extra.extend_from_slice(mode);
+            build(&fof, &index, &extra);
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&fs::read(Path::new(&index).join("manifest.json")).unwrap())
+                    .unwrap();
+            assert!(
+                manifest["banks"].as_array().unwrap().len() >= 2,
+                "fp{bits} {name}"
+            );
+            for ignore in [false, true] {
+                let mut args = vec!["query", "--index", &index, "--query", &query];
+                if ignore {
+                    args.push("--ignore-abandoned");
+                }
+                let streamed = call(&args, "1");
+                assert!(
+                    streamed.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&streamed.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&streamed.stderr).contains("max_loaded_subindexes=1")
+                );
+                if matches!(
+                    name,
+                    "kmers"
+                        | "spaced"
+                        | "hpc"
+                        | "minimizers"
+                        | "simd-minimizers"
+                        | "spaced-minimizers"
+                ) {
+                    assert!(
+                        String::from_utf8_lossy(&streamed.stderr).contains("lookup=record-pruned"),
+                        "fp{bits} {name}: direct dense/minimizer query path is required"
+                    );
+                }
+                let streamed = String::from_utf8(streamed.stdout).unwrap();
+                let mut full = args.clone();
+                full.extend(["--query-memory", "all"]);
+                let full = ok(&full, "4");
+                // Query statistics and every result are identical; elapsed time differs.
+                assert_eq!(
+                    streamed
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .split("\telapsed_s=")
+                        .next(),
+                    full.lines().next().unwrap().split("\telapsed_s=").next(),
+                    "fp{bits} {name} ignore={ignore}"
+                );
+                assert_eq!(
+                    streamed.lines().skip(1).collect::<Vec<_>>(),
+                    full.lines().skip(1).collect::<Vec<_>>(),
+                    "fp{bits} {name} ignore={ignore}"
+                );
+                if name != "findere" {
+                    for ratio in ["0", "0.8", "1"] {
+                        let mut records = args.clone();
+                        records.extend([
+                            "--records",
+                            "--record-batch-size",
+                            "2",
+                            "--min-ratio",
+                            ratio,
+                        ]);
+                        let streamed = ok(&records, "4");
+                        records.extend(["--query-memory", "all"]);
+                        assert_eq!(
+                            streamed,
+                            ok(&records, "1"),
+                            "fp{bits} {name} ratio={ratio} ignore={ignore}"
+                        );
+                        assert!(fs::read_dir(&f.0).unwrap().all(|entry| !entry
+                            .unwrap()
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".zor-query-")));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn sequential_record_queries_keep_results_in_ram_for_one_or_multiple_subindexes() {
+    let f = Fixture::new();
+    let a = f.write("a.fa", format!(">a\n{}\n", dna(600, 313)));
+    let b = f.write("b.fa", format!(">b\n{}\n", dna(6000, 314)));
+    let fof = f.write("input.fof", format!("a\t{a}\nb\t{b}\n"));
+    let index = f.path("multiple");
+    build(&fof, &index, &[]);
+    let invalid = f.write("invalid.fa", "ACGT\n");
+    let args = ["query", "--index", &index, "--query", &invalid, "--records"];
+    assert!(!call(&args, "2").status.success());
+    assert!(fs::read_dir(&f.0).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".zor-query-")));
+    // Invalid input must still fail cleanly without creating any result files.
+    let failure = call(
+        &["query", "--index", &index, "--query", f.0.to_str().unwrap()],
+        "1",
+    );
+    assert!(!failure.status.success());
+    let single = f.path("single");
+    build(&fof, &single, &["--max-subindexes", "1"]);
+    let nonexistent = f.path("not-a-directory");
+    let query = ["query", "--index", &single, "--query", &a, "--records"];
+    let actual = ok(&query, "2");
+    let expected = ok(
+        &query
+            .into_iter()
+            .chain(["--query-memory", "all"])
+            .collect::<Vec<_>>(),
+        "1",
+    );
+    assert_eq!(actual, expected);
+    assert!(!Path::new(&nonexistent).exists());
+}
+
+#[test]
+fn dense_direct_queries_preserve_long_ambiguous_and_repeated_feature_counts() {
+    let f = Fixture::new();
+    let shared = dna(2400, 7319);
+    let other = dna(3200, 6928);
+    let a = f.write("dense-a.fa", format!(">a\n{shared}\n"));
+    let b = f.write("dense-b.fa", format!(">b\n{other}\n"));
+    let fof = f.write("dense.fof", format!("a\t{a}\nb\t{b}\n"));
+    let reverse = String::from_utf8(zorindex::reverse_complement(shared.as_bytes())).unwrap();
+    let reads = format!(
+        ">long\n{}\n>reverse\n{reverse}\n>mixed\n{}NNNN{}\n>short\nACGT\n>empty\n\n>ambiguous\nNNNN\n>negative\n{}\n",
+        shared.repeat(16), shared.repeat(2), other.repeat(2), dna(1000, 31267)
+    );
+    let query = f.write(
+        "dense-queries.fa.zst",
+        zstd::bulk::compress(reads.as_bytes(), 1).unwrap(),
+    );
+    for bits in ["4", "8", "16"] {
+        let index = f.path(&format!("dense-direct-{bits}"));
+        build(
+            &fof,
+            &index,
+            &[
+                "--fingerprint-bits",
+                bits,
+                "--slot-count",
+                "8192",
+                "--max-subindexes",
+                "1",
+                "--max-subindex-size",
+                "4KiB",
+            ],
+        );
+        for ignore in [false, true] {
+            for ratio in ["0", "0.8", "1"] {
+                let mut args = vec![
+                    "query",
+                    "--index",
+                    &index,
+                    "--query",
+                    &query,
+                    "--records",
+                    "--min-ratio",
+                    ratio,
+                    "--record-batch-size",
+                    "2",
+                ];
+                if ignore {
+                    args.push("--ignore-abandoned");
+                }
+                let direct = call(&args, "4");
+                assert!(
+                    direct.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&direct.stderr)
+                );
+                assert!(String::from_utf8_lossy(&direct.stderr).contains("lookup=record-pruned"));
+                args.extend(["--query-memory", "all"]);
+                let full = call(&args, "1");
+                assert!(
+                    full.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&full.stderr)
+                );
+                assert_eq!(
+                    direct.stdout, full.stdout,
+                    "fp{bits} ratio{ratio} ignore{ignore}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn capped_subindexes_route_hashes_and_preserve_membership_across_seed_modes_and_widths() {
+    let f = Fixture::new();
+    let shared = dna(900, 781);
+    let other = dna(1500, 9182);
+    let mut entries = String::new();
+    for (id, seq) in [&shared, &other, &shared].into_iter().enumerate() {
+        let path = f.write(&format!("partition-{id}.fa"), format!(">d{id}\n{seq}\n"));
+        entries.push_str(&format!("d{id}\t{path}\n"));
+    }
+    let fof = f.write("partition.fof", entries);
+    let reads = format!(
+        ">shared\n{shared}\n>negative\n{}\n>empty\n\n",
+        dna(500, 91237)
+    );
+    let query = f.write(
+        "partition-queries.fa.zst",
+        zstd::bulk::compress(reads.as_bytes(), 1).unwrap(),
+    );
+    let positive = f.write("partition-positive.fa", format!(">positive\n{shared}\n"));
+    let modes: &[(&str, &[&str])] = &[
+        ("kmers", &[]),
+        (
+            "minimizers",
+            &[
+                "--index-mode",
+                "minimizers",
+                "--k",
+                "49",
+                "--minimizer-size",
+                "31",
+            ],
+        ),
+        (
+            "spaced",
+            &["--seed-pattern", "#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#"],
+        ),
+        (
+            "strobes",
+            &[
+                "--randstrobemers",
+                "--strobe-min",
+                "9",
+                "--strobe-max",
+                "80",
+            ],
+        ),
+        (
+            "minimizer-strobes",
+            &[
+                "--index-mode",
+                "minimizers",
+                "--k",
+                "49",
+                "--minimizer-size",
+                "31",
+                "--randstrobemers",
+                "--strobe-min",
+                "9",
+                "--strobe-max",
+                "80",
+            ],
+        ),
+        ("findere", &["--index-mode", "findere"]),
+    ];
+    for bits in ["1", "2", "4", "8", "16"] {
+        for &(mode, options) in modes {
+            let index = f.path(&format!("cap-{bits}-{mode}"));
+            let mut extra = vec![
+                "--fingerprint-bits",
+                bits,
+                "--slot-count",
+                "8192",
+                "--max-subindexes",
+                "1",
+                "--max-subindex-size",
+                "4KiB",
+            ];
+            extra.extend_from_slice(options);
+            build(&fof, &index, &extra);
+            let m: serde_json::Value =
+                serde_json::from_slice(&fs::read(Path::new(&index).join("manifest.json")).unwrap())
+                    .unwrap();
+            assert_eq!(m["version"], 9);
+            assert_eq!(m["max_subindex_size"], 4096);
+            assert_eq!(m["max_subindexes"], 1);
+            let banks = m["banks"].as_array().unwrap();
+            let count = banks.len();
+            assert!(count > 1 && count.is_power_of_two());
+            for (part, bank) in banks.iter().enumerate() {
+                let slots = bank["slots"].as_u64().unwrap();
+                assert!(slots.is_power_of_two());
+                assert_eq!(slots * count as u64, 8192);
+                assert_eq!(bank["routing"]["partition"], part);
+                assert_eq!(bank["routing"]["partitions"], count);
+                assert_eq!(bank["routing"]["source_slots"], 8192);
+                let raw = zstd::decode_all(
+                    fs::File::open(Path::new(&index).join(bank["file"].as_str().unwrap())).unwrap(),
+                )
+                .unwrap();
+                let payload = slots * bank["row_bits"].as_u64().unwrap().div_ceil(8);
+                assert_eq!(raw.len() as u64, 40 + payload);
+                assert!(payload <= 4096);
+            }
+            for ignored in [false, true] {
+                let mut args = vec!["query", "--index", &index, "--query", &query];
+                if ignored {
+                    args.push("--ignore-abandoned");
+                }
+                let a = call(&args, "4");
+                assert!(a.status.success(), "{}", String::from_utf8_lossy(&a.stderr));
+                let log = String::from_utf8_lossy(&a.stderr);
+                assert!(log.contains("input_passes=1\tseed_extraction_passes=1"));
+                assert!(log.contains(if ignored {
+                    "abandoned_file_scans=0"
+                } else {
+                    "abandoned_file_scans=1"
+                }));
+                assert!(log.contains("result_storage=RAM"));
+                args.extend(["--query-memory", "all"]);
+                let a = String::from_utf8(a.stdout).unwrap();
+                let b = ok(&args, "1");
+                assert_eq!(
+                    a.lines().skip(1).collect::<Vec<_>>(),
+                    b.lines().skip(1).collect::<Vec<_>>(),
+                    "fp{bits} {mode}"
+                );
+                if mode != "findere" {
+                    for threshold in ["0", "0.8", "1"] {
+                        let mut records = vec![
+                            "query",
+                            "--index",
+                            &index,
+                            "--query",
+                            &query,
+                            "--records",
+                            "--min-ratio",
+                            threshold,
+                        ];
+                        if ignored {
+                            records.push("--ignore-abandoned");
+                        }
+                        let a = ok(&records, "4");
+                        records.extend(["--query-memory", "all"]);
+                        assert_eq!(
+                            a,
+                            ok(&records, "1"),
+                            "fp{bits} {mode} threshold={threshold}"
+                        );
+                    }
+                }
+            }
+            let result = ok(&["query", "--index", &index, "--query", &positive], "4");
+            let total = result
+                .lines()
+                .next()
+                .unwrap()
+                .split('\t')
+                .find_map(|s| s.strip_prefix("total_features="))
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+            assert!(total > 0);
+            assert_eq!(matches(&result, "d0"), total, "fp{bits} {mode}");
+            assert_eq!(matches(&result, "d2"), total, "fp{bits} {mode}");
+            if bits == "8" && mode == "kmers" {
+                // A single seed needs exactly one partition. Delete every
+                // other payload and verify the query still resolves fully.
+                let one = f.write("single-seed.fa", format!(">one\n{}\n", &shared[..31]));
+                let expected = ok(&["query", "--index", &index, "--query", &one], "1");
+                let mut key = 0;
+                zorindex::scan_canonical_kmers(shared[..31].as_bytes(), 31, &mut |k| key = k);
+                let selected =
+                    (zorindex::splitmix64(key ^ 69 ^ 0x34B6_1D8F_29A7_C053) as usize) & (count - 1);
+                for (part, bank) in banks.iter().enumerate() {
+                    if part != selected {
+                        fs::remove_file(Path::new(&index).join(bank["file"].as_str().unwrap()))
+                            .unwrap();
+                    }
+                }
+                let actual = ok(&["query", "--index", &index, "--query", &one], "4");
+                assert_eq!(
+                    actual.lines().skip(1).collect::<Vec<_>>(),
+                    expected.lines().skip(1).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn partition_caps_validate_and_all_construction_storage_modes_agree() {
+    let f = Fixture::new();
+    let path = f.write("cap.fa", format!(">ref\n{}\n", dna(1300, 187)));
+    let fof = f.write("cap.fof", format!("a\t{path}\nb\t{path}\n"));
+    let mut expected: Option<serde_json::Value> = None;
+    let mut expected_directory = String::new();
+    for (name, flags) in [
+        ("default", vec![]),
+        ("ram", vec!["--low-disk"]),
+        ("disk", vec!["--disk-backed"]),
+        ("dropped", vec!["--drop-abandoned"]),
+    ] {
+        let index = f.path(name);
+        let mut args = vec![
+            "--slot-count",
+            "8192",
+            "--max-subindex-size",
+            "2KiB",
+            "--fingerprint-bits",
+            "8",
+        ];
+        args.extend(flags);
+        build(&fof, &index, &args);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(Path::new(&index).join("manifest.json")).unwrap())
+                .unwrap();
+        assert!(manifest["banks"].as_array().unwrap().len() > 1);
+        if name != "dropped" {
+            if let Some(expected) = &expected {
+                assert_eq!(manifest["banks"], expected["banks"]);
+                for bank in manifest["banks"].as_array().unwrap() {
+                    let file = bank["file"].as_str().unwrap();
+                    assert_eq!(
+                        fs::read(Path::new(&index).join(file)).unwrap(),
+                        fs::read(Path::new(&expected_directory).join(file)).unwrap()
+                    );
+                }
+                assert_eq!(
+                    fs::read(Path::new(&index).join("abandoned.zormap.zst")).unwrap(),
+                    fs::read(Path::new(&expected_directory).join("abandoned.zormap.zst")).unwrap()
+                );
+            } else {
+                expected = Some(manifest);
+                expected_directory = index.clone();
+            }
+        }
+        let args = ["query", "--index", &index, "--query", &path];
+        let a = ok(&args, "4");
+        let b = ok(
+            &args
+                .into_iter()
+                .chain(["--query-memory", "all"])
+                .collect::<Vec<_>>(),
+            "1",
+        );
+        assert_eq!(
+            a.lines().skip(1).collect::<Vec<_>>(),
+            b.lines().skip(1).collect::<Vec<_>>()
+        );
+        assert!(!Path::new(&index).join("partitions").exists());
+    }
+    for cap in [
+        "0",
+        "3KiB",
+        "1.5GiB",
+        "junk",
+        "18446744073709551615GiB",
+        "1B",
+    ] {
+        let index = f.path(&format!("invalid-{cap}"));
+        let result = call(
+            &[
+                "build",
+                "--fof",
+                &fof,
+                "--output",
+                &index,
+                "--k",
+                "31",
+                "--max-subindex-size",
+                cap,
+            ],
+            "1",
+        );
+        assert!(!result.status.success(), "cap {cap}");
+        assert!(!Path::new(&index).exists());
+    }
+}
+
+#[test]
+fn malformed_hash_partition_metadata_is_rejected_before_reading_payloads() {
+    let f = Fixture::new();
+    let path = f.write("reference.fa", format!(">ref\n{}\n", dna(1300, 8716)));
+    let fof = f.write("input.fof", format!("a\t{path}\nb\t{path}\n"));
+    let index = f.path("index");
+    build(
+        &fof,
+        &index,
+        &["--slot-count", "8192", "--max-subindex-size", "4KiB"],
+    );
+    let manifest_path = Path::new(&index).join("manifest.json");
+    let original: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let info = ok(&["info", "--index", &index], "1");
+    assert_eq!(stat(&info, "size_classes"), 1);
+    assert!(stat(&info, "largest_subindex_bytes") <= 4096);
+    for corruption in [
+        "missing",
+        "duplicate",
+        "not-power-two",
+        "source-slots",
+        "member-order",
+        "old-version",
+        "over-cap",
+        "bank-order",
+    ] {
+        let mut m = original.clone();
+        match corruption {
+            "missing" => {
+                m["banks"].as_array_mut().unwrap().remove(1);
+            }
+            "duplicate" => m["banks"][1]["routing"]["partition"] = 0.into(),
+            "not-power-two" => m["banks"][0]["routing"]["partitions"] = 3.into(),
+            "source-slots" => m["banks"][0]["routing"]["source_slots"] = 4096.into(),
+            "member-order" => m["banks"][1]["groups"][0]["members"]
+                .as_array_mut()
+                .unwrap()
+                .reverse(),
+            "old-version" => m["version"] = 8.into(),
+            "over-cap" => m["max_subindex_size"] = 512.into(),
+            "bank-order" => m["banks"].as_array_mut().unwrap().swap(0, 1),
+            _ => unreachable!(),
+        }
+        fs::write(&manifest_path, serde_json::to_vec(&m).unwrap()).unwrap();
+        let result = call(&["query", "--index", &index, "--query", &path], "1");
+        assert!(!result.status.success(), "{corruption}");
+    }
+    fs::write(manifest_path, serde_json::to_vec(&original).unwrap()).unwrap();
+    assert!(call(&["query", "--index", &index, "--query", &path], "1")
+        .status
+        .success());
+}
+
+#[cfg(unix)]
+#[test]
+fn sequential_record_queries_parse_non_replayable_input_once() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let f = Fixture::new();
+    let a = f.write("a.fa", format!(">a\n{}\n", dna(500, 823)));
+    let b = f.write("b.fa", format!(">b\n{}\n", dna(6000, 719)));
+    let fof = f.write("inputs.fof", format!("a\t{a}\nb\t{b}\n"));
+    let index = f.path("index");
+    build(&fof, &index, &[]);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_zorindex"))
+        .args([
+            "--threads",
+            "2",
+            "query",
+            "--index",
+            &index,
+            "--query",
+            "/dev/stdin",
+            "--records",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&fs::read(&a).unwrap())
+        .unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(result.stdout).unwrap(),
+        ok(
+            &[
+                "query",
+                "--index",
+                &index,
+                "--query",
+                &a,
+                "--records",
+                "--query-memory",
+                "all"
+            ],
+            "1"
+        )
+    );
+}
+
+#[test]
 fn legacy_manifest_without_planner_fields_still_loads() {
     let f = Fixture::new();
     let reference = f.write("a.fa", format!(">a\n{}\n", dna(700, 123)));
@@ -1193,4 +2026,115 @@ fn legacy_manifest_without_planner_fields_still_loads() {
     assert!(info.contains("merge_column_order\twidth"));
     let query = ok(&["query", "--index", &index, "--query", &reference], "4");
     assert_eq!(matches(&query, "a"), 670);
+}
+
+#[test]
+fn repacking_subindexes_preserves_filter_payloads_and_both_query_modes() {
+    use std::io::Read;
+    let f = Fixture::new();
+    let a = dna(5000, 9921);
+    let b = dna(3000, 9922);
+    let pa = f.write("a.fa", format!(">a\n{a}\n"));
+    let pb = f.write("b.fa", format!(">b\n{b}\n"));
+    let fof = f.write("input.fof", format!("a\t{pa}\nb\t{pb}\n"));
+    let index = f.path("before");
+    let output = f.path("after");
+    ok(
+        &[
+            "build",
+            "--fof",
+            &fof,
+            "--output",
+            &index,
+            "--index-mode",
+            "minimizers",
+            "--k",
+            "49",
+            "--minimizer-size",
+            "31",
+            "--min-subindex-documents",
+            "1",
+            "--hashes",
+            "4",
+        ],
+        "4",
+    );
+    ok(
+        &["repack-subindexes", "--index", &index, "--output", &output],
+        "4",
+    );
+    assert_eq!(
+        fs::read(Path::new(&index).join("manifest.json")).unwrap(),
+        fs::read(Path::new(&output).join("manifest.json")).unwrap()
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(Path::new(&index).join("manifest.json")).unwrap())
+            .unwrap();
+    for bank in manifest["banks"].as_array().unwrap() {
+        let name = bank["file"].as_str().unwrap();
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        zorindex::open_index_reader(&Path::new(&index).join(name))
+            .unwrap()
+            .read_to_end(&mut before)
+            .unwrap();
+        zorindex::open_index_reader(&Path::new(&output).join(name))
+            .unwrap()
+            .read_to_end(&mut after)
+            .unwrap();
+        assert_eq!(before, after);
+    }
+    let query = f.write(
+        "queries.fa",
+        format!(
+            ">a\n{}\n>negative\n{}\n>empty\nNNN\n",
+            &a[50..1050],
+            dna(1000, 9221)
+        ),
+    );
+    for ratio in ["0", "0.8", "1"] {
+        let expected = ok(
+            &[
+                "query",
+                "--index",
+                &index,
+                "--query",
+                &query,
+                "--records",
+                "--min-ratio",
+                ratio,
+                "--query-memory",
+                "all",
+            ],
+            "4",
+        );
+        for dir in [&index, &output] {
+            for mode in ["all", "subindex"] {
+                assert_eq!(
+                    expected,
+                    ok(
+                        &[
+                            "query",
+                            "--index",
+                            dir,
+                            "--query",
+                            &query,
+                            "--records",
+                            "--min-ratio",
+                            ratio,
+                            "--query-memory",
+                            mode
+                        ],
+                        "4"
+                    )
+                );
+            }
+        }
+    }
+    assert!(!call(
+        &["repack-subindexes", "--index", &index, "--output", &output],
+        "4"
+    )
+    .status
+    .success());
 }

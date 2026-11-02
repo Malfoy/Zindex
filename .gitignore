@@ -19,6 +19,7 @@
 *.blmidx
 *.bf
 
+
 # Benchmark outputs
 /results/
 /tmp/
@@ -37,3 +38,7 @@
 *.swp
 *.swo
 *~
+
+# Small, versioned demonstration inputs are intentional source fixtures.
+!/examples/tiny/*.fa
+!/examples/tiny/*.tsv

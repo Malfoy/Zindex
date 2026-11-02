@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BinaryHeap},
+    collections::{BTreeMap, BTreeSet, BinaryHeap},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
         Mutex,
@@ -19,6 +19,10 @@ pub struct Group {
     pub slots: usize,
     pub width: usize,
     pub sketch: Sketch,
+    /// Sum of exact input cardinalities: a safe union bound, unlike the sketch.
+    pub feature_count_upper_bound: usize,
+    /// Sum of source workspaces, covering retained vectors during a union.
+    pub input_peak_bytes: u64,
 }
 
 pub struct Plan {
@@ -68,6 +72,8 @@ pub fn singleton(count: usize, sketch: Sketch, id: usize, config: &BuildConfig) 
         slots: config.slots(count as f64)?,
         width: config.width(1),
         sketch,
+        feature_count_upper_bound: count,
+        input_peak_bytes: 0,
     })
 }
 
@@ -79,7 +85,7 @@ fn candidate(
     config: &BuildConfig,
 ) -> Result<Option<Candidate>> {
     let count = ga.members.len() + gb.members.len();
-    if count > config.merge.max_colors {
+    if count > config.merge.max_colors || !merge_fits_memory(ga, gb, config)? {
         return Ok(None);
     }
     let j = ga.sketch.jaccard(&gb.sketch);
@@ -95,6 +101,9 @@ fn candidate_with_similarity(
     j: f64,
 ) -> Result<Option<Candidate>> {
     let count = ga.members.len() + gb.members.len();
+    if count > config.merge.max_colors || !merge_fits_memory(ga, gb, config)? {
+        return Ok(None);
+    }
     let cardinality = ((ga.cardinality + gb.cardinality) / (1.0 + j)).clamp(
         ga.cardinality.max(gb.cardinality),
         ga.cardinality + gb.cardinality,
@@ -115,6 +124,27 @@ fn candidate_with_similarity(
     }))
 }
 
+fn merge_fits_memory(ga: &Group, gb: &Group, config: &BuildConfig) -> Result<bool> {
+    let Some(budget) = config.merge.planning_memory_budget_bytes else {
+        return Ok(true);
+    };
+    let features = ga
+        .feature_count_upper_bound
+        .saturating_add(gb.feature_count_upper_bound);
+    // Use a cardinality upper bound and include the plan's safety margin. A
+    // noisy/high-similarity sketch must not approve an unbounded graph job.
+    let Ok(slots) = config.slots(features as f64 * (1.0 + config.merge.plan_margin)) else {
+        return Ok(false);
+    };
+    Ok(super::memory::group_estimate(
+        features,
+        slots,
+        config.hashes,
+        config.width(ga.members.len() + gb.members.len()),
+        ga.input_peak_bytes.saturating_add(gb.input_peak_bytes),
+    ) <= budget)
+}
+
 fn merge(mut ga: Group, gb: Group, c: &Candidate, config: &BuildConfig) -> Group {
     ga.sketch.merge_in_place(&gb.sketch);
     let mut members = ga.members;
@@ -129,6 +159,10 @@ fn merge(mut ga: Group, gb: Group, c: &Candidate, config: &BuildConfig) -> Group
         cardinality: c.cardinality,
         slots: c.slots,
         sketch: ga.sketch,
+        feature_count_upper_bound: ga
+            .feature_count_upper_bound
+            .saturating_add(gb.feature_count_upper_bound),
+        input_peak_bytes: ga.input_peak_bytes.saturating_add(gb.input_peak_bytes),
     }
 }
 
@@ -231,6 +265,8 @@ impl Bucket {
 #[derive(Default)]
 pub struct StreamingPlanner {
     groups: Vec<Group>,
+    // Naive placement never expands or revisits an existing size class.
+    naive_sizes: BTreeSet<usize>,
     pair_evaluations: u64,
     possible_pair_evaluations: u64,
     // Sub-bucket by origin count, so both width and slot cost are constant.
@@ -512,6 +548,19 @@ impl StreamingPlanner {
     }
 
     pub fn insert(&mut self, mut incoming: Group, config: &BuildConfig) -> Result<()> {
+        if config.merge.planner == MergePlanner::Naive {
+            let required = incoming.slots;
+            incoming.slots = match self.naive_sizes.range(required..).next().copied() {
+                Some(slots) => slots,
+                None => {
+                    self.naive_sizes.insert(required);
+                    required
+                }
+            };
+            incoming.sketch.release();
+            self.groups.push(incoming);
+            return Ok(());
+        }
         let unpruned = config.merge.planner == MergePlanner::StreamingUnpruned;
         if config.merge.disabled {
             if incoming.members.len() >= config.merge.max_colors {
@@ -553,6 +602,12 @@ impl StreamingPlanner {
                 group.cardinality = c.cardinality;
                 group.slots = c.slots;
                 group.sketch.merge_in_place(&incoming.sketch);
+                group.feature_count_upper_bound = group
+                    .feature_count_upper_bound
+                    .saturating_add(incoming.feature_count_upper_bound);
+                group.input_peak_bytes = group
+                    .input_peak_bytes
+                    .saturating_add(incoming.input_peak_bytes);
                 if group.members.len() >= config.merge.max_colors {
                     group.sketch.release();
                 }
@@ -678,6 +733,106 @@ mod tests {
                 ..MergeArgs::default()
             },
         }
+    }
+
+    #[test]
+    fn naive_places_in_smallest_existing_capacity_without_revisiting_or_merging() {
+        let mut c = config(Backend::Zor);
+        c.merge.planner = MergePlanner::Naive;
+        let mut state = StreamingPlanner::default();
+        for (id, slots) in [16, 8, 64, 32, 128, 16].into_iter().enumerate() {
+            let mut incoming = singleton(3, Sketch::default(), id, &c).unwrap();
+            incoming.slots = slots;
+            state.insert(incoming, &c).unwrap();
+        }
+        let plan = state.finish();
+        assert_eq!(plan.pair_evaluations, 0);
+        assert_eq!(plan.possible_pair_evaluations, 0);
+        assert_eq!(
+            plan.groups.iter().map(|g| g.slots).collect::<Vec<_>>(),
+            [16, 16, 64, 64, 128, 16]
+        );
+        for (id, group) in plan.groups.iter().enumerate() {
+            assert_eq!(group.members, [id]);
+            assert!(group.sketch.is_released());
+            assert_eq!(group.width, c.fingerprint_bits);
+        }
+        // Changing arrival order may change padding, never the set of datasets.
+        let mut reversed = StreamingPlanner::default();
+        for (id, slots) in [128, 64, 16].into_iter().enumerate() {
+            let mut incoming = singleton(3, Sketch::default(), id, &c).unwrap();
+            incoming.slots = slots;
+            reversed.insert(incoming, &c).unwrap();
+        }
+        assert!(reversed.finish().groups.iter().all(|g| g.slots == 128));
+    }
+
+    #[test]
+    fn every_planner_keeps_safe_pairs_instead_of_forming_an_oversized_group() {
+        for mode in [
+            MergePlanner::Streaming,
+            MergePlanner::StreamingUnpruned,
+            MergePlanner::AllPairs,
+        ] {
+            let mut c = config(Backend::Zor);
+            c.hashes = 8;
+            c.fingerprint_bits = 8;
+            c.merge.planner = mode;
+            c.merge.planning_memory_budget_bytes = Some(40 << 20);
+            let initial: Vec<_> = (0..4)
+                .map(|id| {
+                    let mut group =
+                        singleton(50_000, Sketch::new(&[1, 2, 3], 64, 69), id, &c).unwrap();
+                    group.input_peak_bytes = 8 << 20;
+                    group
+                })
+                .collect();
+            let groups = if mode.is_streaming() {
+                let mut planner = StreamingPlanner::default();
+                for group in initial {
+                    planner.insert(group, &c).unwrap();
+                }
+                planner.finish().groups
+            } else {
+                plan(initial, &c).unwrap().groups
+            };
+            assert_eq!(groups.len(), 2, "{mode:?}");
+            assert!(groups.iter().all(|g| g.members.len() == 2
+                && g.feature_count_upper_bound == 100_000
+                && g.input_peak_bytes == 16 << 20));
+            let mut members: Vec<_> = groups
+                .iter()
+                .flat_map(|g| g.members.iter().copied())
+                .collect();
+            members.sort_unstable();
+            assert_eq!(members, vec![0, 1, 2, 3]);
+            assert!(groups.iter().all(|g| super::super::memory::group_estimate(
+                g.feature_count_upper_bound,
+                c.slots(g.feature_count_upper_bound as f64).unwrap(),
+                c.hashes,
+                g.width,
+                g.input_peak_bytes
+            ) <= 40 << 20));
+        }
+    }
+
+    #[test]
+    fn memory_check_uses_exact_count_bound_even_when_sketches_are_identical() {
+        let mut c = config(Backend::Zor);
+        c.hashes = 8;
+        c.fingerprint_bits = 8;
+        c.merge.planning_memory_budget_bytes = Some(200 << 30);
+        let a = singleton(300_000_000, Sketch::new(&[1, 2, 3], 64, 69), 0, &c).unwrap();
+        let b = singleton(300_000_000, Sketch::new(&[1, 2, 3], 64, 69), 1, &c).unwrap();
+        assert!(candidate_with_similarity(0, 1, &a, &b, &c, 1.0)
+            .unwrap()
+            .is_none());
+        c.merge.planning_memory_budget_bytes = Some(1 << 40);
+        let candidate = candidate_with_similarity(0, 1, &a, &b, &c, 1.0)
+            .unwrap()
+            .unwrap();
+        let merged = merge(a, b, &candidate, &c);
+        assert_eq!(merged.feature_count_upper_bound, 600_000_000);
     }
     #[test]
     fn rounded_cost_controls_merges() {

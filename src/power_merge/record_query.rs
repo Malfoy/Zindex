@@ -169,10 +169,14 @@ pub(super) struct Worker {
 
 impl Worker {
     pub(super) fn new(index: &Index) -> Self {
+        Self::with_documents(index.manifest.colors.len())
+    }
+
+    pub(super) fn with_documents(documents: usize) -> Self {
         Self {
-            scores: RecordScores::new(index.manifest.colors.len()),
+            scores: RecordScores::new(documents),
             strand_scores: None,
-            full_hits: RecordScores::new(index.manifest.colors.len()),
+            full_hits: RecordScores::new(documents),
             scratch: Vec::new(),
             keys: Vec::new(),
             sorted: Vec::new(),
@@ -288,6 +292,49 @@ impl Worker {
         let total = range.len() as u64;
         self.scores.clear();
         self.candidates.reset(index, total, ratio);
+        self.query_feature_range(index, range);
+        total
+    }
+
+    // A loaded subindex has its own small document space. The caller already
+    // extracted these features, so move the buffer rather than parsing again or
+    // building a global feature-ID table. Cross-read caching is not needed here.
+    pub(super) fn query_prepared(&mut self, index: &Index, keys: &mut Vec<u64>, ratio: f64) {
+        std::mem::swap(&mut self.keys, keys);
+        self.cache.clear();
+        self.origins.clear();
+        self.query_features(index, 0..self.keys.len(), ratio);
+        std::mem::swap(&mut self.keys, keys);
+    }
+
+    // Partitions contribute disjoint feature occurrences to the same documents.
+    // Bounds use the ORIGINAL read denominator and all unprocessed partitions,
+    // never just the features in the currently loaded partition.
+    pub(super) fn query_partition(
+        &mut self,
+        index: &Index,
+        keys: impl Iterator<Item = u64>,
+        total: u64,
+        remaining: u64,
+        previous: &[(usize, u64)],
+        ratio: f64,
+    ) {
+        self.keys.clear();
+        self.keys.extend(keys);
+        self.cache.clear();
+        self.origins.clear();
+        self.scores.clear();
+        for &(id, count) in previous {
+            self.scores.add(id, count);
+        }
+        self.candidates.reset(index, total, ratio);
+        self.candidates.remaining = remaining;
+        self.candidates.until_check = 0;
+        self.candidates.advance(index, &self.scores, 0);
+        self.query_feature_range(index, 0..self.keys.len());
+    }
+
+    fn query_feature_range(&mut self, index: &Index, range: Range<usize>) {
         self.keys[range.clone()].sort_unstable();
         let mut i = range.start;
         // Prepare independent addresses ahead, but commit scores/cache/pruning
@@ -313,16 +360,12 @@ impl Worker {
             positions.resize(count * stride, 0);
             for (&key, out) in keys[..count].iter().zip(positions.chunks_exact_mut(stride)) {
                 let hash = PositionHash::new(key, index.manifest.seed);
-                for (bank, out) in index
-                    .banks
-                    .iter()
-                    .zip(out.chunks_exact_mut(index.manifest.hashes))
-                {
+                for (id, bank) in index.selected_banks(key) {
                     hash.positions(
                         bank.meta.slots,
                         index.manifest.hashes,
                         index.manifest.segment_length,
-                        out,
+                        &mut out[id * index.manifest.hashes..(id + 1) * index.manifest.hashes],
                     );
                 }
             }
@@ -358,7 +401,6 @@ impl Worker {
             }
         }
         self.positions = positions;
-        total
     }
 
     // Very long records do not allocate an unbounded feature list or result
@@ -765,6 +807,7 @@ mod tests {
                     row_bits: offset,
                     groups,
                     fingerprint_first: planes,
+                    routing: None,
                 },
                 data,
                 fallback: Vec::new(),
@@ -860,6 +903,55 @@ mod tests {
                                 actual, expected,
                                 "bits={bits} planes={planes} recovery={recovery} ratio={ratio}"
                             );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partial_query_bounds_preserve_counts_across_partition_orders() {
+        for bits in [1, 2, 4, 8, 16] {
+            for planes in [false, true] {
+                let index = random_index(bits, planes);
+                for common in [0, 20, 60, 70] {
+                    let mut keys = vec![123; common];
+                    keys.extend((0..70 - common).map(|i| splitmix64(i as u64 + 8000)));
+                    // Include an empty part and put the matching occurrences in
+                    // different parts. A per-part denominator would be wrong.
+                    let parts = [&keys[..13], &keys[13..41], &keys[41..], &keys[0..0]];
+                    for order in [[0, 1, 2, 3], [2, 3, 0, 1], [3, 1, 2, 0]] {
+                        for ratio in [0.0, 0.5, 0.8, 1.0] {
+                            let mut worker = Worker::new(&index);
+                            let mut previous = Vec::new();
+                            let mut left = keys.len() as u64;
+                            for part in order {
+                                worker.query_partition(
+                                    &index,
+                                    parts[part].iter().copied(),
+                                    keys.len() as u64,
+                                    left,
+                                    &previous,
+                                    ratio,
+                                );
+                                left -= parts[part].len() as u64;
+                                previous.clear();
+                                for &id in &worker.scores.touched {
+                                    let count = worker.scores.values[id];
+                                    if ratio == 0.0
+                                        || (count + left) as f64 / keys.len() as f64 >= ratio
+                                    {
+                                        previous.push((id, count));
+                                    }
+                                }
+                            }
+                            let mut actual = Vec::new();
+                            worker
+                                .scores
+                                .write(keys.len() as u64, ratio, &mut actual)
+                                .unwrap();
+                            assert_eq!(actual, reference(&index, &keys, ratio), "fp{bits} planes={planes} common={common} ratio={ratio} order={order:?}");
                         }
                     }
                 }

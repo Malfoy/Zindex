@@ -25,7 +25,7 @@ Header fields:
 - version
 - `k`
 - ZOR hash count
-- fingerprint width (`1`, `8` or `16`); single-bit fingerprints are packed eight per byte, with each stack row rounded up to a whole byte
+- fingerprint width (`1`, `2`, `4`, `8` or `16`); sub-byte fingerprints are packed eight, four or two per byte, with each stack row rounded up to a whole byte
 - flags
 - seed
 - feature mode
@@ -45,11 +45,11 @@ Header fields:
 - slot-major stack
 - optional union graph
 
-For 1-bit fingerprints, a plain stack row occupies
-`ceil(technical_bin_count / 8)` bytes and a standalone filter (including a
-union graph) occupies `ceil(array_length / 8)` bytes. Bits are least-significant
-first within each byte. Slice codecs operate on these packed bytes with a
-one-byte codec element width; the header fingerprint width remains `1`.
+For sub-byte fingerprints of width `f`, a plain stack row occupies
+`ceil(technical_bin_count * f / 8)` bytes and a standalone filter (including a
+union graph) occupies `ceil(array_length * f / 8)` bytes. Fingerprints are packed
+from the least-significant bits of each byte. Slice codecs operate on these
+packed bytes with a one-byte codec element width; the header retains width `f`.
 Unused final-byte bits are ignored by queries. The 8- and 16-bit layouts are
 unchanged.
 
@@ -134,7 +134,7 @@ count each color at most once per feature.
 Zindex builds a new merged directory by default, regardless of the output
 extension. `--plain` selects the legacy single-file `.zoridx` layout;
 `--power-of-two-merge` remains an optional compatibility flag.
-`manifest.json` contains version `8`, feature/hash settings, dataset identities,
+`manifest.json` contains version `8` (or `9` for hash-partitioned indexes), feature/hash settings, dataset identities,
 group members and widths, bank sizes and abandoned-key map metadata.
 Version 4 adds `minimizer_scheme` (`simd` or `open-closed-mod`) and
 `homopolymer_compression` (boolean). These govern both construction and queries.
@@ -160,10 +160,39 @@ remain powers of two and must fit at least `hashes` complete segments. Queries
 use this stored size. Versions 1 through 7 retain their historical size-dependent
 position mapping; changing a version number alone does not convert an index.
 
+Version 9 adds hash-routed subindexes. `max_subindex_size` stores the build's
+maximum uncompressed slice-payload bytes (default 8 GiB; a power of two).
+Oversized finalized size classes are reconstructed as a power-of-two number
+of partitions. Their bank metadata contains a `routing` object with
+`source_slots`, `partition` (zero-based), and `partitions`. Each has
+`slots * partitions == source_slots`; both slot counts and the partition count
+are powers of two. Unpartitioned banks omit `routing`. Partitions are ordered
+by `(source_slots, partition)` and stored in
+`bank-<source_exponent>-part-<partition>-of-<partitions>.zorbank.zst`.
+
+The route is `splitmix64(key ^ seed ^ 0x34B61D8F29A7C053) & (partitions - 1)`.
+Every key's H positions are computed using the selected bank's **local** slot
+count. Keys are not replicated or queried in other partitions of the same size
+class. Fingerprints and origin bits are unchanged. Each original document and
+merged group appears once per partition of its size class; cross-class duplicate
+documents, missing partitions, inconsistent members and invalid geometries are
+rejected. Group order may differ between partitions to improve compression.
+Abandoned keys from every partition still enter the single global 32-bit-hash
+multimap; collisions retain the full union of original document IDs.
+
+`--max-subindexes` and `min_subindex_documents` apply to original size classes
+before hash partitioning. A size class can consequently contain multiple physical
+bank files. Each bank's byte-padded slice payload fits `max_subindex_size`;
+its 40-byte header, metadata and query-result memory are outside that cap.
+The bank payload encoding itself is unchanged. Version-9 readers accept the
+optional fixed segment geometry; legacy library configurations without it keep
+their historical position mapping. Readers before version 9 reject partitioned
+directories, rather than accidentally querying every partition.
+
 Each `bank-<exponent>.zorbank.zst` expands to magic `ZORPOW3\0`, followed by
 four little-endian `u64` values: slots, bits per row, group count and data bytes.
 Rows have `ceil(bits_per_row / 8)` bytes. Each row begins with all groups'
-1-, 8- or 16-bit fingerprints, followed immediately by their packed origin bits. Singleton
+1-, 2-, 4-, 8- or 16-bit fingerprints, followed immediately by their packed origin bits. Singleton
 groups have no origin bits. Group offsets in the manifest describe the original
 complete-payload prefix; the origin-plane offset for group `i` is
 `group_count * fingerprint_bits + group.offset - i * fingerprint_bits`.
@@ -210,8 +239,29 @@ legacy `ZORABN1\0` stream: little-endian u32 hash, count and origin IDs.
 This is one global multimap across all banks;
 32-bit hash collisions union origin lists. It is omitted with `--drop-abandoned`.
 
-The current reader also supports manifest versions 1 through 7 and their legacy
+The current reader also supports manifest versions 1 through 8 and their legacy
 `ZORPOW1\0` interleaved banks. Version-1 per-group abandoned-key records are
 converted to the global 32-bit-hash multimap on load. Older readers cannot read
-new version-8 directories. Merged directories currently cannot be appended or
+new version-9 directories. Merged directories currently cannot be appended or
 repacked; rebuilding requires the complete input list.
+
+### Parallel loading of merged subindexes
+
+New bank files concatenate independent Zstd frames of at most 4 MiB decoded
+payload. Concatenating their decoded bytes gives the unchanged bank header and
+matrix. The same compression level is used, and each frame has a Zstd content
+checksum. Single-frame and raw legacy files remain supported.
+
+An optional final Zstd skippable frame (magic `0x184D2A50`) indexes frame ranges.
+Its payload is `ZORFRM1\0`, a little-endian u64 frame count, then four little-endian
+u64 values per frame: compressed offset, compressed length, decoded offset,
+decoded length. These are followed by the 64-bit FNV-1a checksum of the preceding
+payload, `ZORSEEK1`, and the total payload length as a little-endian u64.
+Offsets must cover the data contiguously, decoded coverage must match the bank
+header, and the reader bounds frame and table allocations before decoding.
+
+Streaming readers ignore the skippable table and concatenate the frames normally.
+Parallel readers use disjoint output slices and bound compressed scratch to a
+single frame per active worker. This compression framing does not change matrix
+geometry, fingerprints, document IDs or membership semantics. `repack-subindexes`
+converts existing merged indexes to this framing without reconstructing filters.
