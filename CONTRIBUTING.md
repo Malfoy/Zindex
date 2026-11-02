@@ -14,6 +14,9 @@ cargo test --workspace --locked
 ```
 
 CI runs the release suite with native and portable x86-64 code generation.
+Use the pinned Rust toolchain from `rust-toolchain.toml` when reproducing CI;
+the workflow installs that same compiler. Compiler upgrades should be validated
+on both targets before updating the pin.
 Regression tests should exercise observable behavior, including stored settings
 and loading when they are affected. Performance experiments are separate:
 use the [benchmarking guide](docs/BENCHMARKING.md), record one run per

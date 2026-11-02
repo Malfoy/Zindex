@@ -19,7 +19,10 @@ jobs:
       RUSTFLAGS: -C target-cpu=${{ matrix.cpu }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.0"
+          components: rustfmt
       - name: Format
         run: cargo fmt --all --check
       - name: Test
