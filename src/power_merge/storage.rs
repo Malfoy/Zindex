@@ -3914,7 +3914,7 @@ fn print_aggregate(
 ) {
     let mode = IndexMode::from_u8(manifest.index_mode).expect("validated index mode");
     println!("#query\t{}\tk={}\tindex_mode={}\ttotal_features={}\tstack_probes={}\tbank_probes={}\telapsed_s={:.6}",
-        query.display(), manifest.k, mode.label(), total, probes, bank_probes, seconds);
+        query.display(), if mode == IndexMode::Minimizers { manifest.minimizer_size } else { manifest.k }, mode.label(), total, probes, bank_probes, seconds);
     println!("color\tmatches\tratio\tunique_kmers\tabandoned");
     for (color, &matches) in manifest.colors.iter().zip(scores) {
         let ratio = if total == 0 {
@@ -4032,7 +4032,14 @@ pub fn info_command(directory: &Path) -> Result<()> {
         .into_iter()
         .sum();
     println!("index\t{}\nk\t{}\nhashes\t{}\nseed\t{}\nfingerprint_bits\t{}\nindex_mode\t{}\ntechnical_layout\tmerge-pow2\ncolors\t{}\ngroups\t{}\nbanks\t{}",
-        directory.display(), m.k, m.hashes, m.seed, m.fingerprint_bits, features.mode.label(), m.colors.len(), groups, m.banks.len());
+        directory.display(), if features.mode == IndexMode::Minimizers { features.minimizer_size } else { m.k }, m.hashes, m.seed, m.fingerprint_bits, features.mode.label(), m.colors.len(), groups, m.banks.len());
+    if features.mode == IndexMode::Minimizers {
+        println!(
+            "window\t{}\nwindow_span\t{}",
+            m.k - features.minimizer_size + 1,
+            m.k
+        );
+    }
     println!(
         "size_classes\t{}\nmax_subindex_size\t{}\nlargest_subindex_bytes\t{}\nhash_partitions\t{}",
         m.banks

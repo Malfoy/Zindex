@@ -67,14 +67,14 @@ fn compressed_build_and_query_preserve_memberships() {
                     "--output".into(),
                     index.display().to_string(),
                     "--k".into(),
-                    if mode == "minimizers" { "49" } else { "31" }.into(),
+                    "31".into(),
                     "--index-mode".into(),
                     mode.into(),
                     "--hashes".into(),
                     "8".into(),
                 ];
                 if mode == "minimizers" {
-                    build.extend(["--minimizer-size".into(), "31".into()]);
+                    build.extend(["--window".into(), "19".into()]);
                 }
                 if mode == "findere" {
                     build.extend(["--findere-z".into(), "2".into()]);

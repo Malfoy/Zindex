@@ -31,7 +31,7 @@ fi' EXIT
 for mode in kmers minimizers; do
   args=(--k 31)
   if [[ "$mode" == minimizers ]]; then
-    args=(--k 49 --index-mode minimizers --minimizer-size 31)
+    args=(--k 31 --index-mode minimizers --window 19)
   fi
   "$BIN/zorindex" build --fof "$DATA/samples.fof" --output "$OUT/$mode.zindex" \
     --threads 4 "${args[@]}" > "$OUT/$mode-build.stdout" 2> "$OUT/$mode-build.stderr"

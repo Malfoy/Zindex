@@ -112,17 +112,22 @@ fn persisted_schemes_and_homopolymer_setting_match_build_query_and_plain_append(
                         "--output",
                         &index,
                         "--k",
-                        "31",
+                        if mode == IndexMode::Minimizers {
+                            "21"
+                        } else {
+                            "31"
+                        },
                         "--index-mode",
                         mode.label(),
-                        "--minimizer-size",
-                        "21",
                         "--minimizer-scheme",
                         scheme.label(),
                         "--homopolymer-compression",
                         "--fingerprint-bits",
                         bits,
                     ];
+                    if mode == IndexMode::Minimizers {
+                        args.extend(["--window", "11"]);
+                    }
                     // Plain filters can abandon keys without recovery. Leave room
                     // for this test to assert extraction matching independently.
                     if plain {
@@ -130,6 +135,11 @@ fn persisted_schemes_and_homopolymer_setting_match_build_query_and_plain_append(
                     }
                     ok(&args, "4");
                     let info = ok(&["info", "--index", &index], "1");
+                    if mode == IndexMode::Minimizers {
+                        for field in ["k\t21", "window\t11", "window_span\t31"] {
+                            assert!(info.lines().any(|line| line == field), "{info}");
+                        }
+                    }
                     assert!(info.contains(&format!("minimizer_scheme\t{}", scheme.label())));
                     assert!(info.contains("homopolymer_compression\ttrue"));
                     let config = FeatureConfig::new(mode, 21, 16)
@@ -183,9 +193,9 @@ fn default_is_open_closed_and_legacy_metadata_keeps_simd() {
             "--index-mode",
             "minimizers",
             "--k",
-            "49",
-            "--minimizer-size",
             "31",
+            "--window",
+            "19",
         ],
         "4",
     );
@@ -201,9 +211,9 @@ fn default_is_open_closed_and_legacy_metadata_keeps_simd() {
             "--index-mode",
             "minimizers",
             "--k",
-            "49",
-            "--minimizer-size",
             "31",
+            "--window",
+            "19",
             "--minimizer-scheme",
             "simd",
         ];
@@ -316,7 +326,6 @@ fn anchor_settings_roundtrip_queries_reverse_complements_and_plain_updates() {
                     for choice in 0..3 {
                         for hpc in [false, true] {
                             let k = if mode == IndexMode::Kmers { 9 } else { 31 };
-                            let k_text = k.to_string();
                             let index = f.path(&format!(
                                 "anchors-fp{bits}-{plain}-{mode:?}-{scheme:?}-{choice}-{hpc}"
                             ));
@@ -330,16 +339,17 @@ fn anchor_settings_roundtrip_queries_reverse_complements_and_plain_updates() {
                                 "--output",
                                 &index,
                                 "--k",
-                                &k_text,
+                                "9",
                                 "--index-mode",
                                 mode.label(),
-                                "--minimizer-size",
-                                "9",
                                 "--minimizer-scheme",
                                 scheme.label(),
                                 "--fingerprint-bits",
                                 bits,
                             ];
+                            if mode == IndexMode::Minimizers {
+                                args.extend(["--window", "23"]);
+                            }
                             if masked {
                                 args.extend(["--seed-pattern", pattern]);
                             }
@@ -453,13 +463,13 @@ fn invalid_anchor_arguments_fail_before_construction() {
                 "--index-mode",
                 "minimizers",
                 "--k",
-                "31",
-                "--minimizer-size",
                 "9",
+                "--window",
+                "23",
                 "--seed-pattern",
                 "#_#",
             ],
-            "minimizer size m",
+            "seed length k",
         ),
         (&["--seed-pattern", "#x#"], "only '#' and '_'"),
         (&["--seed-pattern", "___"], "at least one '#'"),
@@ -630,23 +640,22 @@ fn randstrobe_distance_defaults_follow_strobe_length() {
     let fof = f.write("defaults.fof", format!("a\t{reference}\n"));
     for mode in ["kmers", "minimizers"] {
         let index = f.path(mode);
-        ok(
-            &[
-                "build",
-                "--fof",
-                &fof,
-                "--output",
-                &index,
-                "--k",
-                "31",
-                "--index-mode",
-                mode,
-                "--minimizer-size",
-                "9",
-                "--randstrobemers",
-            ],
-            "4",
-        );
+        let mut args = vec![
+            "build",
+            "--fof",
+            &fof,
+            "--output",
+            &index,
+            "--k",
+            if mode == "minimizers" { "9" } else { "31" },
+            "--index-mode",
+            mode,
+            "--randstrobemers",
+        ];
+        if mode == "minimizers" {
+            args.extend(["--window", "23"]);
+        }
+        ok(&args, "4");
         let expected = if mode == "kmers" {
             "strobe_min\t31\nstrobe_max\t93"
         } else {
@@ -736,6 +745,11 @@ fn real_collection_before_after_benchmark() {
     let binaries = [before.as_str(), env!("CARGO_BIN_EXE_zorindex")];
     let indexes = [f.path("before"), f.path("after")];
     for (binary, index) in binaries.into_iter().zip(&indexes) {
+        let help = Command::new(binary)
+            .args(["build", "--help"])
+            .output()
+            .unwrap();
+        let legacy_cli = String::from_utf8_lossy(&help.stdout).contains("--minimizer-size");
         let start = std::time::Instant::now();
         let output = Command::new(binary)
             .args([
@@ -747,9 +761,13 @@ fn real_collection_before_after_benchmark() {
                 "--output",
                 index,
                 "--k",
-                "49",
-                "--minimizer-size",
-                "31",
+                if legacy_cli { "49" } else { "31" },
+                if legacy_cli {
+                    "--minimizer-size"
+                } else {
+                    "--window"
+                },
+                if legacy_cli { "31" } else { "19" },
                 "--index-mode",
                 "minimizers",
                 "--fingerprint-bits",

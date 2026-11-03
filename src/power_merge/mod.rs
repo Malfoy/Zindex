@@ -61,7 +61,7 @@ pub enum QueryMemory {
 #[serde(rename_all = "kebab-case")]
 pub enum MergePlanner {
     /// Full maximum-saving agglomeration (compatibility name: all-pairs).
-    #[value(alias = "full")]
+    #[value(name = "full", alias = "all-pairs")]
     #[serde(alias = "full")]
     AllPairs,
     #[default]
@@ -115,7 +115,7 @@ pub struct MergeArgs {
     /// streaming (default), full/all-pairs, streaming-unpruned, or naive (ordered placement without unions).
     #[arg(long = "merge-planner", value_enum, default_value_t = MergePlanner::Streaming)]
     pub planner: MergePlanner,
-    /// Physical group order within each bank; does not change planning or query output order.
+    /// Physical group order within each bank. Does not change planning or query output order.
     #[arg(long = "merge-column-order", value_enum, default_value_t = ColumnOrder::Compression)]
     pub column_order: ColumnOrder,
     /// Number of SimdSketch buckets (8-bit comparison fingerprints + 32-bit union minima).
@@ -132,11 +132,11 @@ pub struct MergeArgs {
     /// the exact union past the planned power of two at build time (which doubles the group's slots).
     #[arg(long = "merge-plan-margin", default_value_t = 0.03)]
     pub plan_margin: f64,
-    /// Minimum original documents per subindex; promote smaller filters, never fold.
+    /// Minimum original documents per subindex. Promote smaller filters, never fold.
     /// Collections smaller than this use one subindex. Set 1 for the legacy layout.
     #[arg(long, default_value_t = 128)]
     pub min_subindex_documents: usize,
-    /// Maximum size-class count before hash partitioning; promote smaller filters. Omit for unlimited.
+    /// Maximum size-class count before hash partitioning. Promote smaller filters. Omit for unlimited.
     #[arg(long)]
     pub max_subindexes: Option<usize>,
     /// Maximum uncompressed merged-subindex payload. Hash-partition larger size classes.
@@ -165,14 +165,14 @@ pub struct MergeArgs {
 
     /// Estimated concurrent build-workspace budget in GiB. Default: 80% of
     /// available RAM (including visible cgroup limits). Oversized jobs run alone.
-    /// This is admission control, not an RSS cap; retained filters/recovery and
+    /// This is admission control, not an RSS cap. Retained filters/recovery and
     /// a single oversized genome still need enough memory. Feature sorting stays in RAM.
     #[arg(long)]
     pub build_memory_gib: Option<f64>,
 
     /// Total process resident-memory ceiling in decimal GB (500 = 500000000000
     /// bytes). Fixed admission budget, without automatic available-RAM discount.
-    /// Measured RSS is checked every 20 ms; this is not a virtual-address limit.
+    /// Measured RSS is checked every 20 ms. This is not a virtual-address limit.
     #[arg(long, conflicts_with_all = ["build_memory_gib", "plain"])]
     pub max_ram_gb: Option<f64>,
 

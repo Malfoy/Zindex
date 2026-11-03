@@ -192,7 +192,7 @@ impl FeatureConfig {
                 "seed pattern width {} must match {} ({})",
                 pattern.width(),
                 if self.mode == IndexMode::Minimizers {
-                    "minimizer size m"
+                    "seed length k"
                 } else {
                     "k"
                 },

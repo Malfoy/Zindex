@@ -16,7 +16,7 @@ Report each query separately:
 
 Index minimizers instead:
   ./target/release/zorindex build --fof tests/data/bacteria/samples.fof \
-    --output bacteria.min.zindex --k 49 --index-mode minimizers --minimizer-size 31
+    --output bacteria.min.zindex --k 31 --index-mode minimizers --window 19
 
 Use your own FASTA/FASTQ paths in place of the bundled samples.fof.
 Query settings are automatically read from the index.

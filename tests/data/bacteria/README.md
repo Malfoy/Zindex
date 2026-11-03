@@ -23,7 +23,7 @@ From the repository root:
 
 ```bash
 ./target/release/zorindex build --fof tests/data/bacteria/samples.fof \
-  --output bacteria.min.zindex --k 49 --index-mode minimizers --minimizer-size 31
+  --output bacteria.min.zindex --k 31 --index-mode minimizers --window 19
 ./target/release/zorindex query --index bacteria.min.zindex \
   --query tests/data/bacteria/queries.fa --records --min-ratio 0.8 > matches.tsv
 python3 utils/scripts/prepare_bacteria_example.py --check-results matches.tsv \
@@ -32,7 +32,7 @@ python3 utils/scripts/prepare_bacteria_example.py --check-results matches.tsv \
 
 `queries.fa` contains a 1-kb fragment from each genome, its reverse complement,
 and a random negative control. `source-truth.tsv` records each positive's
-source dataset, contig, offset and strand. Related assemblies can also match;
+source dataset, contig, offset and strand. Related assemblies can also match.
 the checker verifies that every positive matches its source.
 
 The optional checker runs both index modes in a new temporary directory:

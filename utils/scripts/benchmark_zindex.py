@@ -103,13 +103,13 @@ def main():
     parser.add_argument("--output", type=Path, required=True, help="New result directory; never reused")
     parser.add_argument("--binary", type=Path, default=Path("target/release/zorindex"))
     parser.add_argument("--threads", type=int, required=True)
-    parser.add_argument("--k", type=int, default=49)
-    parser.add_argument("--minimizer-size", type=int, default=31)
+    parser.add_argument("--k", type=int, default=31, help="Seed length in bases")
+    parser.add_argument("--window", type=int, default=19, help="Consecutive k-mers per minimizer window")
     parser.add_argument("--minimizer-scheme", choices=["open-closed-mod", "simd"], default="open-closed-mod")
     parser.add_argument("--index-mode", choices=["kmers", "minimizers", "modimizers", "findere"], default="minimizers")
     parser.add_argument("--hashes", type=int, default=4)
     parser.add_argument("--fingerprint-bits", type=int, choices=[1, 2, 4, 8, 16], default=8)
-    parser.add_argument("--merge-planner", choices=["streaming", "all-pairs", "streaming-unpruned", "naive"], default="streaming")
+    parser.add_argument("--merge-planner", choices=["streaming", "full", "all-pairs", "streaming-unpruned", "naive"], default="streaming")
     parser.add_argument("--query-memory", choices=["subindex", "all"], default="subindex")
     parser.add_argument("--max-subindex-size", default="8GiB")
     parser.add_argument("--max-subindexes", type=int)
@@ -160,7 +160,7 @@ def main():
         save(root / "results.json", result)
         build = [str(frozen), "build", "--fof", str(fof), "--output", str(root / "index"),
                  "--threads", str(args.threads), "--k", str(args.k), "--index-mode", args.index_mode,
-                 "--minimizer-size", str(args.minimizer_size), "--minimizer-scheme", args.minimizer_scheme,
+                 "--minimizer-scheme", args.minimizer_scheme,
                  "--hashes", str(args.hashes), "--fingerprint-bits", str(args.fingerprint_bits),
                  "--merge-planner", args.merge_planner, "--merge-column-order", "compression",
                  "--merge-sketch-size", "128", "--merge-max-colors", "48", "--seed", "69",
@@ -168,6 +168,8 @@ def main():
                  "--cycle-break", "no-heuristic", "--tie-scan", "1", "--segment-length", "64",
                  "--min-subindex-documents", str(args.min_subindex_documents),
                  "--max-subindex-size", args.max_subindex_size, "--skip-oversized-documents=false"]
+        if args.index_mode == "minimizers":
+            build += ["--window", str(args.window)]
         if args.max_subindexes is not None:
             build += ["--max-subindexes", str(args.max_subindexes)]
         result["stages"]["build"] = measured(root, "build", build)
