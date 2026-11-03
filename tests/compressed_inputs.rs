@@ -38,10 +38,7 @@ fn compressed_build_and_query_preserve_memberships() {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    for binary in [
-        env!("CARGO_BIN_EXE_bloomindex"),
-        env!("CARGO_BIN_EXE_zorindex"),
-    ] {
+    for binary in [env!("CARGO_BIN_EXE_zorindex")] {
         for mode in ["kmers", "minimizers", "findere"] {
             let mut expected = None;
             for (suffix, format) in [
@@ -82,11 +79,7 @@ fn compressed_build_and_query_preserve_memberships() {
                 if mode == "findere" {
                     build.extend(["--findere-z".into(), "2".into()]);
                 }
-                if binary.ends_with("zorindex") {
-                    build.extend(["--fingerprint-bits".into(), "8".into()]);
-                } else {
-                    build.extend(["--false-positive-rate".into(), "0.00390625".into()]);
-                }
+                build.extend(["--fingerprint-bits".into(), "8".into()]);
                 run(binary, build);
                 let query = vec![
                     "query".into(),

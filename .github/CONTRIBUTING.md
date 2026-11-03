@@ -23,7 +23,7 @@ use the [benchmarking guide](../docs/BENCHMARKING.md), record one run per
 configuration/workload, and preserve raw output rather than overwriting it.
 
 Keep generated indexes, genomes and private experiment directories out of Git.
-The tiny example FASTAs are intentional exceptions to the data ignore rules.
+The bundled bacterial example is an intentional exception to the data ignore rules.
 Do not change historical benchmark numbers when updating an implementation.
 
 Vendored code changes must retain upstream licenses and update the corresponding

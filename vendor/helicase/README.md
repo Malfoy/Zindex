@@ -258,7 +258,7 @@ See the [migration guide](MIGRATION.md) for details.
 
 ## Benchmarks
 
-A benchmark suite comparing Helicase against [needletail](https://github.com/onecodex/needletail) and [paraseq](https://github.com/noamteyssier/paraseq) is included.
+A benchmark suite comparing Helicase against [needletail](https://crates.io/crates/needletail) and [paraseq](https://github.com/noamteyssier/paraseq) is included.
 
 Run without arguments to execute benchmarks on built-in synthetic datasets:
 ```sh

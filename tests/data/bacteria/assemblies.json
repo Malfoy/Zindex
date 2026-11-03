@@ -1,20 +1,62 @@
 [
   {
-    "accession": "GCF_000005845.2",
-    "organism": "Escherichia coli str. K-12 substr. MG1655",
-    "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/005/845/GCF_000005845.2_ASM584v2/GCF_000005845.2_ASM584v2_genomic.fna.gz",
-    "ncbi_md5": "c13d459b5caa702ff7e1f26fe44b8ad7"
+    "accession": "GCF_000006885.1",
+    "organism": "Streptococcus pneumoniae TIGR4 (firmicutes)",
+    "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/006/885/GCF_000006885.1_ASM688v1/GCF_000006885.1_ASM688v1_genomic.fna.gz",
+    "ncbi_md5": "0c8e580789626aeb2e0d62d1bb6ddf28"
   },
   {
-    "accession": "GCF_000008865.2",
-    "organism": "Escherichia coli O157:H7 str. Sakai",
-    "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/008/865/GCF_000008865.2_ASM886v2/GCF_000008865.2_ASM886v2_genomic.fna.gz",
-    "ncbi_md5": "e7bf4b6a0fa4cbd17a2cac69125311e0"
+    "accession": "GCF_000008805.1",
+    "organism": "Neisseria meningitidis MC58 (b-proteobacteria)",
+    "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/008/805/GCF_000008805.1_ASM880v1/GCF_000008805.1_ASM880v1_genomic.fna.gz",
+    "ncbi_md5": "287e55cbffed6f2874c691ad6717019a"
+  },
+  {
+    "accession": "GCF_000007525.1",
+    "organism": "Bifidobacterium longum NCC2705 (high G+C Gram-positive bacteria)",
+    "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/007/525/GCF_000007525.1_ASM752v1/GCF_000007525.1_ASM752v1_genomic.fna.gz",
+    "ncbi_md5": "5d8b17f2f49cec1ed86473425758f92a"
+  },
+  {
+    "accession": "GCF_000007265.1",
+    "organism": "Streptococcus agalactiae 2603V/R (firmicutes)",
+    "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/007/265/GCF_000007265.1_ASM726v1/GCF_000007265.1_ASM726v1_genomic.fna.gz",
+    "ncbi_md5": "5d3dd7ab74315015e6cff580e2808530"
+  },
+  {
+    "accession": "GCF_000009105.1",
+    "organism": "Neisseria meningitidis Z2491 (b-proteobacteria)",
+    "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/009/105/GCF_000009105.1_ASM910v1/GCF_000009105.1_ASM910v1_genomic.fna.gz",
+    "ncbi_md5": "071f892fd823a21515ed16cbfe05040d"
+  },
+  {
+    "accession": "GCF_000006765.1",
+    "organism": "Pseudomonas aeruginosa PAO1 (g-proteobacteria)",
+    "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/006/765/GCF_000006765.1_ASM676v1/GCF_000006765.1_ASM676v1_genomic.fna.gz",
+    "ncbi_md5": "c859ec5a25506367506bce972788aca8"
+  },
+  {
+    "accession": "GCF_000007745.1",
+    "organism": "[Mannheimia] succiniciproducens MBEL55E (g-proteobacteria)",
+    "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/007/745/GCF_000007745.1_ASM774v1/GCF_000007745.1_ASM774v1_genomic.fna.gz",
+    "ncbi_md5": "66f8608c681476658314e8cb3580aef5"
   },
   {
     "accession": "GCF_000009045.1",
-    "organism": "Bacillus subtilis subsp. subtilis str. 168",
+    "organism": "Bacillus subtilis subsp. subtilis str. 168 (firmicutes)",
     "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/009/045/GCF_000009045.1_ASM904v1/GCF_000009045.1_ASM904v1_genomic.fna.gz",
     "ncbi_md5": "87378255941a61ec4b4384af8ba28ff5"
+  },
+  {
+    "accession": "GCF_000009405.1",
+    "organism": "Staphylococcus carnosus subsp. carnosus TM300 (firmicutes)",
+    "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/009/405/GCF_000009405.1_ASM940v1/GCF_000009405.1_ASM940v1_genomic.fna.gz",
+    "ncbi_md5": "4a94701f348708f0e9281775a9c8883b"
+  },
+  {
+    "accession": "GCF_000007705.1",
+    "organism": "Chromobacterium violaceum ATCC 12472 (b-proteobacteria)",
+    "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/007/705/GCF_000007705.1_ASM770v1/GCF_000007705.1_ASM770v1_genomic.fna.gz",
+    "ncbi_md5": "b0c44fb9864912428812bb2989fe8b46"
   }
 ]

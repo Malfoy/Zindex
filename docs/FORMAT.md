@@ -1,7 +1,6 @@
 # Index Format Notes
 
-This document summarizes the binary formats used by the two command-line
-indexes. The exact reader and writer implementations are the source of truth.
+This document describes Zindex's single-file and merged-directory formats. The exact reader and writer implementations are the source of truth.
 
 Both formats are written as zstd streams by default. The magic bytes described
 below are the first bytes of the decompressed payload. Readers detect zstd frame
@@ -89,45 +88,6 @@ The experimental stored stack-codec byte maps to:
 
 Legacy codecs remain readable for old local indexes but are hidden from the
 CLI when they are not useful for current experiments.
-
-## Bindex (`.blmidx`)
-
-Magic:
-
-```text
-BLMIDX1\0
-```
-
-Current format version: `2` (version 1 remains readable).
-
-Header fields:
-
-- version
-- `k`
-- Bloom hash count
-- seed
-- feature mode
-- minimizer size
-- modimizer sampling
-- target false-positive rate
-- common bit count
-- color metadata
-- technical layout and technical-bin metadata (version 2)
-- bitstack words
-
-Bindex stores `bit_count * color_words` little-endian `u64` words, where:
-
-```text
-color_words = ceil(technical_bin_count / 64)
-```
-
-For each Bloom bit position, all colors are packed into consecutive `u64`
-words. Querying ANDs the packed words from all Bloom positions and increments
-scores for the remaining set bits.
-
-The default flat layout has one technical bin per output color. The optional
-split-large layout maps several technical bins to one output color; queries
-count each color at most once per feature.
 
 ## Zindex power-of-two merged directory
 

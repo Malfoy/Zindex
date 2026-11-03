@@ -8,3 +8,4 @@ Local API exposure only: `src/lib.rs` makes the existing `lexer` module public;
 `Lexer::next_block` is public and a `current_block()` accessor exposes block bytes.
 This lets minimizer-fasta consume the upstream SIMD classifier with bounded
 streaming memory. No upstream parser, compression, or SIMD algorithm is changed.
+The README links to the needletail package page.

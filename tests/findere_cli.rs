@@ -32,11 +32,8 @@ impl Drop for Fixture {
     }
 }
 
-fn binaries() -> [&'static str; 2] {
-    [
-        env!("CARGO_BIN_EXE_bloomindex"),
-        env!("CARGO_BIN_EXE_zorindex"),
-    ]
+fn binaries() -> [&'static str; 1] {
+    [env!("CARGO_BIN_EXE_zorindex")]
 }
 fn call(bin: &str, args: &[&str]) -> Output {
     Command::new(bin)
@@ -54,9 +51,6 @@ fn ok(bin: &str, args: &[&str]) -> String {
     );
     String::from_utf8(output.stdout).unwrap()
 }
-fn is_zor(bin: &str) -> bool {
-    Path::new(bin).file_name().unwrap() == "zorindex"
-}
 fn build(bin: &str, fof: &str, output: &str, k: &str, z: Option<&str>, extra: &[&str]) {
     let mut args = vec![
         "build",
@@ -72,11 +66,7 @@ fn build(bin: &str, fof: &str, output: &str, k: &str, z: Option<&str>, extra: &[
     if let Some(z) = z {
         args.extend(["--findere-z", z]);
     }
-    if is_zor(bin) {
-        args.extend(["--plain", "--slot-scale", "8", "--fingerprint-bits", "16"]);
-    } else {
-        args.extend(["--bit-count", "65536"]);
-    }
+    args.extend(["--plain", "--slot-scale", "8", "--fingerprint-bits", "16"]);
     args.extend(extra);
     ok(bin, &args);
 }
@@ -170,16 +160,12 @@ fn append_repack_union_and_compressed_fastq_keep_findere_semantics() {
     for bin in binaries() {
         let index = f.path("initial.idx");
         let appended = f.path("appended.idx");
-        let extra = if is_zor(bin) {
-            vec!["--union-graph", "--stack-compression", "lz4"]
-        } else {
-            vec![]
-        };
+        let extra = vec!["--union-graph", "--stack-compression", "lz4"];
         build(bin, &fof, &index, "31", Some("7"), &extra);
         let qa = f.write("qa.fa", format!(">a\n{a}\n"));
         let output = ok(bin, &["query", "--index", &index, "--query", &qa]);
         assert_eq!(matches(&output, "a"), (a.len() - 31 + 1) as u64);
-        if is_zor(bin) {
+        {
             let ignored = ok(
                 bin,
                 &["query", "--index", &index, "--query", &qa, "--ignore-union"],
@@ -196,7 +182,7 @@ fn append_repack_union_and_compressed_fastq_keep_findere_semantics() {
         assert!(info.contains("findere_z\t7\n"));
         let output = ok(bin, &["query", "--index", &appended, "--query", &query]);
         assert_eq!(matches(&output, "b"), (b.len() - 31 + 1) as u64);
-        if is_zor(bin) {
+        {
             let repacked = f.path("repacked.idx");
             ok(
                 bin,
@@ -333,11 +319,7 @@ fn query_results_and_probe_counts_match_across_thread_counts() {
     for bin in binaries() {
         for z in ["0", "3", "10"] {
             let index = f.path("test.idx");
-            let extra = if is_zor(bin) {
-                vec!["--union-graph", "--stack-compression", "lz4"]
-            } else {
-                vec![]
-            };
+            let extra = vec!["--union-graph", "--stack-compression", "lz4"];
             build(bin, &fof, &index, "31", Some(z), &extra);
             for query in [&plain, &compressed] {
                 let mut expected = None;
