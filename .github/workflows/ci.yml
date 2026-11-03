@@ -33,11 +33,11 @@ jobs:
         run: cargo build --workspace --release --locked --bins
       - name: Checked demonstration
         run: bash utils/scripts/demo.sh "$RUNNER_TEMP/zindex-demo-${{ matrix.cpu }}"
-      - name: Check benchmark recorder on tiny inputs
+      - name: Check benchmark recorder
         run: >-
           python3 utils/scripts/benchmark_zindex.py
-          --fof tests/data/tiny/samples.fof
-          --positive tests/data/tiny/a-only.fa --negative tests/data/tiny/negative.fa
+          --fof tests/data/bacteria/samples.fof
+          --positive tests/data/bacteria/positive.fa --negative tests/data/bacteria/negative.fa
           --threads 2 --hash-inputs --hash-index
           --output "$RUNNER_TEMP/zindex-recorder-${{ matrix.cpu }}"
       - name: Preserve failed example logs

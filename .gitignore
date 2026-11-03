@@ -42,5 +42,6 @@ __pycache__/
 *.py[cod]
 
 # Small, versioned demonstration inputs are intentional source fixtures.
-!/tests/data/tiny/*.fa
-!/tests/data/tiny/*.tsv
+!/tests/data/bacteria/*.fa
+!/tests/data/bacteria/*.tsv
+!/tests/data/bacteria/genomes/*.fna.gz

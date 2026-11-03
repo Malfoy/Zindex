@@ -1,0 +1,134 @@
+{
+  "status": "complete",
+  "retrieved_utc": "2026-11-02T20:38:50.999577+00:00",
+  "assemblies": [
+    {
+      "accession": "GCF_000006885.1",
+      "organism": "Streptococcus pneumoniae TIGR4 (firmicutes)",
+      "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/006/885/GCF_000006885.1_ASM688v1/GCF_000006885.1_ASM688v1_genomic.fna.gz",
+      "ncbi_md5": "0c8e580789626aeb2e0d62d1bb6ddf28",
+      "document_id": 0,
+      "path": "tests/data/bacteria/genomes/GCF_000006885.1.fna.gz",
+      "sha256": "ba7ba0aa1ebe0752b83cf8d806ec497138dd2fc8020e2e0130dc4efea6e307d7",
+      "compressed_bytes": 635909,
+      "bases": 2160842,
+      "contigs": 1
+    },
+    {
+      "accession": "GCF_000008805.1",
+      "organism": "Neisseria meningitidis MC58 (b-proteobacteria)",
+      "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/008/805/GCF_000008805.1_ASM880v1/GCF_000008805.1_ASM880v1_genomic.fna.gz",
+      "ncbi_md5": "287e55cbffed6f2874c691ad6717019a",
+      "document_id": 1,
+      "path": "tests/data/bacteria/genomes/GCF_000008805.1.fna.gz",
+      "sha256": "5e5a6ff7a4a84df95a3040a1865652f7eb47b02b8dfc7d9f55b76200d168b557",
+      "compressed_bytes": 648695,
+      "bases": 2272360,
+      "contigs": 1
+    },
+    {
+      "accession": "GCF_000007525.1",
+      "organism": "Bifidobacterium longum NCC2705 (high G+C Gram-positive bacteria)",
+      "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/007/525/GCF_000007525.1_ASM752v1/GCF_000007525.1_ASM752v1_genomic.fna.gz",
+      "ncbi_md5": "5d8b17f2f49cec1ed86473425758f92a",
+      "document_id": 2,
+      "path": "tests/data/bacteria/genomes/GCF_000007525.1.fna.gz",
+      "sha256": "39147e760ad99b7320040df901569aa08e5b57867c6a2668bef76602b97d8102",
+      "compressed_bytes": 665420,
+      "bases": 2260266,
+      "contigs": 2
+    },
+    {
+      "accession": "GCF_000007265.1",
+      "organism": "Streptococcus agalactiae 2603V/R (firmicutes)",
+      "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/007/265/GCF_000007265.1_ASM726v1/GCF_000007265.1_ASM726v1_genomic.fna.gz",
+      "ncbi_md5": "5d3dd7ab74315015e6cff580e2808530",
+      "document_id": 3,
+      "path": "tests/data/bacteria/genomes/GCF_000007265.1.fna.gz",
+      "sha256": "aa8b331405e7572708819a9bc2a8439b57628c0a7466400e16ec0e0bda3c94ec",
+      "compressed_bytes": 634530,
+      "bases": 2160267,
+      "contigs": 1
+    },
+    {
+      "accession": "GCF_000009105.1",
+      "organism": "Neisseria meningitidis Z2491 (b-proteobacteria)",
+      "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/009/105/GCF_000009105.1_ASM910v1/GCF_000009105.1_ASM910v1_genomic.fna.gz",
+      "ncbi_md5": "071f892fd823a21515ed16cbfe05040d",
+      "document_id": 4,
+      "path": "tests/data/bacteria/genomes/GCF_000009105.1.fna.gz",
+      "sha256": "7c36f924111f1122d592815fb271fa3e159623bdc0caaa92c4eeed09520b830e",
+      "compressed_bytes": 629571,
+      "bases": 2184406,
+      "contigs": 1
+    },
+    {
+      "accession": "GCF_000006765.1",
+      "organism": "Pseudomonas aeruginosa PAO1 (g-proteobacteria)",
+      "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/006/765/GCF_000006765.1_ASM676v1/GCF_000006765.1_ASM676v1_genomic.fna.gz",
+      "ncbi_md5": "c859ec5a25506367506bce972788aca8",
+      "document_id": 5,
+      "path": "tests/data/bacteria/genomes/GCF_000006765.1.fna.gz",
+      "sha256": "9433cb94b3f21fa40e94d0d9454996fcca39da1d49074b9b22b6a459e63ca510",
+      "compressed_bytes": 1787220,
+      "bases": 6264404,
+      "contigs": 1
+    },
+    {
+      "accession": "GCF_000007745.1",
+      "organism": "[Mannheimia] succiniciproducens MBEL55E (g-proteobacteria)",
+      "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/007/745/GCF_000007745.1_ASM774v1/GCF_000007745.1_ASM774v1_genomic.fna.gz",
+      "ncbi_md5": "66f8608c681476658314e8cb3580aef5",
+      "document_id": 6,
+      "path": "tests/data/bacteria/genomes/GCF_000007745.1.fna.gz",
+      "sha256": "e334d2bb660b4e0a0a8e15d79433ace914dc7703e729188008cb8c9cc7d803aa",
+      "compressed_bytes": 681924,
+      "bases": 2314078,
+      "contigs": 1
+    },
+    {
+      "accession": "GCF_000009045.1",
+      "organism": "Bacillus subtilis subsp. subtilis str. 168 (firmicutes)",
+      "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/009/045/GCF_000009045.1_ASM904v1/GCF_000009045.1_ASM904v1_genomic.fna.gz",
+      "ncbi_md5": "87378255941a61ec4b4384af8ba28ff5",
+      "document_id": 7,
+      "path": "tests/data/bacteria/genomes/GCF_000009045.1.fna.gz",
+      "sha256": "1a9e4f66533db783e9ecb6727355993a16a00ef36fa512dcac2de39eff1ae8c5",
+      "compressed_bytes": 1248396,
+      "bases": 4215606,
+      "contigs": 1
+    },
+    {
+      "accession": "GCF_000009405.1",
+      "organism": "Staphylococcus carnosus subsp. carnosus TM300 (firmicutes)",
+      "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/009/405/GCF_000009405.1_ASM940v1/GCF_000009405.1_ASM940v1_genomic.fna.gz",
+      "ncbi_md5": "4a94701f348708f0e9281775a9c8883b",
+      "document_id": 8,
+      "path": "tests/data/bacteria/genomes/GCF_000009405.1.fna.gz",
+      "sha256": "a38adebf07b62728ad52680419b02841f9d57d38c1289de0edf6f2060dfd9586",
+      "compressed_bytes": 752126,
+      "bases": 2566424,
+      "contigs": 1
+    },
+    {
+      "accession": "GCF_000007705.1",
+      "organism": "Chromobacterium violaceum ATCC 12472 (b-proteobacteria)",
+      "url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/007/705/GCF_000007705.1_ASM770v1/GCF_000007705.1_ASM770v1_genomic.fna.gz",
+      "ncbi_md5": "b0c44fb9864912428812bb2989fe8b46",
+      "document_id": 9,
+      "path": "tests/data/bacteria/genomes/GCF_000007705.1.fna.gz",
+      "sha256": "a6b98e8233ea0d82e38925f2d72273cf973ec19ea874594509fa588712d88d7c",
+      "compressed_bytes": 1359279,
+      "bases": 4751080,
+      "contigs": 1
+    }
+  ],
+  "query_length": 1000,
+  "negative_lcg_seed": 20261102,
+  "queries_sha256": "d9395bfb8b01a515b0c818de94cf95a5d177019abaf69ac622cfa1193000c5f6",
+  "selection": {
+    "pool": "docs/benchmarks/accessions_128_bacterial.txt",
+    "seed": 20261102,
+    "count": 10
+  }
+}

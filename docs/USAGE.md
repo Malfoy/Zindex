@@ -1,944 +1,191 @@
-# Detailed usage and implementation notes
+# Usage
 
-Start with the [getting-started guide](../README.md) and
-`bash utils/scripts/demo.sh` for a runnable example. All commands below run from the
-repository root after building. This guide also describes the legacy comparison
-layouts and advanced implementation choices.
+Run commands from the repository root after `cargo build --release --locked`.
+The bundled [bacterial example](../tests/data/bacteria/README.md) supplies the
+input files used below.
 
-ZORINDEX contains two Rust command-line indexes for approximate colored
-k-mer queries over many FASTA/FASTQ datasets:
+## Build an index
 
-- `zorindex`: Zindex, merged colored power-of-two ZOR banks by default;
-  `--plain` selects the legacy interleaved per-color stack.
-- `bloomindex`: Bindex, a matching interleaved stack of per-color Bloom filters.
+### 1. Index all k-mers
 
-Both binaries use the same input format, DNA feature extraction code, canonical
-2-bit encoding, parallel parsing, and query reporting. This makes Bindex a
-direct comparison target for Zindex when evaluating size, build time, and query
-throughput.
+```bash
+./target/release/zorindex build --fof tests/data/bacteria/samples.fof \
+  --output bacteria.zindex --k 31
+```
 
-The source tree is organized as:
+Each FOF line is an input FASTA/FASTQ path, optionally preceded by a dataset
+name and a tab. Relative paths use the working directory. The output must be
+a new directory.
+
+### 2. Index minimizers
+
+```bash
+./target/release/zorindex build --fof tests/data/bacteria/samples.fof \
+  --output bacteria.min.zindex --k 49 --index-mode minimizers --minimizer-size 31
+```
+
+Here `k=49` is the selection-window span and `m=31` is the seed length.
+Open-closed mod minimizers are the default selector. To choose the alternative
+SIMD hash-minimizer selector, add `--minimizer-scheme simd`.
+
+### 3. Use spaced seeds
+
+```bash
+./target/release/zorindex build --fof tests/data/bacteria/samples.fof \
+  --output bacteria.spaced.zindex --k 21 --seed-pattern '#_#_#_#_#_#_#_#_#_#_#'
+```
+
+The pattern must be symmetric and match `k`, or `m` in minimizer mode.
+A `#` retains a base and `_` skips one. In minimizer mode, select ordinary
+minimizers first, then apply the pattern.
+
+### 4. Use randstrobemers
+
+```bash
+./target/release/zorindex build --fof tests/data/bacteria/samples.fof \
+  --output bacteria.strobe.zindex --k 21 --randstrobemers \
+  --strobe-min 25 --strobe-max 100
+```
+
+Two strobes are linked. `k` is the length of each strobe; the distances are
+between their starts. In minimizer mode, `m` specifies each strobe's length and
+already-selected minimizers are linked. Queries score both orientations and
+take the larger count per dataset and record.
+
+### 5. Sample seeds by hash
+
+```bash
+./target/release/zorindex build --fof tests/data/bacteria/samples.fof \
+  --output bacteria.sampled.zindex --k 31 --index-mode modimizers \
+  --modimizer-sampling 16
+```
+
+This retains roughly one in 16 canonical k-mers, without a minimizer window.
+
+### 6. Compress homopolymers
+
+Add `--homopolymer-compression` to collapse repeated bases before extracting
+seeds. The same setting is applied automatically to queries. Lengths and strobe
+distances then refer to the compressed sequence.
+
+### 7. Use findere
+
+```bash
+./target/release/zorindex build --fof tests/data/bacteria/samples.fof \
+  --output bacteria.findere.zindex --k 31 --index-mode findere
+```
+
+Findere indexes `(k-z)`-mers and requires `z+1` consecutive matches in the
+same dataset to report a k-mer match. `z` defaults to 10; change it with
+`--findere-z`. It is separate from sampling, spaced seeds and randstrobemers.
+
+Dense k-mers and modimizers require lengths up to 31. Minimizer windows can be
+odd lengths up to 255, with `m <= 31`. Findere requires
+`0 <= z < k <= 255` and `1 <= k-z <= 31`.
+
+## Query an index
+
+### 1. Query one sequence
+
+```bash
+./target/release/zorindex query --index bacteria.zindex \
+  --query tests/data/bacteria/query.fa
+```
+
+This reports aggregate counts over the query file:
 
 ```text
-src/lib.rs              shared DNA parsing, feature extraction, hashing, FOF parsing
-src/bin/zorindex.rs     Zindex CLI and pure ZOR stack implementation
-src/bin/bloomindex.rs   Bindex CLI and interleaved Bloom stack implementation
-src/power_merge/        Zindex merge planning, colored power-of-two banks and lookup
-utils/minimizer-fasta/  standalone parallel SIMD/OCM minimizer FASTA generator
-utils/ocm-minimizers/   shared dependency-free optimized OCM iterator
+color    matches    ratio    unique_kmers    abandoned
 ```
 
-## Requirements
+`color` is the dataset name. `matches` counts query seed occurrences and
+`ratio` is the matched fraction. `unique_kmers` is the historical column name
+for the number of distinct indexed seeds in that dataset. `abandoned` reports
+constraints abandoned during construction; their keys are recovered by default.
 
-- Rust through rustup, which selects the pinned Rust 1.97.0 toolchain (language minimum 1.89)
-- Enough RAM to hold the parsed feature sets during construction
-
-## Build
+### 2. Filter the results
 
 ```bash
-cargo build --release --locked
+./target/release/zorindex query --index bacteria.zindex \
+  --query tests/data/bacteria/query.fa --min-ratio 0.8
 ```
 
-The release binaries are:
+Only datasets reaching the specified matched fraction are printed.
+
+### 3. Query several records separately
+
+```bash
+./target/release/zorindex query --index bacteria.zindex \
+  --query tests/data/bacteria/queries.fa --records --min-ratio 0.8
+```
 
 ```text
-target/release/zorindex
-target/release/bloomindex
-target/release/minimizer-fasta
+query_id    valid_kmers    hits
+read_1      100            0:100,2:93
 ```
 
-Both tools default to all available hardware threads. Override this with
-`--threads`.
+Here 100 query seeds were extracted; datasets 0 and 2 matched 100 and 93.
+IDs index the manifest's `colors` array. `valid_kmers` counts selected seeds,
+including in minimizer mode. It does not count all k-mer windows or covered
+bases. Findere aggregate counts instead refer to reconstructed k-mer windows.
 
-For copy-paste collaborator commands, see
-[collaborator commands](COLLABORATOR.txt). Build on the machine where you
-will run the binaries: `.cargo/config.toml` enables `target-cpu=native`.
+Per-record reporting accepts FASTA and is unavailable for findere. Without
+`--records`, queries aggregate over the complete FASTA/FASTQ file.
+Extraction settings, seed patterns and homopolymer compression are read from
+the index. Approximate membership can produce matches for absent seeds.
 
-## Standalone minimizer FASTA utility
+### 4. Choose memory use and parallelism
 
-`minimizer-fasta` generates one canonical FASTA record per selected minimizer
-position. It is an independent workspace package, with no dependency on the
-index implementation. It preserves the canonical SimdMinimizers selection used
-by the original benchmark generator (default seed length31, window19 positions,
-49-base span); it does not silently substitute open-closed-mod selection.
+Queries load one subindex at a time. Query parsing and seed extraction happen
+once, and the abandoned-key file is scanned once; results remain in RAM.
+Use `--query-memory all` to load all subindexes together.
+
+Both construction and queries use the available CPU threads. Supply
+`--threads N` to choose a limit.
+
+## Inspect and tune the index
 
 ```bash
-cargo build --release -p minimizer-fasta
-./target/release/minimizer-fasta genome.fna.gz minimizers.fa.gz
-./target/release/minimizer-fasta --fof samples.fof --output-dir minimizers --gzip
+./target/release/zorindex info --index bacteria.zindex
 ```
 
-Selection and gzip compression run in parallel, including chunks of a single
-long chromosome. Input/output order is deterministic; memory is bounded by the
-in-flight chunks rather than chromosome length. The default uses all available
-CPUs and gzip level1. See [the utility documentation](../utils/minimizer-fasta/README.md)
-for parameters, compression details and the generated collection FOF.
+The default layout uses streaming planning and compression-aware column order.
+Only estimated space-saving merges are accepted, accounting for colored cells
+and power-of-two slot rounding. Merges are decided before constructing filters
+and are not reverted afterward.
 
-## Input Format
+| Option | Purpose |
+|---|---|
+| `--fingerprint-bits 1,2,4,8,16` | Select fingerprint width; default 8 |
+| `--hashes N` | Hash locations per filter; default 4 |
+| `--merge-planner all-pairs` | Full pairwise planner instead of streaming |
+| `--merge-planner naive` | Ordered placement without dataset unions |
+| `--merge-sketch-size N` | Sketch buckets; default 128 |
+| `--max-subindexes N` | Cap size classes before physical hash partitioning |
+| `--min-subindex-documents N` | Promote undersized classes; default 128 |
+| `--max-subindex-size 8GiB` | Maximum uncompressed filter payload per subindex |
+| `--low-disk` | Keep completed construction data in RAM instead of staging it |
 
-Both binaries take a file-of-files through `--fof`. Empty lines and lines
-starting with `#` are ignored.
+The slot scale defaults to 1.0; the separate planning margin defaults to 0.03.
+Sketch comparisons use 8-bit fingerprints, retaining full minima for merging.
+Fixed 64-cell segments, no-heuristic cycle breaking and tie-scan 1 are defaults.
 
-Single-column form:
+The subindex cap bounds filter payload, not total process RAM. Query seeds,
+results, metadata and workers also use memory. Oversized documents can be
+skipped by construction's memory guard; inspect the skipped-document report.
+Use `--skip-oversized-documents=false` to require all supplied inputs, and
+`--max-ram-gb N` for the sampled process-RSS guard. Admission estimates and
+sampled RSS checks do not replace an operating-system memory limit.
 
-```text
-path/to/sample.fa.gz
-path/to/other_sample.fna.zst
-```
+## Index maintenance
 
-Named-color form:
-
-```text
-sample_a<TAB>path/to/sample_a.fa
-sample_b<TAB>path/to/sample_b.fastq.gz
-```
-
-Whitespace-separated `name path` lines are also accepted. If no name is given,
-the color name is derived from the file name.
-
-Supported sequence input:
-
-- FASTA
-- FASTQ
-- gzip-compressed FASTA/FASTQ
-- zstd-compressed FASTA/FASTQ (`.zst`, `.zstd`)
-- xz-compressed FASTA/FASTQ (`.xz`)
-- bzip2-compressed FASTA/FASTQ (`.bz2`, `.bz`, `.bzip2`)
-
-## Feature Modes
-
-Both indexes support the same indexed feature modes:
-
-```text
-kmers       every canonical k-mer
-minimizers  canonical minimizers from each k-window
-modimizers  hash-sampled canonical k-mers
-findere     all (k-z)-mers, with positional reconstruction of query k-mers
-```
-
-Full k-mer and modimizer modes currently require `k <= 31`, because canonical
-DNA k-mers are encoded in a `u64`. Minimizer mode may use larger odd-length
-windows because only the minimizer sequence is encoded; the default minimizer
-length is 21. Both canonical minimizer schemes require odd `k`.
-
-For Zindex, `--index-mode minimizers` defaults to **open-closed mod minimizers**
-([Groot Koerkamp, Liu and Pibiri, 2025](https://doi.org/10.1186/s13015-025-00270-0)).
-Use `--minimizer-scheme simd` to retain the standard canonical SIMD hash-minimizer
-backend. Bindex still uses that SIMD backend. The overall feature-mode default
-remains `kmers`, not `minimizers`.
-
-The open-closed selector automatically uses AVX2 on supported x86-64 CPUs;
-short records and other CPUs use its portable path. Four overlapping regions
-are processed together on one thread with prefix/suffix sliding minima,
-full-width 64-bit hashes, and bounded 1,024-window tile buffers. Exact selection,
-strand-consistent ties and emitted order match the original scalar iterator;
-the SIMD hash-minimizer scheme is still independently selectable.
-
-The open-closed selector runs in linear time, with `w=k-m+1`,
-`r=min(4,m)` and anchor length `t=r+(m-r)%w`, where `m` is `--minimizer-size`.
-Open-syncmer anchors are preferred over closed-syncmer anchors, with ordinary
-anchors as fallback; the selected representative offset is `anchor_offset%w`.
-Our canonical adaptation hashes canonical anchors and inner s-mers, chooses the
-largest `s<=min(4,t)` with `t-s` even, treats tied inner minima symmetrically, and
-breaks outer ties using the odd window's GT/AC majority. This guarantees the
-same canonical representatives on reverse-complemented sequences and matching
-selection when an exact window is queried in isolation. It is not a byte-for-byte
-implementation of the paper's directional tie rules.
-
-Examples:
+Merged indexes are rebuilt to incorporate new datasets. Legacy `--plain`
+indexes also support `append` and ordinary `repack`.
+`repack-subindexes` rewrites compression framing without changing filter cells:
 
 ```bash
-./target/release/zorindex build --fof samples.fof --k 31 --output samples.zindex
-./target/release/zorindex build --fof samples.fof --k 63 --index-mode minimizers \
-  --minimizer-size 21 --output samples.m21.zindex
-./target/release/zorindex build --fof samples.fof --k 63 --index-mode minimizers \
-  --minimizer-size 21 --minimizer-scheme simd --output samples.simd.zindex
-./target/release/zorindex build --fof samples.fof --k 31 --index-mode modimizers \
-  --modimizer-sampling 16 --output samples.mod16.zindex
+./target/release/zorindex repack-subindexes --index bacteria.zindex \
+  --output bacteria.reframed.zindex
 ```
 
-The feature mode is stored in the index and reused by `query`. Legacy `--plain`
-indexes also support `append`; merged directories currently require a rebuild.
-
-### Optional homopolymer compression (Zindex)
-
-Add `--homopolymer-compression` (alias `--homocompress`) to `build` to collapse
-consecutive identical DNA bases before feature extraction, for any feature mode:
-
-```bash
-./target/release/zorindex build --fof samples.fof --output samples.hpc.zindex \
-  --k 49 --index-mode minimizers --minimizer-size 31 --homopolymer-compression
-./target/release/zorindex query --index samples.hpc.zindex --query reads.fa.gz
-```
-
-Compression is case-insensitive and never joins records or ambiguous-base runs.
-The stored setting is reused automatically by queries and plain-index appends;
-there is no separate query flag to accidentally mismatch it. `k` and minimizer
-lengths apply to the compressed sequence, and query ratios count its features
-(or its k-mer windows in findere mode), not original-base positions. Raw parsed
-base counts are still reported. Compression is disabled by default.
-
-New Zindex files/directories record both the minimizer scheme and compression
-setting. Legacy indexes default to SIMD selection and no homopolymer compression.
-
-### Optional spaced seeds and randstrobemers (Zindex)
-
-For `kmers` or `minimizers`, `--seed-pattern` (alias `--spaced-seed`) retains
-the bases marked `#` and discards those marked `_`. The pattern must contain
-at least one `#`, be symmetric under reversal, and have width exactly `k` for
-k-mers or `--minimizer-size` (`m`) for minimizers. **Ordinary minimizers are
-selected first, then masked**; the pattern does not affect their selection.
-The retained bases are packed and canonicalized, with optional BMI2 bit
-extraction on supported x86-64 CPUs. An all-`#` pattern preserves ordinary keys.
-
-```bash
-./target/release/zorindex build --fof samples.fof --output samples.spaced.zindex \
-  --k 8 --seed-pattern '##_##_##'
-./target/release/zorindex build --fof samples.fof --output samples.spaced-min.zindex \
-  --k 31 --index-mode minimizers --minimizer-size 9 --seed-pattern '##__#__##'
-```
-
-`--randstrobemers` (alias `--randstrobes`) links **two** strobes: all k-mer
-positions in k-mer mode, or only already-selected minimizer positions in
-minimizer mode. `k` or `m` specifies the length of **each strobe**, not the
-combined key. `--strobe-min` and `--strobe-max` set inclusive distances between
-their **start positions**, measured in bases, not in numbers of minimizers.
-Their defaults are one and three strobe lengths, respectively. Minimum distance
-must be positive and cannot exceed maximum distance; overlapping strobes are
-allowed if explicitly requested by choosing a minimum below the strobe length.
-
-```bash
-./target/release/zorindex build --fof samples.fof --output samples.rand.zindex \
-  --k 21 --randstrobemers --strobe-min 25 --strobe-max 100
-./target/release/zorindex build --fof samples.fof --output samples.rand-min.zindex \
-  --k 49 --index-mode minimizers --minimizer-size 31 \
-  --randstrobemers --strobe-min 32 --strobe-max 100
-./target/release/zorindex query --index samples.rand-min.zindex --query reads.fa.gz
-```
-
-Construction emits **one downstream seed per selected anchor**, using
-Strobealign's canonical-strobe XXH64 hashes and minimum masked-XOR popcount
-selection (`q=255`, first/nearest candidate wins ties). An anchor without an
-eligible downstream partner is paired with itself, as in Strobealign's
-iterator. Full-seed keys use the symmetric `h1/2 + h2/2` representation from
-[Sahlin (2022)](https://doi.org/10.1186/s13059-022-02831-7), not Strobealign's
-newer partial-match/MCS-specific packed keys. Your all-k-mer or selected-
-minimizer anchor set and inclusive base-distance settings remain unchanged;
-this does not switch minimizer selection to syncmers.
-
-Queries independently reselect partners in the forward and reverse-complement
-directions and report the **larger count per document**, never the sum. Both
-directions have one seed per selected anchor and the same denominator. For
-multi-record queries the per-document maxima are summed **per record**, so
-mixed-strand read files work correctly. Symmetric seed keys do not make partner
-selection strand-invariant. Duplicate seed occurrences remain weighted. At
-read boundaries, partner reselection or self-pair fallback may differ from a
-long reference even without errors. The inter-strobe gap is not part of a key.
-
-The earlier custom two-direction construction is incompatible: its indexes
-must be rebuilt. New randstrobemer indexes carry a versioned extraction
-identity, and old custom indexes are rejected rather than silently misqueried.
-
-Both options may be combined: ordinary minimizer selection precedes masking,
-and randstrobe linking then uses the masked strobes. Homopolymer compression,
-if enabled, happens first, so all lengths and distances refer to compressed
-bases. Neither option crosses record or ambiguous-base boundaries. The linker
-buffers only the local distance window; minimizer mode additionally stores and
-deduplicates selected positions. Settings are persisted and reused by queries
-and plain-index appends, and `info` reports them. They are not supported with
-findere or modimizers. Bindex does not expose these new options.
-
-### Findere
-
-Both tools accept `--index-mode findere`. Here `--k` is the **query** k-mer
-length; the index stores all canonical `(k-z)`-mers from valid reference
-stretches of at least `k` bases. `--findere-z` (alias `--z`) defaults to **10**.
-For example, `--k 31` indexes 21-mers and requires 11 consecutive 21-mer hits
-in the **same dataset** to report one 31-mer match.
-
-```bash
-./target/release/zorindex build --fof samples.fof --k 31 --index-mode findere --output samples.findere.zindex
-./target/release/bloomindex build --fof samples.fof --k 31 --index-mode findere --output samples.findere.blmidx
-
-# Override z; query automatically reuses the stored setting.
-./target/release/zorindex build --fof samples.fof --k 31 --index-mode findere --findere-z 3 --output samples.z3.zindex
-./target/release/zorindex query --index samples.findere.zindex --query reads.fa
-./target/release/bloomindex query --index samples.findere.blmidx --query reads.fa
-```
-
-Constraints are `0 <= z < k <= 255` and `1 <= k-z <= 31`. Setting `z=0`
-recovers ordinary k-mer membership. Findere is a separate mode, not combined
-with minimizer or modimizer sampling. `info` reports `findere_z` and `indexed_k`.
-
-Query `matches`, `total_features`, and ratios count reconstructed **k-mer
-positions**, not shorter-feature hits. Probe counters count actual shorter-feature
-probes. Consecutive windows reuse those probes; reconstruction resets at each
-FASTA/FASTQ record or ambiguous base and ignores stretches shorter than `k`.
-Findere queries use the Rayon pool configured by `--threads` (all available
-hardware threads by default). Bounded batches distribute both short records and
-individual long sequences over workers, each with private decoding scratch and
-score counters. Long-sequence tasks own disjoint k-mer windows and include `k-1`
-trailing context bases: no matches are lost or duplicated at task boundaries.
-Those boundaries repeat up to `z` shorter-feature probes; probe counters include
-this work and are deterministic across thread counts. Parsing/decompression is
-still serial. The additional findere negative-run skipping optimization is not
-implemented.
-
-Findere reduces some approximate-membership false positives but is not exact:
-all constituent shorter features can exist without their full k-mer occurring.
-Bloom's reported `estimated_fp_rate` remains the underlying shorter-feature
-estimate, not the reconstructed k-mer false-positive rate. Pure ZOR can abandon
-constraints; findere does not repair those false negatives and can propagate
-one missing shorter feature to several query windows. Check `abandoned` when
-choosing ZOR construction settings.
-
-Findere uses feature-mode
-tag 3 followed by a mode-specific `z` byte after the common feature settings;
-older binaries reject this unknown mode. The stored mode and `z` survive append
-and ZOR repack operations.
-
-## Zindex
-
-Zindex builds merged colored power-of-two banks by default, using streaming
-planning, compression column ordering, sizing factor **1.0**, `no-heuristic` cycle
-breaking and `tie-scan=1`. Four hash locations are the default. These settings
-do not need to be repeated on the command line:
-
-```bash
-./target/release/zorindex build --fof samples.fof --output samples.zindex \
-  --k 49 --index-mode minimizers --minimizer-size 31 --fingerprint-bits 16
-./target/release/zorindex query --index samples.zindex --query reads.fa.gz
-./target/release/zorindex info --index samples.zindex
-```
-
-`--output` must name a new directory, regardless of its extension. To use the
-legacy single-stack layout instead, pass **`--plain`**. This builds one pure ZOR
-filter per color and stores them in a slot-major interleaved layout:
-
-```text
-slot 0: color 0 fingerprint, color 1 fingerprint, ...
-slot 1: color 0 fingerprint, color 1 fingerprint, ...
-```
-
-A query computes the ZOR positions once, XORs the selected rows, and compares
-each color lane against the query fingerprint. The layout is intended to keep
-the later SIMD/chunked XOR path straightforward.
-
-### Build
-
-```bash
-./target/release/zorindex build \
-  --plain \
-  --fof samples.fof \
-  --k 31 \
-  --fingerprint-bits 16 \
-  --output samples.zoridx
-```
-
-Important options:
-
-- `--hashes`: number of ZOR locations per key.
-- `--fingerprint-bits`: `1`, `2`, `4`, `8` (default), or `16`. Sub-byte
-  fingerprints are tightly packed (eight, four, or two per byte). Approximate
-  false-positive rates per absent indexed feature are 50%, 25%, 6.25%, 0.39%,
-  and 0.0015%, respectively; sequence-level thresholds still apply. The 2- and
-  4-bit query paths fuse slice XOR and packed equality screening with AVX2 where
-  available, with a portable word-parallel fallback. These widths work with
-  merged and plain indexes, including the existing compression modes and plain
-  index append/repack. Origin bits and the abandoned-key map remain additional
-  costs, so total index size does not scale solely with fingerprint width.
-- `--slot-scale`: multiplier applied to the largest color cardinality.
-- `--slot-count`: explicit slot budget before segmented layout rounding.
-- `--segment-length`: explicit power-of-two segment length.
-- `--cycle-break`: heuristic used when the peel reaches a core.
-- `--union-graph`: optional union ZOR filter used as a query prefilter.
-
-### Append
-
-```bash
-./target/release/zorindex append --index samples.zoridx --fof more_samples.fof \
-  --output samples.extended.zoridx
-```
-
-Append reuses the original `k`, hash count, seed, layout, fingerprint width,
-and feature mode. If the input index contains a union graph, append removes it
-because the stored index does not contain all previous keys needed to update
-the union graph exactly.
-
-### Query
-
-```bash
-./target/release/zorindex query --index samples.zoridx --query query.fa.gz --min-ratio 0.1
-```
-
-Output starts with a summary line, followed by one line per color passing the
-ratio threshold:
-
-```text
-#query  query.fa.gz  k=31  index_mode=kmers  total_features=...  stack_probes=...  elapsed_s=...
-color   matches   ratio   unique_kmers   abandoned
-```
-
-Merged indexes also support one result per FASTA record:
-
-```bash
-./target/release/zorindex query --index samples.pow2 --query reads.fa.gz --records --min-ratio 0.8
-```
-
-Merged-index queries default to `--query-memory subindex`. The query input is
-**parsed once**, seeds are **extracted once**, and the global abandoned-key file
-is **scanned once**, retaining only matches for queried seeds. One subindex is
-then decompressed and queried at a time, and released before the next is loaded.
-Results remain **in RAM**; queries create **no temporary result files**. Record
-input can be a non-replayable stream such as `/dev/stdin`.
-
-Ordinary dense k-mer and minimizer queries retain extracted feature buffers per read and use the
-same threshold-pruning lookup worker as full loading, with local document IDs.
-They avoid a global feature-ID dictionary and per-feature hit lists for each
-subindex. The largest needed subindex load overlaps the recovery-file scan;
-only one decompressed subindex is resident at any time. Repeated occurrences
-retain their full multiplicity, and recovery preserves the union of colliding
-32-bit hashes without double counting filter hits. When a size class has physical
-hash partitions, partial counts and pruning bounds use the original read's total
-and all remaining partitions, rather than applying a threshold to each partition.
-Filtered recovery directories are counted in RAM and allocated once before
-insertion, avoiding collision clustering from incremental insertion of sorted
-hashes. This adds no recovery-file scan and changes no indexed data or membership
-semantics. Query phase logs report this initialization as `recovery_map_s`.
-
-Dense queries also use this path with spaced seeds or homopolymer compression.
-Other seed modes retain the size-class membership cache. Findere windows and
-randstrobemer strand maxima are resolved after all hash partitions of that class contribute.
-SIMD lookup and parallel query workers remain active, and output retains input
-record order and original document IDs.
-
-Construction defaults to **`--max-subindex-size 8GiB`**, measured on the
-uncompressed, byte-padded slice payload. The value must be a power of two; it
-accepts bytes or integer `KiB`, `MiB`, and `GiB` suffixes. Larger finalized size
-classes are rebuilt as 2, 4, 8, ... hash partitions, each with power-of-two local
-slots and at most the requested number of payload bytes. Every seed selects
-**one partition per original size class**, with all H positions inside it; query
-false-positive probability is not multiplied by the partition count. Partitions
-with no queried seeds are not loaded. Fingerprint width and merged memberships
-are unchanged. Column order is optimized independently within each partition.
-
-The cap bounds **resident filter data**, not total process RAM. Query seeds,
-in-RAM results, membership caches, metadata and worker buffers use additional RAM.
-Legacy indexes remain queryable but retain their original subindex sizes; rebuild
-to apply the cap. Only oversized classes need an additional construction pass
-after exact sizing and promotion; classes under the cap keep their original filter
-bytes. Partitioned filters have new cells/abandoned keys, so individual approximate
-false positives, compression and abandoned-key volume can differ from an unpartitioned build. This option does not cap
-construction workspaces. A cap too small for the slice width and minimum H-segment
-geometry is rejected rather than silently exceeding it.
-
-On sufficient-RAM machines, retain the fully resident query behavior with:
-
-```bash
-./target/release/zorindex query --index samples.pow2 --query reads.fa.gz --query-memory all
-```
-
-Full loading probes all relevant size classes together and retains the complete
-recovery map. Sequential loading keeps only recovery matches for the query and
-releases each subindex before loading the next. These options concern merged indexes; the
-legacy `--plain` single-file query path is unchanged. Selecting a query memory
-mode requires no index rebuild.
-
-Newly built merged subindexes use independent 4-MiB Zstd frames, allowing all
-query workers to decode a single subindex in parallel. This removes the serial
-decompression bottleneck without keeping several subindexes resident. Existing
-single-frame indexes remain readable. To enable parallel loading without
-rebuilding their filters, write a separate copy with:
-
-```bash
-./target/release/zorindex --threads 32 repack-subindexes --index samples.pow2 --output samples.parallel.pow2
-```
-
-Repacking preserves every decoded filter byte, the manifest and the recovery
-file; it changes only physical bank compression. It does not overwrite the
-source or an existing output directory. The concatenated Zstd frames and optional
-skippable seek table are also readable by older streaming readers. Compressed
-input scratch is bounded by one frame per active decoding worker.
-
-Record reporting emits `query_id`, `valid_kmers` (the indexed feature count),
-and ordered numeric `document_id:count` pairs, matching the record-level benchmark TSV.
-Lookup, thresholding and formatting run in parallel with persistent worker
-counters; only matching documents are scanned when `--min-ratio` is positive.
-At threshold zero, all documents, including zero counts, are still reported.
-`--record-batch-size` defaults to 4096. The compatibility aliases
-`--bench-records` and `--bench-batch` accept the original benchmark command line.
-This mode accepts compressed FASTA and ordinary feature modes, not findere;
-without `--records`, whole-file aggregate reporting is unchanged.
-
-With `--query-memory all`, record queries use a bounded parser/lookup/writer pipeline, recycling input and
-output buffers. Ready input batches may be paired to amortize worker dispatch;
-output remains in input-record and document order. Worker-local feature batches
-hold at most 32,768 features and reuse complete lookup results for repeated keys,
-including keys shared by different reads in that worker batch. Duplicate feature
-occurrences retain their full multiplicity. Cached origin lists are capped at
-262,144 32-bit IDs per worker and are discarded between feature batches; oversized
-results are not retained. This is not a persistent index cache.
-
-For positive `--min-ratio`, the total feature count is determined first. A filter
-group is skipped only when **every** document in it has too few possible remaining
-matches to pass. Contiguous retired groups are omitted from fingerprint reads;
-1-bit fingerprints retire aligned 64-group blocks; 2- and 4-bit fingerprints
-retire byte-aligned units of four and two groups. Counts for every reported
-document remain exact, including abandoned-key matches and 32-bit hash collisions.
-Threshold-zero queries still report all counters, including zeros. Records longer
-than the feature budget use a bounded-memory two-scan path rather than retaining
-all their features. Whole-file aggregate queries deduplicate each feature batch
-before partitioning it across workers, applying weighted counts.
-
-Modern index loading decompresses independent banks in parallel, concurrently
-with the global abandoned-key map; its postings use buffered bulk decoding.
-Version-1 indexes retain legacy fallback conversion. These are execution-only
-changes: no index-size increase, no new files or format changes, and no changes to
-fingerprints, hash positions or abandoned-key collision handling. The positional
-findere reconstruction path retains its existing per-feature lookup semantics.
-
-### Metadata
-
-```bash
-./target/release/zorindex info --index samples.zoridx
-```
-
-### Zindex: default merged power-of-two banks
-
-```bash
-./target/release/zorindex build --fof samples.fof --k 31 --fingerprint-bits 16 --output samples.pow2
-./target/release/zorindex info --index samples.pow2
-./target/release/zorindex query --threads 4 --index samples.pow2 --query query.fa.gz
-```
-
-`--output` is a new directory. It contains `manifest.json` and compressed
-subindex files per occupied power-of-two cell count (one file per hash partition
-when the size cap requires partitioning). Each subindex stores all groups
-of that size in bit-packed slices, with a contiguous fingerprint plane followed
-by origin bits. Queries XOR and screen fingerprints using AVX2 where available,
-with a scalar fallback; origin bits are decoded only for matching fingerprints.
-
-`--min-subindex-documents` defaults to **128 original documents**, counting all
-members of each merged filter. Undersized slot-size buckets are combined by
-promoting filters to a larger power of two, never by folding, dropping documents,
-or changing the sketch merge plan. A dynamic program minimizes padded storage
-among contiguous size-bucket partitions satisfying the minimum. Collections
-with fewer than 128 documents use one subindex. Set the parameter to `1` to
-retain the previous layout.
-
-`--max-subindexes N` additionally caps the number of size classes (unlimited
-by default). The same padded-space dynamic program chooses at most `N`
-contiguous size ranges, promoting each to its largest power of two without
-folding or changing dataset merge membership. The document minimum still
-applies; use `--min-subindex-documents 1` to measure the count cap alone.
-The byte-size cap is applied afterward, so `--max-subindexes` limits original
-size classes, while oversized classes may have several physical hash partitions.
-`info` reports both `size_classes` and physical `banks`, plus
-`largest_subindex_bytes`, `hash_partitions` and `max_subindex_size`.
-A cap above the number of natural size buckets does not create extra subindexes.
-
-The constraint uses exact constructed sizes, not sketch estimates: only filters
-needing promotion are rebuilt from their input documents. This may require an
-additional input read and extra construction work. Completed filters and abandoned
-keys follow the selected disk/RAM storage policy. It trades larger filters for fewer
-subindex probes. Fingerprint width, slot-scale (1.0), coloring and abandoned-key
-semantics are unchanged; promoted filters can have different false-positive
-identities because their hash positions change. `info` reports the original
-document count of every final subindex and the number of promoted groups.
-Groups are sorted by payload width, then by
-samples of their assigned filter cells to cluster similar physical columns. Dataset
-names and query output order stay the same as in the FOF. Promotion does not
-split planned filter groups; hash partitioning can route their seeds among
-physical files while retaining the same logical dataset IDs.
-
-The planner sketches the actual indexed feature sets, so k-mers, minimizers,
-modimizers, and findere use the same features for planning and construction.
-Sketching uses vendored [Ragnar Groot Koerkamp's SimdSketch 0.3.0](https://github.com/RagnarGrootKoerkamp/simd-sketch)
-with explicit feature-ID and union extensions (see `vendor/simd-sketch/NOTICE.md`).
-Comparisons use **8-bit fingerprints**, AVX2 byte equality and correction for
-accidental matches. The planner uses the dense-genome path: no empty-cell masks,
-no occupancy checks during comparison, and all 256 fingerprint values available. AVX2
-feature hashing/threshold collection reuses Ragnar's SIMD lane compaction.
-Full **32-bit minima** are retained solely to support exact sketch unions:
-truncated fingerprints cannot themselves be merged. At the default 128 buckets,
-each sketch retains 128 bytes of fingerprints plus 512 bytes of merge state
-(640 bytes before allocation metadata), with no mask allocation. Streaming additionally
-packs the comparison bytes in one reusable, transposed arena (128 bytes per active
-group at this setting, plus block padding and small position metadata).
-This fast path assumes populated sketch buckets; similarity estimates for
-tiny/sparse feature sets are not adjusted for unpopulated buckets.
-The 8-bit sketch fingerprints are independent of the index fingerprint setting.
-Unions update minima and fingerprints in place. Groups reaching the color cap
-release their sketches immediately; all other sketches are freed when planning
-finishes, before filter construction. Singleton cardinalities are counted exactly
-during feature extraction; group cardinalities use collision-corrected Jaccard.
-The new estimator can change merge decisions relative to the former 64-bit
-sketches; planner pruning preserves exhaustive streaming decisions **with the
-same new sketches**.
-
-Planning modes are selectable with `--merge-planner`:
-
-- `naive`: process datasets in FOF order without merging their feature sets.
-  Each dataset keeps its own fingerprint filter and is appended to the smallest
-  sufficient existing power-of-two subindex. If none fits, create one at the
-  dataset's required capacity. Earlier assignments are never revisited, and
-  existing subindexes are never enlarged. No similarity sketches are computed.
-  Input order is preserved within each subindex. This mode disables global
-  minimum-document/count promotion (`--min-subindex-documents` and
-  `--max-subindexes`) and uses width/input order instead of compression-based
-  column ordering. The physical `--max-subindex-size` safety limit still applies.
-  The program's default remains `streaming`.
-- `all-pairs`: repeatedly merge the pair with the largest predicted
-  bit saving until no profitable pair remains. Candidate comparisons and heap
-  storage can be quadratic in the number of datasets. Equal-saving ties use
-  group IDs derived from input order, so its partition can also depend on order.
-- `streaming` (default): process datasets in FOF order. Bucket current groups by
-  slot exponent and origin count. Compare an incoming sketch only with buckets
-  whose optimistic cost could save bits, excluding origin-limited buckets.
-  Visit buckets in descending maximum possible saving, skipping those unable
-  to beat the incumbent. Probe the earliest group first, stopping a bucket when
-  that group achieves its upper bound. All comparison fingerprints are packed
-  in one transposed arena: AVX2 compares the same fingerprint position across
-  32 groups per vector, with independent vectors sharing query broadcasts. An exact,
-  conservative cost bound determines the required number of matching bytes;
-  blocks stop early when even all remaining bytes matching cannot suffice.
-  Large scans use one coarse parallel dispatch, not repeated candidate batches
-  or a freshly flattened candidate-ID vector. Intermediate scans use lazily
-  created 8- or 16-worker pools (never exceeding the configured parallelism)
-  below 16 or 32 MiB of comparison fingerprints; larger scans use the full
-  configured pool. This avoids waking all workers for short scans. Auxiliary
-  pools exist only during planning; extraction retains its configured parallelism.
-  Removed columns are swap-compacted
-  and freed blocks reused. Physical order may change, but logical group IDs
-  retain exactly the original earliest-ID tie-breaking.
-  Merge it into the group with the largest positive saving,
-  or keep it separate. Update that group's sketch without revisiting old pairs.
-  Pruning preserves the original streaming decisions and tie-breaking exactly;
-  groups skipped for a small arrival remain eligible for larger future arrivals.
-  There is no fixed size cap or merge reversion. Only current sketches are retained.
-  Comparisons can still be quadratic in the worst case. Results depend on input order.
-- `streaming-unpruned`: retain the original streaming scan over every current
-  group, as a comparison baseline. It produces the same partition as `streaming`.
-- `naive`: do not union datasets. Place each incoming dataset in the smallest
-  sufficient existing size class, retaining input order. This is a placement
-  baseline, not Jaccard-guided merging.
-
-The merge planners use the same cost, including power-of-two rounding and payload width:
-the fingerprint alone for a singleton, or fingerprint plus one membership bit
-per dataset for a merged group. The fingerprint width is never reduced. These are
-greedy optimizers, not globally optimal partition searches. Streaming is planning
-only: filter construction begins after the batch's final plan is known. Exact
-sizing, promotion and hash partitioning can require later reconstruction without
-changing the planned dataset unions.
-
-Use `--merge-planner full` (an alias for `all-pairs`) to opt into the full planner,
-or `--merge-planner naive` for ordered placement without dataset unions.
-
-The streaming planner merges each dataset into the best existing group as it
-arrives, so the input order matters: an order that keeps related genomes
-adjacent gives smaller groups, fewer candidate evaluations and a smaller index.
-`utils/scripts/sort_fof_by_lineage.py LINEAGE_TSV IN.fof OUT.fof` orders a FOF by
-phylum, class, order, family, genus and species from a lineage table (the
-661k-bacteria `File2_taxid_lineage` layout); datasets without a lineage go last.
-All modes default to `--merge-column-order compression`: within each bank's
-equal-width sections, lexicographically sort samples from eight short windows
-of the actual completed filter cells. This bounded-memory heuristic puts identical
-sampled columns together without an all-pairs ordering search. It does not guarantee
-smaller files on every collection. `--merge-column-order width` retains the previous
-width/input-ID order for comparisons. Physical ordering never changes merges,
-origin bit assignments, dataset identities, or query output order; offsets and member
-IDs are stored in the manifest. Old manifests retain their legacy defaults.
-
-Construction reuses the existing ZOR peel and cycle-breaking implementation.
-Every retained equation's complete fingerprint/membership payload is verified.
-By default, abandoned features are recovered through **one global multimap** shared
-by all banks: a 32-bit hash of each abandoned feature maps to its originating
-datasets (packed 32-bit IDs). Its open-addressed directory is queried once per
-feature, not once per group. Hash collisions union the originating dataset lists;
-there is no full-key collision check. Recovery adds to the filter's hits and never
-overwrites them; each dataset is counted once per queried feature.
-`build --drop-abandoned` omits both recovery storage and lookup,
-accepting missing abandoned features. `query --ignore-abandoned` skips loading and
-querying the map of an existing merged index. Recovery is enabled by default.
-Version-1 and version-2 merged indexes remain readable. Version-1 fallback records are
-converted into the global 32-bit-hash map on load, without rewriting the files.
-New indexes use manifest version 8 (bank layout version 3) and require an updated reader.
-Merged indexes use a fixed segment length of 64 cells, independent of filter
-capacity; `--segment-length` overrides that fixed value. The manifest records it
-so old indexes retain their historical position mapping. The minimum filter
-capacity accommodates the fixed segments and hash count; slot-scale stays 1.0.
-The global abandoned-key map uses lossless delta/variable-integer encoding on
-disk and inline singleton origins in RAM. All 32 hash bits and origin IDs are
-preserved. The updated reader also loads earlier recovery-file encodings.
-**Merges are never
-reverted**, even when exact union cardinalities, byte padding or fallback entries
-erase the estimated savings. Actual capacity is computed from exact union keys
-and remains a power of two; the planned membership partition is unchanged.
-Construction defaults to **two input passes without temporary key files**:
-
-1. Extract each dataset's exact cardinality and mergeable sketch, decide merges,
-   and project the power-of-two bank layout. Only sketches, counts, feature
-   signatures and the plan are retained; extracted keys are discarded.
-2. Reread the inputs for each planned group, form its exact union and origin
-   masks, and build its filter. Actual union cardinalities determine the final
-   power-of-two sizes; estimates are not hard capacities and merges are never
-   reverted. Changed indexed features between passes cause a clean error.
-
-Completed filters are **bit-packed at their actual payload width**, not stored as
-64-bit cells. By default they are staged as bit-packed cell files next to the output,
-so RAM needs to fit only planning metadata and the active groups' keys/payloads/graphs;
-`--low-disk` keeps them in RAM instead and creates no temporary key/cell files.
-The existing compression-aware column ordering is preserved using exactly the
-same cell samples. Bank packing uses bounded row tiles and writes directly to
-zstd; completed banks are released from RAM. The atomic publication directory
-contains only the final index files. Both passes run as tasks on the
-`--threads` rayon pool. Parsing and
-planning overlap: one pool thread inserts each parsed dataset into the
-streaming planner, in input order, while the other threads parse the datasets
-queued ahead of it, and the planner's own candidate scans use the same pool.
-At most 1024 datasets are parsed ahead of the planner. Admission also limits
-the total estimated workspace of outstanding extraction and construction jobs.
-The default budget is 80% of available RAM at each stage, respecting visible
-cgroup-v2 limits; override it with `--build-memory-gib N`. The worker pool still
-uses every requested thread. Large jobs reduce concurrent group admission rather
-than blocking worker threads on a memory semaphore. Plans, member order, feature
-sets, fingerprints and recovery are unchanged.
-
-For a fixed **total process RSS** budget, use `--max-ram-gb 500`: GB is decimal,
-so this requests exactly 500,000,000,000 bytes. This conflicts with
-`--build-memory-gib`; `--max-document-memory-gib` may still impose a narrower
-document ceiling. Fixed mode subtracts the resident baseline from the requested
-total for workspace admission; it does not clamp the request to MemAvailable or
-apply the automatic 80% discount. Visible cgroup limits remain authoritative.
-Retained planner/filter/recovery memory and all build phases share the same RSS
-ceiling. A native watchdog samples RSS every 20 ms and exits nonzero on a measured
-excess (`memory-limit-exceeded` plus JSON evidence on stderr); a synchronous
-check also runs before publishing the final index. This is a sampled RSS guard,
-not RLIMIT_AS: transient overshoot between samples is possible, and allocation
-failure or a kernel OOM kill can precede a sample. Partial staging is never a
-success. Automatic available-memory accounting adds only explicitly evictable
-ZFS ARC above `c_min`, bounded by `size - c_min`, before cgroup limits; it does
-not add ordinary page cache already counted in MemAvailable.
-
-Merged builds enable `--skip-oversized-documents=true` by default. A document
-whose estimated input or singleton-graph workspace exceeds the build budget is
-skipped, with its original FOF ID, name, path, reason, estimate and budget recorded
-in `<output>.skipped-documents.json`. A successful index includes the same report
-and manifest metadata. Included document IDs are compacted in original FOF order;
-`source_document_ids` maps them back to their original IDs. Skipped documents are
-**absent from the index**, not false negatives of its included collection. If all
-documents are skipped, construction exits with an error and the report remains;
-no empty or incomplete index is published. `info` reports the input and skip counts.
-
-Use `--max-document-memory-gib N` to lower the per-document ceiling; it cannot
-raise the overall build-workspace budget. Automatic budgets use80% of available
-RAM. An explicit `--build-memory-gib` is honoured up to actual available RAM;
-it is not silently reduced by the automatic80% policy. File size is only an extraction
-concurrency hint and cannot exclude a document. The collector bounds decoded
-bytes and feature-vector reservations, then checks the exact distinct-feature
-count, bytes actually written to the occurrence vector, hash count, graph index
-width and power-of-two slots before graph construction. Unused vector capacity
-is not charged as resident RAM. For the compact graph, the RSS prediction counts
-the actual array types and estimates degree-heap occupancy and the initial
-degree-one queue from the degree distribution. This model was checked against
-five completed multi-Gb-genome constructions at 4, 6 and 8 hashes (errors below
-0.04%). This evidence covers compact 32-bit graphs; the 64-bit lazy-heap path
-still uses an explicitly labelled conservative capacity fallback, not a validated
-RSS prediction. Admission adds a separate 10% margin to the selected estimate.
-Non-overlapping extraction/graph/assignment phases are not added together.
-Set `ZORINDEX_MEMORY_TRACE=1` for structured `memory-trace` stderr records of
-measured occurrences/distinct counts, reservations, per-phase RSS/high-water
-RSS and the final graph/heap capacities. The trace distinguishes
-`predicted_peak_rss_bytes`, `admission_workspace_bytes`,
-`conservative_capacity_bound_bytes` and `prediction_model`.
-This does not change filter semantics. Degree-one queues can grow during
-peeling, and changing parser/allocator behaviour can still alter peak RSS.
-Every merge candidate is checked **before acceptance**, in streaming,
-streaming-unpruned and all-pairs planning. Its memory estimate uses the sum of
-exact input feature counts as a conservative union bound, the combined payload
-width, power-of-two slot rounding and retained source workspace. Sketch overlap
-cannot lower this memory bound. Rejected candidates leave their documents
-available for other, smaller merges, so admissible pairs can still merge rather
-than undoing a large merge into singletons afterward. The frozen limit is saved
-as `merge_memory_budget_bytes` in the manifest. This can increase final index size.
-A defensive post-plan check remains, and construction admission uses the same
-conservative counts. A requested
-subindex promotion that cannot fit is rejected before allocation rather than
-silently violating its requested layout. Corrupt/unreadable inputs remain errors.
-
-This is conservative estimated admission, **not a hard process RSS cap**.
-Parser buffers, allocator overhead, sketch error and changing memory availability
-still matter. No feature keys are externally sorted. Guarded jobs may not bypass
-available admission headroom just because they are alone. Explicit
-`--skip-oversized-documents=false` allows oversized individual documents again;
-it does not disable merge-candidate or promotion limits. Use it only when those
-individual jobs are known to fit. The guard applies to merged builds;
-the legacy `--plain` path does not support its explicit options.
-In RAM mode, completed filters and accumulated
-abandoned-key records remain additional memory costs. In disk mode both are staged
-to disk. Feature vectors are still sorted/deduplicated in memory; external sorting
-is used only for staged abandoned-key records, never for extracted input features.
-
-By default (`--low-disk=false`) completed filters are staged as bit-packed cell
-files and abandoned keys as sorted hash/group/origin-mask runs next to the output.
-`--low-disk` selects the scratch-free mode instead, using more RAM to reduce scratch disk:
-both stay in RAM until bank compression.
-Each active job uses at most 65,536 records (1 MiB) for abandoned-key sorting.
-A bounded-fan-in external merge writes the same single global abandoned-key map
-without retaining the collection's records in RAM. Even pathological hash collisions
-keep at most a collection-sized origin list, rather than one entry per abandoned key.
-Staged files are removed after use; promoted filters follow the same storage policy.
-`--disk-backed` also stages abandoned keys, alongside its temporary `u64` feature
-and cell caches followed by tiled bank packing. All modes produce identical bank files and the same global
-abandoned-key map for unchanged inputs, settings and column order; only
-construction metadata and timings differ.
-
-Graph positions, adjacency, offsets and peel records use checked 32-bit indices
-where possible, with a wide fallback. A mutable indexed degree heap avoids stale
-priority entries while retaining the original tie-breaking and peel decisions.
-Fingerprints, origin assignments, hash positions, false positives and query
-counts are unchanged by construction mode.
-
-Options: `--merge-sketch-size` (128 buckets), `--merge-max-colors` (48 datasets),
-`--merge-min-saving` (0; a fractional safety margin), `--merge-plan-margin`
-(0.03 by default: each merged group is planned as if its estimated union were
-3% larger, because sketch noise can push the exact union past the planned power
-of two and double the group's slots; 0 disables the inflation). The manifest's
-`overflow_groups` counts groups whose exact union required more slots than
-planned, before minimum-document promotion. `--merge-disabled` selects
-(power-of-two singleton banks for comparisons). Payloads currently fit at most
-64 bits, including the 1-, 2-, 4-, 8- or 16-bit fingerprint. `--slot-count` acts as a minimum
-per-group cell budget before rounding.
-
-Query supports all feature modes and uses Rayon for ordinary and findere queries.
-This format currently supports plain in-memory slices with zstd-compressed files;
-append, ordinary repack, union prefilters, and split-large layouts
-are rejected. A future append implementation must plan merges only within the
-new update batch, never against old filters whose source documents may be gone.
-`info` reports the planner, candidate evaluations, payload, padding, recovery-map
-hashes/associations/RAM, fallback storage, metadata, and disk bytes
-separately. The 1,024-genome before/after benchmark is summarized in
-[historical optimization benchmark](OPTIMIZATION_BENCHMARK.txt).
-
-## Bindex
-
-Bindex is the Bloom-filter comparison backend. It stores one Bloom filter per
-color with bit-position-major interleaving:
-
-```text
-bit position 0: packed colors
-bit position 1: packed colors
-...
-```
-
-For a query, Bloom positions are computed once and the packed color words at
-those positions are ANDed.
-
-### Build
-
-```bash
-./target/release/bloomindex build \
-  --fof samples.fof \
-  --k 31 \
-  --false-positive-rate 0.00390625 \
-  --hashes 6 \
-  --output samples.blmidx
-```
-
-Sizing options:
-
-- `--false-positive-rate`: target per-color Bloom false-positive rate.
-- `--hashes`: Bloom hash count.
-- `--bits-per-item`: override automatic bits-per-item sizing.
-- `--bit-count`: explicit common bit count for every color.
-
-Automatic sizing uses the largest color cardinality and applies it to all
-colors. Appended colors larger than the original sizing target increase their
-Bloom false-positive rate; append reports a warning in that case.
-
-### Append, Query, Info
-
-```bash
-./target/release/bloomindex append --index samples.blmidx --fof more_samples.fof \
-  --output samples.extended.blmidx
-./target/release/bloomindex query --index samples.blmidx --query query.fa.gz --min-ratio 0.1
-./target/release/bloomindex info --index samples.blmidx
-```
-
-## Choosing Bloom Hash Counts
-
-For a target false-positive rate `p` and `h` Bloom hashes, Bindex uses:
-
-```text
-bits_per_item = -h / ln(1 - p^(1/h))
-```
-
-The optimal Bloom hash count depends on the target `p`, memory budget, and
-throughput target. For comparable experiments, fix the target false-positive
-rate and sweep `--hashes`; the automatic sizing will adjust the bit count.
-
-## Serialization
-
-`build`, `append`, and `repack` always serialize an index to disk. Both Zindex
-and Bindex write the serialized index stream through zstd by default. The
-loaders detect zstd streams automatically and can still read raw legacy streams.
-
-## Experimental Stack Compression
-
-Zindex also has experimental per-row stack codecs behind `--stack-compression`.
-This is separate from whole-index zstd serialization. The default stack mode is
-`none`.
-
-Available experimental modes:
-
-```text
-svb32-0124
-lz4
-lz4-lib
-snappy
-fastpfor256
-lz4-hc
-fastpfor-pack
-```
-
-Repack an existing index with an experimental stack codec:
-
-```bash
-./target/release/zorindex repack --index samples.zoridx --output samples.lz4hc.zoridx \
-  --stack-compression lz4-hc
-```
-
-## Testing
-
-Run all unit tests:
-
-```bash
-cargo test --workspace --release --locked
-```
-
-List test cases:
-
-```bash
-cargo test --workspace --release --locked -- --list
-```
-
-The suite covers canonical encoding, reverse-complement equivalence, feature
-modes, FOF parsing helpers, ZOR layouts, stack storage round trips, all five
-fingerprint widths, Bloom sizing, and Bloom query behavior. Integration tests
-also exercise compressed inputs, subindex routing, memory controls and the
-standalone minimizer generator.
-
-## Citation
-
-Zindex uses ZOR filters:
-
-Antoine Limasset. ZOR Filters: Fast and Smaller Than Fuse Filters. In 24th
-International Symposium on Experimental Algorithms (SEA 2026), LIPIcs 371,
-24:1-24:17, 2026. DOI:
-[10.4230/LIPIcs.SEA.2026.24](https://doi.org/10.4230/LIPIcs.SEA.2026.24).
-
-Compression applies to construction inputs and queries, including findere. Use
-the appropriate compression suffix; decoding errors are returned. Compressed
-feature extraction streams gzip, zstd, xz and bzip2 through the same FASTA/FASTQ
-parser instead of inflating the entire file first. Parser buffers can still grow
-for a long individual record, and extracted feature vectors remain in memory.
+See [format notes](FORMAT.md) and [troubleshooting](TROUBLESHOOTING.md).

@@ -1,17 +1,17 @@
 # Zindex
 
-[![CI](https://github.com/Malfoy/Zindex/actions/workflows/ci.yml/badge.svg)](https://github.com/Malfoy/Zindex/actions/workflows/ci.yml)
+Zindex efficiently reports the number of matches between a query sequence and
+every dataset in an indexed collection.
 
-Zindex searches sequence collections using compact approximate membership
-indexes. It supports minimizers, k-mers, spaced seeds and randstrobemers, and
-reports the datasets matching each query. Similar datasets can share a filter
-while retaining their individual membership.
+Zindex combines compact ZOR filters with color-preserving merging: similar
+datasets share a filter while retaining their individual membership. A
+sketch-based planner chooses space-saving merges and groups filters into
+power-of-two subindexes, whose interleaved cells support SIMD queries.
+An optimized implementation of low-density open-closed mod minimizers reduces
+the number of indexed seeds; ordinary k-mers, spaced seeds and randstrobemers
+are also supported.
 
 ## Install
-
-Use Rust through rustup (the repository selects Rust 1.97.0) and a C/C++ toolchain.
-On Debian/Ubuntu, native build dependencies are `build-essential pkg-config`.
-Python 3 and Bash are needed for the examples. Linux x86-64 is tested in CI.
 
 ```bash
 git clone https://github.com/Malfoy/Zindex.git
@@ -19,93 +19,108 @@ cd Zindex
 cargo build --release --locked
 ```
 
-Build on the machine where you will run the tools: native CPU instructions are
-enabled by default. See [troubleshooting](docs/TROUBLESHOOTING.md) for portable
-builds, compiler details and installation problems.
+## Usage
 
-## Try the bundled example
+[Ten real bacterial genomes](tests/data/bacteria/README.md), compressed as
+FASTA.gz, are bundled with query sequences. Run the examples from the repository
+root; no downloads are needed.
+
+### Build an index
+
+Start by indexing every 31-mer:
+
+```bash
+./target/release/zorindex build --fof tests/data/bacteria/samples.fof \
+  --output bacteria.zindex --k 31
+```
+
+The file passed to `--fof` lists one dataset per line. The output is a new index
+directory.
+
+For a smaller index, select 31-base minimizers from 49-base windows:
+
+```bash
+./target/release/zorindex build --fof tests/data/bacteria/samples.fof \
+  --output bacteria.min.zindex --k 49 --index-mode minimizers --minimizer-size 31
+```
+
+This uses low-density open-closed mod minimizers by default.
+
+To use spaced seeds, supply a symmetric pattern (`#` retains a base, `_` skips it):
+
+```bash
+./target/release/zorindex build --fof tests/data/bacteria/samples.fof \
+  --output bacteria.spaced.zindex --k 21 --seed-pattern '#_#_#_#_#_#_#_#_#_#_#'
+```
+
+To use randstrobemers, link two 21-base strobes with start positions 25–100 bases
+apart:
+
+```bash
+./target/release/zorindex build --fof tests/data/bacteria/samples.fof \
+  --output bacteria.strobe.zindex --k 21 --randstrobemers \
+  --strobe-min 25 --strobe-max 100
+```
+
+### Query an index
+
+Query the simple 31-mer index with a 1-kb fragment from the first genome:
+
+```bash
+./target/release/zorindex query --index bacteria.zindex \
+  --query tests/data/bacteria/query.fa
+```
+
+The result gives each dataset's match count and the fraction of query seeds
+matched. Membership is approximate, so absent seeds can also match.
+
+To report only datasets matching at least 80% of the query seeds:
+
+```bash
+./target/release/zorindex query --index bacteria.zindex \
+  --query tests/data/bacteria/query.fa --min-ratio 0.8
+```
+
+To report each FASTA query separately, use `--records`. The bundled queries
+include a fragment from each genome, its reverse complement and a negative
+control:
+
+```bash
+./target/release/zorindex query --index bacteria.zindex \
+  --query tests/data/bacteria/queries.fa --records --min-ratio 0.8
+```
+
+The output contains `query_id`, `valid_kmers` (selected seed count) and `hits`.
+A hit such as `0:970` means 970 matches in dataset 0; dataset IDs follow the
+input list's order.
+
+To query an alternative index, change only `--index`; seed settings are read
+automatically from the index:
+
+```bash
+./target/release/zorindex query --index bacteria.min.zindex \
+  --query tests/data/bacteria/queries.fa --records --min-ratio 0.8
+```
+
+The optional checker builds the k-mer and minimizer indexes and verifies that
+every positive query matches its source genome:
 
 ```bash
 bash utils/scripts/demo.sh
 ```
 
-No downloads are required. The [tiny dataset](tests/data/tiny/README.md) contains
-three 8-kb references and six 1-kb queries, with expected answers for shared
-sequences, dataset-specific sequences, reverse complements and a negative read.
-The script checks all three tools and ends with:
+### Use your own data
 
-```text
-PASS: example queries and all three tools
-```
+Create a file with one FASTA/FASTQ path per line and pass it through `--fof`.
+Dataset names can precede paths, separated by a tab. Gzip, zstd, xz and bzip2
+inputs are supported.
 
-Logs and results are retained in a new temporary directory whose path is printed.
-For an optional example using **three real bacterial genomes**, see the
-[checksum-verified download and query instructions](tests/data/bacteria/README.md).
+See the [usage guide](docs/USAGE.md) for additional seed schemes, query options
+and memory settings, or the [standalone minimizer utility](utils/minimizer-fasta/README.md)
+for exporting selected seeds.
 
-## Index your own collection
+## Citation
 
-Create `samples.fof` with one FASTA/FASTQ path per line, or a dataset name and
-path separated by a tab. Relative paths use the command's working directory.
-Gzip, zstd, xz and bzip2 inputs are supported; use the corresponding suffix.
+TBD.
 
-```bash
-./target/release/zorindex build --fof samples.fof --output samples.zindex \
-  --k 49 --index-mode minimizers --minimizer-size 31 --fingerprint-bits 16
-./target/release/zorindex query --index samples.zindex --query reads.fa.gz \
-  --records --min-ratio 0.8
-./target/release/zorindex info --index samples.zindex
-```
-
-The index output must be a new directory. Query extraction settings are reused
-automatically from the index. Inspect `info` and any skipped-document report to
-confirm which inputs were included.
-
-## Read the results
-
-`--records` reports each query FASTA record separately:
-
-```text
-query_id    valid_kmers    hits
-read_1      100            0:100,2:93
-```
-
-This read has 100 selected seed occurrences; datasets 0 and 2 match 100 and 93.
-Dataset IDs refer to the manifest's `colors` array. In minimizer mode, counts
-refer to selected seeds, not all k-mer windows or covered bases. Membership is
-approximate, so absent seeds can match.
-
-Without `--records`, results aggregate over the entire FASTA/FASTQ file.
-Per-record reporting is available for merged indexes except findere.
-See [output formats and modes](docs/USAGE.md#query) for details.
-
-## Documentation
-
-- [Full usage, defaults, memory controls and seed options](docs/USAGE.md)
-- [Standalone minimizer FASTA generator](utils/minimizer-fasta/README.md)
-- [Bindex comparison commands](docs/COLLABORATOR.txt)
-- [Benchmarking](docs/BENCHMARKING.md) and [manuscript artifact status](docs/REPRODUCIBILITY.md)
-- [Formats](docs/FORMAT.md), [changelog](docs/CHANGELOG.md), and [contributing](.github/CONTRIBUTING.md)
-
-The build produces `zorindex`, `bloomindex` (the Bloom-filter comparison tool),
-and `minimizer-fasta` under `target/release/`. Zindex defaults to streaming merge
-planning; minimizer mode uses open-closed mod selection. Other seed modes and
-legacy layouts are described in the usage guide.
-
-## Tests
-
-```bash
-cargo test --workspace --release --locked
-```
-
-The Rust suite has 389 unit/integration tests plus a doctest, covering extraction,
-filter layouts, compression, query modes, parallelism and memory controls.
-CI runs native and portable x86-64 release tests, the bundled demonstration,
-and a tiny-input check of the benchmark recorder.
-
-## Citation and license
-
-See [CITATION.cff](CITATION.cff) for software citation metadata and record the
-release or Git revision used. Zindex builds on Antoine Limasset's
-[ZOR Filters: Fast and Smaller Than Fuse Filters (SEA 2026)](https://doi.org/10.4230/LIPIcs.SEA.2026.24).
-
-[MIT license](LICENSE); vendored dependencies retain their licenses and notices.
+[MIT license](LICENSE).

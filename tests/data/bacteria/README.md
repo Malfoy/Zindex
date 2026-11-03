@@ -1,45 +1,50 @@
-# Optional real bacterial example
+# Bacterial example
 
-This example downloads three complete RefSeq assemblies: E. coli K-12 MG1655,
-E. coli O157:H7 Sakai, and B. subtilis 168. Together they contain about 14.5 Mb
-of sequence and require only a few megabytes of compressed downloads.
-Python 3.9 or newer and internet access are required. The regular synthetic
-demonstration and CI tests do not download these genomes.
+Ten real RefSeq bacterial assemblies are bundled under `genomes/`.
+They were selected from [the accession list](../../../docs/benchmarks/accessions_128_bacterial.txt)
+with random seed 20261102. Accession versions, original NCBI URLs and checksums
+are recorded in [assemblies.json](assemblies.json) and [sources.json](sources.json).
 
-From the repository root, after `cargo build --release --locked`:
+## Build and query
+
+From the repository root:
 
 ```bash
-python3 utils/scripts/prepare_bacteria_example.py --output /tmp/zindex-bacteria
-./target/release/zorindex build --fof /tmp/zindex-bacteria/samples.fof \
-  --output /tmp/zindex-bacteria/index --k 49 --index-mode minimizers \
-  --minimizer-size 31 --fingerprint-bits 16 --skip-oversized-documents=false
-./target/release/zorindex query --index /tmp/zindex-bacteria/index \
-  --query /tmp/zindex-bacteria/queries.fa --records --min-ratio 0.8 \
-  > /tmp/zindex-bacteria/hits.tsv
-python3 utils/scripts/prepare_bacteria_example.py --check-results /tmp/zindex-bacteria/hits.tsv
+./target/release/zorindex build --fof tests/data/bacteria/samples.fof \
+  --output bacteria.zindex --k 31
+./target/release/zorindex query --index bacteria.zindex \
+  --query tests/data/bacteria/query.fa
 ```
 
-The download directory must be new. Each compressed genome is checked against
-the NCBI MD5 value pinned in [assemblies.json](assemblies.json). Full gzip
-decoding verifies its trailer. `sources.json` additionally records SHA-256
-identities, URLs, retrieval time, byte/base counts and original document IDs.
-`samples.fof` is only published after all files and query records validate.
-Failed downloads retain diagnostics but do not publish a usable FOF.
+`samples.fof` contains one named assembly per line. `query.fa` contains a
+1-kb fragment from the first assembly.
 
-For each assembly, the first contiguous 1,000-base ACGT run supplies a forward
-query and its reverse complement. `source-truth.tsv` records the assembly,
-contig, zero-based start and strand. A seventh query is a deterministic uniform
-random control. The checker requires every positive's selected minimizers to
-match its source dataset; additional hits in related genomes are allowed.
-The random control is reported, not used as a false-positive-rate calibration.
+## Use minimizers and multiple queries
 
-Pinned sources:
+```bash
+./target/release/zorindex build --fof tests/data/bacteria/samples.fof \
+  --output bacteria.min.zindex --k 49 --index-mode minimizers --minimizer-size 31
+./target/release/zorindex query --index bacteria.min.zindex \
+  --query tests/data/bacteria/queries.fa --records --min-ratio 0.8 > matches.tsv
+python3 utils/scripts/prepare_bacteria_example.py --check-results matches.tsv \
+  --truth tests/data/bacteria/source-truth.tsv
+```
 
-- [E. coli K-12 MG1655, GCF_000005845.2](https://www.ncbi.nlm.nih.gov/datasets/genome/GCF_000005845.2/)
-- [E. coli Sakai, GCF_000008865.2](https://www.ncbi.nlm.nih.gov/datasets/genome/GCF_000008865.2/)
-- [B. subtilis 168, GCF_000009045.1](https://www.ncbi.nlm.nih.gov/datasets/genome/GCF_000009045.1/)
+`queries.fa` contains a 1-kb fragment from each genome, its reverse complement,
+and a random negative control. `source-truth.tsv` records each positive's
+source dataset, contig, offset and strand. Related assemblies can also match;
+the checker verifies that every positive matches its source.
 
-Each assembly's NCBI directory exposes `md5checksums.txt`; the pinned checksums
-were verified there on 2026-11-02. If an upstream file is unavailable or its
-checksum changes, the script fails instead of silently substituting an assembly.
-This is a small functional example, not the manuscript benchmark collections.
+The optional checker runs both index modes in a new temporary directory:
+
+```bash
+bash utils/scripts/demo.sh
+```
+
+## Retrieve the original files again
+
+```bash
+python3 utils/scripts/prepare_bacteria_example.py --output /tmp/bacteria-originals
+```
+
+Downloads are checked against pinned NCBI checksums. A changed file is rejected.

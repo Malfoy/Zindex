@@ -9,12 +9,11 @@ defaults must not be described as reproducing those large-collection results.
 
 | Material | Location | What it establishes |
 |---|---|---|
-| Fixed tiny inputs and expected hits | `tests/data/tiny/`, `utils/scripts/demo.sh` | Installation and functional behavior |
+| Bundled bacterial genomes and source queries | `tests/data/bacteria/`, `utils/scripts/demo.sh` | Installation and functional behavior |
 | Correctness tests | `tests/`, workspace unit tests | Covered extraction, storage, query and CLI combinations |
 | One-run measurement runner | `utils/scripts/benchmark_zindex.py` | Reproducible commands, timing boundaries and artifact capture on a supplied collection |
 | Historical optimization summaries | `docs/OPTIMIZATION_BENCHMARK.txt`, `docs/GENERAL_CASE_OPTIMIZATIONS.md` | Recorded measurements of their explicitly identified historical versions |
 | Small bacterial accession list | `docs/benchmarks/accessions_128_bacterial.txt` | A list of 128 accessions, not the manuscript collections |
-| Optional three-genome example | `tests/data/bacteria/`, `utils/scripts/prepare_bacteria_example.py` | Verified downloads and source-mapped forward/reverse queries |
 
 Historical summaries refer to local, git-ignored experiment directories. Those
 paths identify provenance; they are not downloadable artifacts. Their frozen
@@ -37,8 +36,7 @@ bundle needs:
 4. Query sequences or generation scripts, source-document truth, read lengths,
    random seeds and complete substitution/insertion/deletion models. Platform
    labels alone do not specify a simulator distribution.
-5. Comparator versions, commands and equivalent extraction/threshold settings;
-   native Zindex OCM and Bindex SIMD defaults do not select identical seeds.
+5. Comparator versions, commands and equivalent extraction/threshold settings.
 6. Raw timing/RSS reports, index manifests and sizes, error exits and interrupted
    points, plus machine-readable plot data and plotting scripts.
 

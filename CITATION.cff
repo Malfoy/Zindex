@@ -1,7 +1,7 @@
 cff-version: 1.2.0
-message: "Please cite Zindex and record the release or exact Git revision used."
+message: "TBD — preprint forthcoming."
 type: software
-title: "Zindex: approximate membership indexes for sequence collections"
+title: "Zindex"
 authors:
   - name: "Zindex contributors"
 repository-code: "https://github.com/Malfoy/Zindex"

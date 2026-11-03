@@ -8,8 +8,7 @@ tagged release. Existing published release tags have not been moved.
 - Simplify the landing page and consolidate the repository into five main
   directories: src, tests, utils, docs and vendor. Move fixtures under tests/data,
   helper scripts under utils/scripts, and build support under .cargo.
-- Add an optional, checksum-verified three-genome bacterial example alongside
-  the bundled synthetic demonstration.
+- Bundle ten real bacterial assemblies and source-mapped example queries.
 
 - Pin the tested Rust 1.97.0 toolchain for local and CI builds, avoiding the
   Rust 1.99.1 native-target LLVM failure observed in the Bzip2 dependency.
@@ -24,8 +23,6 @@ tagged release. Existing published release tags have not been moved.
 - Add construction memory controls and explicit reports for skipped documents.
 - Add independent Zstd frames and lossless `repack-subindexes` for parallel
   loading, plus additional planner and query execution improvements.
-- Accept odd minimizer windows up to 255 in Bindex, including loading those
-  indexes; dense k-mer/modimizer keys remain limited to 31 bases.
 - Add a checked small demonstration, build-revision reporting, corrected
   documentation, and a one-run benchmark artifact recorder.
 

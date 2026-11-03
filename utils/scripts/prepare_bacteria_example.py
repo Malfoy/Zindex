@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download three pinned bacterial assemblies, or check their example query results."""
+"""Retrieve the example assemblies or check source-query matches."""
 import argparse
 import csv
 import datetime
@@ -117,7 +117,11 @@ def prepare(output, manifest=ASSEMBLIES):
                 name = entry["accession"] + "_" + strand
                 queries.append(">" + name + "\n" + dna + "\n")
                 truth.append([name, str(document_id), entry["accession"], contig, str(start), strand])
-        queries.append(">random_negative\n" + negative_query() + "\n")
+        (output / "query.fa").write_text(queries[0])
+        (output / "positive.fa").write_text("".join(queries))
+        negative = ">random_negative\n" + negative_query() + "\n"
+        (output / "negative.fa").write_text(negative)
+        queries.append(negative)
         truth.append(["random_negative", "-", "-", "-", "-", "-"])
         (output / "queries.fa").write_text("".join(queries))
         with (output / "source-truth.tsv").open("w", newline="") as dest:
@@ -137,8 +141,8 @@ def prepare(output, manifest=ASSEMBLIES):
     print("Prepared " + str(output / "samples.fof"))
 
 
-def check_results(path):
-    with path.with_name("source-truth.tsv").open(newline="") as source:
+def check_results(path, truth=None):
+    with (truth or path.with_name("source-truth.tsv")).open(newline="") as source:
         expected = list(csv.DictReader(source, delimiter="\t"))
     with path.open(newline="") as source:
         rows = list(csv.DictReader(source, delimiter="\t"))
@@ -163,11 +167,12 @@ def main():
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument("--output", type=Path, help="Download into a new directory (never reused)")
     modes.add_argument("--check-results", type=Path, help="Check hits.tsv next to the generated source-truth.tsv")
+    parser.add_argument("--truth", type=Path, help="Source truth for --check-results")
     args = parser.parse_args()
     if args.output is not None:
         prepare(args.output)
     else:
-        check_results(args.check_results)
+        check_results(args.check_results, args.truth)
 
 
 if __name__ == "__main__":

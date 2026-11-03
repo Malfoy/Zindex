@@ -47,6 +47,10 @@ class BacteriaExampleTests(unittest.TestCase):
             sequences = (output / "queries.fa").read_text().splitlines()[1::2]
             self.assertEqual(len(sequences), 3)
             self.assertEqual(sequences[1], example.reverse_complement(sequences[0]))
+            self.assertEqual((output / "query.fa").read_text(),
+                             ">GCF_example.1_forward\n" + sequences[0] + "\n")
+            self.assertEqual((output / "queries.fa").read_text(),
+                             (output / "positive.fa").read_text() + (output / "negative.fa").read_text())
             hits = output / "hits.tsv"
             hits.write_text("query_id\tvalid_kmers\thits\n" + "".join(
                 r["query_id"] + "\t100\t" + ("0:100" if r["document_id"] != "-" else "") + "\n"

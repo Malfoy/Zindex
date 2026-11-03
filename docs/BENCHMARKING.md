@@ -64,33 +64,6 @@ or claim cold-cache measurements. Construction and earlier reads affect cache
 state. Record that policy alongside any reported results. Run configurations
 sequentially on an otherwise idle machine.
 
-## Comparable Bloom and ZOR experiments
-
-Bindex uses SIMD minimizers. Match this explicitly in Zindex rather than
-comparing Bindex's selector to Zindex's default OCM selector:
-
-```bash
-mkdir -p /results/comparison
-./target/release/zorindex build --fof samples.fof \
-  --k 49 --index-mode minimizers --minimizer-size 31 --minimizer-scheme simd \
-  --fingerprint-bits 16 --output /results/comparison/zindex
-./target/release/bloomindex build --fof samples.fof \
-  --k 49 --index-mode minimizers --minimizer-size 31 \
-  --hashes 4 --false-positive-rate 0.0000152587890625 \
-  --output /results/comparison/bindex.blmidx
-```
-
-Use the same query file, thread count and reporting semantics in both tools.
-Bindex has aggregate reporting; for that comparison, omit Zindex's `--records`
-and use the same `--min-ratio`. Record total extracted query features to verify
-that the selectors/inputs agree. Use GNU time around each command and retain its
-output. Neither shared numerical FPR settings nor similar seed counts guarantee
-identical approximate answers.
-
-Bloom's automatically sized bits/item for hash count `h` and target `p` are
-`-h / ln(1 - p^(1/h))`. Varying hashes can change the resulting size.
-Zindex's recovery map and origin bits are additional to its fingerprint payload.
-
 ## Accuracy and historical experiments
 
 The runner preserves query output; it cannot infer source-document truth from
@@ -102,7 +75,7 @@ of per-feature false-positive probability.
 Historical measurements retain their original settings and timing definitions.
 See [REPRODUCIBILITY.md](REPRODUCIBILITY.md) for the current artifact inventory
 and missing material needed to reproduce the manuscript's large collections.
-The tiny demonstration and this runner do not reproduce unpublished experiments.
+The bundled example and this runner do not reproduce unpublished experiments.
 
 ## Legacy slice-compression experiments
 
