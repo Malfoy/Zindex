@@ -8,7 +8,7 @@ The default selection is **canonical SimdMinimizers 2.3.1**, matching the origin
 `benchmark-simd-minimizers` / gzip benchmark generators. Select
 `--minimizer-scheme open-closed-mod` (alias `ocm`) to use the same optimized
 canonical open-closed mod iterator as native Zindex. Both tools share the
-dependency-free `ocm-minimizers` crate; there is no separate copied iterator to
+dependency-free `ocm-minimizers` crate. There is no separate copied iterator to
 drift out of sync. Existing benchmark inputs and ongoing experiments are not
 changed by installing it.
 
@@ -20,12 +20,12 @@ From the repository root:
 cargo build --release -p minimizer-fasta
 ```
 
-Only this utility and its dependencies are built; the index implementation is
+Only this utility and its dependencies are built. The index implementation is
 not a dependency. The workspace release profile uses optimization level3,
 fat LTO, one codegen unit, stripped symbols and panic=abort. The repository's
 `.cargo/config.toml` sets `target-cpu=native`, enabling AVX2 or NEON on supported
 hosts. Rebuild on each target machine: a native binary need not run on older CPUs.
-The JSON summary reports `AVX2`, `NEON` or `scalar`; builds without either SIMD
+The JSON summary reports `AVX2`, `NEON` or `scalar`. Builds without either SIMD
 feature use the dependency's portable scalar fallback.
 
 Alternatively install the utility, explicitly keeping native CPU optimization:
@@ -44,17 +44,17 @@ RUSTFLAGS='-C target-cpu=native' cargo install --path utils/minimizer-fasta --lo
 gzip -dc input.fa.gz | ./target/release/minimizer-fasta - - > output.fa
 ```
 
-`--k` is the **seed length** (default31); `--window` / `-w` is the number of
+`--k` is the **seed length** (default31). `--window` / `-w` is the number of
 candidate k-mers per window (default19). The total span is `k + window - 1`
 (49 bases by default). The span must be odd for canonical strand tie-breaking.
 Supported seed lengths are1..64 for `simd`, 1..31 for `open-closed-mod`, and
-window counts1..65535. `--seed` defaults to69 and controls OCM's hash ordering;
+window counts1..65535. `--seed` defaults to69 and controls OCM's hash ordering.
 the legacy SIMD selector keeps its original hashing regardless of this setting.
 For example, utility `--k 31 --window 19 --minimizer-scheme open-closed-mod`
-matches Zindex `--k 49 --minimizer-size 31 --minimizer-scheme open-closed-mod`.
+matches Zindex `--index-mode minimizers --k 31 --window 19 --minimizer-scheme open-closed-mod`.
 No seed is selected
 from an ACGT run shorter than the full window span. Upper/lowercase and sequence
-whitespace are normalized; non-ACGT bases split runs. Record and ambiguity
+whitespace are normalized. Non-ACGT bases split runs. Record and ambiguity
 boundaries are never crossed. FASTQ is intentionally rejected: this is a FASTA
 utility, matching the original generator.
 
@@ -66,7 +66,7 @@ including positions in runs too short for a full selection window.
 
 Input compression is detected from magic bytes: plain, gzip (including multiple
 members), zstd, xz and bzip2 are supported. `-` supports stdin/stdout. Named
-output files are **never overwritten**. An I/O error returns a nonzero status;
+output files are **never overwritten**. An I/O error returns a nonzero status.
 any partial output remains available for diagnosis and is not silently reused.
 
 ## Collections
@@ -77,7 +77,7 @@ any partial output remains available for diagnosis and is not silently reused.
   --fof samples.fof --output-dir ocm-minimizers --gzip
 ```
 
-The FOF accepts `path` or `name<TAB>path`; blank/comment lines are ignored.
+The FOF accepts `path` or `name<TAB>path`. Blank/comment lines are ignored.
 Relative input paths are resolved against the current working directory.
 Files are processed concurrently using the same affinity-sized Rayon pool as
 within-file chunk processing, not a nested worker pool for every genome.
@@ -90,7 +90,7 @@ files or a manifest cause an error instead of being overwritten or resumed.
 
 ## Performance and compression
 
-- Defaults to all CPUs available to the process; `--threads` overrides this.
+- Defaults to all CPUs available to the process. `--threads` overrides this.
 - SIMD selection uses Ragnar Groot Koerkamp and Igor Martayan's SimdMinimizers.
 - OCM selection uses Zindex's four-lane AVX2 kernel, full-width 64-bit hashes,
   prefix/suffix sliding minima, and a portable fallback. OCM writes positions
@@ -99,7 +99,7 @@ files or a manifest cause an error instead of being overwritten or resumed.
 - FASTA parsing uses Helicase's SIMD block lexer, not its record-buffering API.
   DNA spans are normalized and counted in bulk, without retaining complete
   chromosomes. `vendor/helicase` contains upstream 1.2.0 with a small API-only
-  exposure of its SIMD block classifier; upstream parsing algorithms are unchanged.
+  exposure of its SIMD block classifier. Upstream parsing algorithms are unchanged.
   Fallible block reads propagate errors. Magic-based gzip/xz/zstd/bzip2
   decoding also applies to stdin and the library `generate` API. Decoder errors
   are returned rather than triggering a parser panic or silently accepting EOF.
@@ -109,19 +109,19 @@ files or a manifest cause an error instead of being overwritten or resumed.
   deduplication. Distinct positions are never collapsed by k-mer value.
 - Worker-local packed DNA, position/bitset arrays and output buffers are reused.
   Canonicalization uses a stack buffer, not a heap allocation per seed.
-- Dedicated parsing/writing threads and bounded channels overlap I/O and compute;
+- Dedicated parsing/writing threads and bounded channels overlap I/O and compute.
   full input records, full output files and collection-wide seed sets are not
-  retained. `--chunk-bases` defaults to262144; context is added automatically.
+  retained. `--chunk-bases` defaults to262144. Context is added automatically.
 - Output gzip is compressed in parallel with the accelerated zlib-rs backend,
   using standard **concatenated gzip members** in original chunk order.
   Consumers must read all members (e.g. `gzip -dc`, Python `gzip`, Rust
   `MultiGzDecoder`). A single-member-only `GzDecoder` will stop too early.
-- `.gz` / `.gz.partial` enables gzip automatically; `--gzip` forces it.
+- `.gz` / `.gz.partial` enables gzip automatically. `--gzip` forces it.
   `--gzip-level` defaults to1 and accepts0..9. The original benchmark helper
-  used level6; compressed bytes/sizes may differ, but decompressed FASTA content
+  used level6. Compressed bytes/sizes may differ, but decompressed FASTA content
   and selected positions are unchanged.
 - A normal single-member gzip input still has one sequential decompressor per
-  file; the utility does not claim parallel inflation of one DEFLATE stream.
+  file. The utility does not claim parallel inflation of one DEFLATE stream.
 
 JSON statistics go to stdout, or stderr when FASTA itself is written to stdout.
 They include `minimizer_scheme` and `seed` alongside the previous fields.

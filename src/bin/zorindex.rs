@@ -56,7 +56,7 @@ enum Command {
     Append(AppendArgs),
     /// Change slice compression in a legacy --plain index.
     Repack(RepackArgs),
-    /// Reframe merged subindexes for parallel decoding; preserve all filter bytes.
+    /// Reframe merged subindexes for parallel decoding. Preserve all filter bytes.
     RepackSubindexes {
         #[arg(long)]
         index: PathBuf,
@@ -82,10 +82,13 @@ struct BuildArgs {
     #[arg(long)]
     fof: PathBuf,
 
-    /// K-mer window length. Full k-mer/modimizer modes are limited to 1..=31;
-    /// minimizer/findere modes may use larger windows because only shorter features are encoded.
+    /// Seed length in bases (1..=31), or reconstructed k-mer length for findere (up to 255).
     #[arg(short = 'k', long)]
     k: usize,
+
+    /// Number of consecutive k-mers per minimizer window. The span is k + window - 1 bases.
+    #[arg(short = 'w', long, required_if_eq("index_mode", "minimizers"))]
+    window: Option<usize>,
 
     /// Output index path.
     #[arg(short, long)]
@@ -111,11 +114,7 @@ struct BuildArgs {
     #[arg(long, alias = "z", default_value_t = zorindex::findere::DEFAULT_Z)]
     findere_z: usize,
 
-    /// Canonical minimizer length when --index-mode minimizers is used.
-    #[arg(long, default_value_t = DEFAULT_MINIMIZER_SIZE)]
-    minimizer_size: usize,
-
-    /// Minimizer selector; persisted for queries and updates. Legacy indexes use simd.
+    /// Minimizer selector, persisted for queries and updates. Legacy indexes use simd.
     #[arg(long, value_enum, default_value = "open-closed-mod")]
     minimizer_scheme: MinimizerScheme,
 
@@ -123,7 +122,7 @@ struct BuildArgs {
     #[arg(long, alias = "homocompress")]
     homopolymer_compression: bool,
 
-    /// Symmetric #/_ pattern, width k (or minimizer size m); mask after minimizer selection.
+    /// Symmetric #/_ pattern of width k, applied after minimizer selection.
     #[arg(long, alias = "spaced-seed")]
     seed_pattern: Option<SpacedSeed>,
 
@@ -131,11 +130,11 @@ struct BuildArgs {
     #[arg(long, alias = "randstrobes")]
     randstrobemers: bool,
 
-    /// Inclusive minimum distance between strobe starts, in bases (default: k or m).
+    /// Inclusive minimum distance between strobe starts, in bases (default: k).
     #[arg(long, alias = "strobe-window-min", requires = "randstrobemers")]
     strobe_min: Option<usize>,
 
-    /// Inclusive maximum distance between strobe starts, in bases (default: 3 times k or m).
+    /// Inclusive maximum distance between strobe starts, in bases (default: 3 times k).
     #[arg(long, alias = "strobe-window-max", requires = "randstrobemers")]
     strobe_max: Option<usize>,
 
@@ -599,6 +598,7 @@ fn main() -> Result<()> {
 
 fn build_command(args: BuildArgs) -> Result<()> {
     validate_build_args(&args)?;
+    let span = extraction_span_from_args(&args)?;
     if args.merge.power_of_two_merge && !args.plain {
         ensure!(
             args.technical_layout == TechnicalLayoutMode::Flat,
@@ -617,7 +617,7 @@ fn build_command(args: BuildArgs) -> Result<()> {
             .unwrap_or(zorindex::power_merge::DEFAULT_SEGMENT_LENGTH);
         let config = zorindex::power_merge::BuildConfig {
             backend: zorindex::power_merge::Backend::Zor,
-            k: args.k,
+            k: span,
             hashes: args.hashes,
             seed: args.seed,
             fingerprint_bits: args.fingerprint_bits as usize,
@@ -660,7 +660,7 @@ fn build_command(args: BuildArgs) -> Result<()> {
         feature_config.mode.label(),
         build_jobs
     );
-    let mut summaries = summarize_inputs(&inputs, args.k, args.seed, feature_config, build_jobs)?;
+    let mut summaries = summarize_inputs(&inputs, span, args.seed, feature_config, build_jobs)?;
     summaries.sort_by(|left, right| left.input.name.cmp(&right.input.name));
 
     let technical_plan = choose_zor_technical_layout(&summaries, &args)?;
@@ -711,9 +711,7 @@ fn build_command(args: BuildArgs) -> Result<()> {
     for chunk in color_plans.chunks(build_jobs) {
         let results = chunk
             .par_iter()
-            .map(|plan| {
-                build_zor_color_parts(plan, args.k, args.seed, feature_config, build_config)
-            })
+            .map(|plan| build_zor_color_parts(plan, span, args.seed, feature_config, build_config))
             .collect::<Result<Vec<_>>>()?;
         for result in results {
             for part in result.parts {
@@ -757,7 +755,7 @@ fn build_command(args: BuildArgs) -> Result<()> {
     let total_abandoned = colors.iter().map(|c| c.abandoned).sum::<u64>();
 
     let index = ZorIndex {
-        k: args.k,
+        k: span,
         hashes: args.hashes,
         fingerprint_bits: args.fingerprint_bits,
         seed: args.seed,
@@ -809,7 +807,11 @@ fn append_command(args: AppendArgs) -> Result<()> {
     eprintln!(
         "parsing {} new color files with k={} and index_mode={}",
         inputs.len(),
-        index.k,
+        if index.feature_config.mode == IndexMode::Minimizers {
+            index.feature_config.minimizer_size
+        } else {
+            index.k
+        },
         index.feature_config.mode.label()
     );
     let mut parsed = inputs
@@ -1049,7 +1051,11 @@ fn query_command(args: QueryArgs) -> Result<()> {
     println!(
         "#query\t{}\tk={}\tindex_mode={}\ttotal_features={}\tstack_probes={}\telapsed_s={:.3}",
         args.query.display(),
-        index.k,
+        if index.feature_config.mode == IndexMode::Minimizers {
+            index.feature_config.minimizer_size
+        } else {
+            index.k
+        },
         index.feature_config.mode.label(),
         total_features,
         stack_queries,
@@ -1081,7 +1087,21 @@ fn info_command(args: IndexArg) -> Result<()> {
     let total_unique = index.colors.iter().map(|c| c.unique_kmers).sum::<u64>();
     let total_abandoned = index.colors.iter().map(|c| c.abandoned).sum::<u64>();
     println!("index\t{}", args.index.display());
-    println!("k\t{}", index.k);
+    println!(
+        "k\t{}",
+        if index.feature_config.mode == IndexMode::Minimizers {
+            index.feature_config.minimizer_size
+        } else {
+            index.k
+        }
+    );
+    if index.feature_config.mode == IndexMode::Minimizers {
+        println!(
+            "window\t{}\nwindow_span\t{}",
+            index.k - index.feature_config.minimizer_size + 1,
+            index.k
+        );
+    }
     println!("hashes\t{}", index.hashes);
     println!("fingerprint_bits\t{}", index.fingerprint_bits);
     println!("seed\t{}", index.seed);
@@ -1156,25 +1176,44 @@ fn info_command(args: IndexArg) -> Result<()> {
     Ok(())
 }
 
-fn feature_config_from_args(args: &BuildArgs) -> FeatureConfig {
-    let length = if args.index_mode == IndexMode::Minimizers {
-        args.minimizer_size
+fn extraction_span_from_args(args: &BuildArgs) -> Result<usize> {
+    if args.index_mode == IndexMode::Minimizers {
+        let window = args.window.context("minimizer indexes require --window")?;
+        ensure!(window > 0, "--window must be greater than zero");
+        let span = args
+            .k
+            .checked_add(window - 1)
+            .context("k + window - 1 overflows")?;
+        ensure!(span <= 255, "k + window - 1 must be at most 255 bases");
+        ensure!(
+            span % 2 == 1,
+            "canonical minimizers require an odd k + window - 1 span"
+        );
+        Ok(span)
     } else {
+        ensure!(
+            args.window.is_none(),
+            "--window requires --index-mode minimizers"
+        );
+        Ok(args.k)
+    }
+}
+
+fn feature_config_from_args(args: &BuildArgs) -> FeatureConfig {
+    let minimizer_size = if args.index_mode == IndexMode::Minimizers {
         args.k
+    } else {
+        DEFAULT_MINIMIZER_SIZE
     };
-    FeatureConfig::new(
-        args.index_mode,
-        args.minimizer_size,
-        args.modimizer_sampling,
-    )
-    .with_findere_z(args.findere_z)
-    .with_minimizer_scheme(args.minimizer_scheme)
-    .with_homopolymer_compression(args.homopolymer_compression)
-    .with_seed_pattern(args.seed_pattern)
-    .with_randstrobemers(args.randstrobemers.then_some(RandstrobeConfig {
-        min_distance: args.strobe_min.unwrap_or(length),
-        max_distance: args.strobe_max.unwrap_or(length * 3),
-    }))
+    FeatureConfig::new(args.index_mode, minimizer_size, args.modimizer_sampling)
+        .with_findere_z(args.findere_z)
+        .with_minimizer_scheme(args.minimizer_scheme)
+        .with_homopolymer_compression(args.homopolymer_compression)
+        .with_seed_pattern(args.seed_pattern)
+        .with_randstrobemers(args.randstrobemers.then_some(RandstrobeConfig {
+            min_distance: args.strobe_min.unwrap_or(args.k),
+            max_distance: args.strobe_max.unwrap_or(args.k.saturating_mul(3)),
+        }))
 }
 
 fn validate_build_args(args: &BuildArgs) -> Result<()> {
@@ -1186,7 +1225,10 @@ fn validate_build_args(args: &BuildArgs) -> Result<()> {
         (2..=32).contains(&args.hashes),
         "--hashes must be in 2..=32"
     );
-    validate_feature_config(args.k, feature_config_from_args(args))?;
+    validate_feature_config(
+        extraction_span_from_args(args)?,
+        feature_config_from_args(args),
+    )?;
     fingerprint_bytes(args.fingerprint_bits)
         .with_context(|| "--fingerprint-bits must be 1, 2, 4, 8 or 16")?;
     ensure!(
@@ -1224,7 +1266,7 @@ fn validate_feature_config(k: usize, config: FeatureConfig) -> Result<()> {
     config.validate_anchors(k)?;
     ensure!(
         (1..=31).contains(&config.minimizer_size),
-        "--minimizer-size must be in 1..=31"
+        "minimizer seed length (--k) must be in 1..=31"
     );
     ensure!(
         config.modimizer_sampling > 0,
@@ -1241,10 +1283,13 @@ fn validate_feature_config(k: usize, config: FeatureConfig) -> Result<()> {
             );
         }
         IndexMode::Minimizers => {
-            ensure!(k % 2 == 1, "canonical minimizer indexes require odd k");
+            ensure!(
+                k % 2 == 1,
+                "canonical minimizer indexes require an odd window span"
+            );
             ensure!(
                 (1..=k).contains(&config.minimizer_size),
-                "--minimizer-size must be in 1..=k for minimizer indexes"
+                "minimizer seed length must be in 1..=window span"
             );
         }
         IndexMode::Modimizers => {
@@ -2514,7 +2559,12 @@ fn build_union_graph_streaming(
     eprintln!("building optional union graph filter");
     let mut union = Vec::new();
     for plan in color_plans {
-        let parsed = parse_color(&plan.input, args.k, args.seed, feature_config)?;
+        let parsed = parse_color(
+            &plan.input,
+            extraction_span_from_args(args)?,
+            args.seed,
+            feature_config,
+        )?;
         union.extend_from_slice(&parsed.kmers);
     }
     union.sort_unstable();
@@ -4980,6 +5030,72 @@ mod tests {
     use zorindex::{scan_canonical_kmers, ZSTD_FRAME_MAGIC};
 
     #[test]
+    fn minimizer_cli_uses_seed_length_and_kmer_window_count() {
+        for (k, window, span) in [(31, 19, 49), (30, 20, 49), (31, 1, 31), (1, 255, 255)] {
+            let Command::Build(args) = Cli::try_parse_from([
+                "zorindex",
+                "build",
+                "--fof",
+                "inputs.fof",
+                "--output",
+                "index",
+                "--index-mode",
+                "minimizers",
+                "-k",
+                &k.to_string(),
+                "-w",
+                &window.to_string(),
+            ])
+            .unwrap()
+            .command
+            else {
+                panic!()
+            };
+            validate_build_args(&args).unwrap();
+            assert_eq!(extraction_span_from_args(&args).unwrap(), span);
+            assert_eq!(feature_config_from_args(&args).minimizer_size, k);
+        }
+    }
+
+    #[test]
+    fn minimizer_cli_rejects_ambiguous_or_invalid_windows_before_io() {
+        let base = [
+            "zorindex",
+            "build",
+            "--fof",
+            "missing.fof",
+            "--output",
+            "index",
+            "--k",
+            "31",
+        ];
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain(["--index-mode", "minimizers"])).is_err()
+        );
+        assert!(Cli::try_parse_from(base.into_iter().chain(["--minimizer-size", "21"])).is_err());
+        for extra in [
+            vec!["--window", "19"],
+            vec!["--index-mode", "minimizers", "--window", "0"],
+            vec!["--index-mode", "minimizers", "--window", "2"],
+            vec!["--index-mode", "minimizers", "--window", "227"],
+            vec![
+                "--index-mode",
+                "minimizers",
+                "--window",
+                "18446744073709551615",
+            ],
+        ] {
+            let Command::Build(args) = Cli::try_parse_from(base.into_iter().chain(extra))
+                .unwrap()
+                .command
+            else {
+                panic!()
+            };
+            assert!(validate_build_args(&args).is_err());
+        }
+    }
+
+    #[test]
     fn queries_default_to_one_resident_subindex_with_explicit_all_ram_opt_in() {
         let args = [
             "zorindex", "query", "--index", "index", "--query", "reads.fa",
@@ -5507,13 +5623,13 @@ mod tests {
             plain: true,
             fof: build_fof,
             k: 5,
+            window: None,
             output: index_path.clone(),
             hashes: 3,
             fingerprint_bits: 8,
             seed: 99,
             index_mode: IndexMode::Kmers,
             findere_z: zorindex::findere::DEFAULT_Z,
-            minimizer_size: DEFAULT_MINIMIZER_SIZE,
             minimizer_scheme: MinimizerScheme::OpenClosedMod,
             homopolymer_compression: false,
             seed_pattern: None,

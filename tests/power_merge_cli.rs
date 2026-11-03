@@ -114,11 +114,11 @@ fn naive_ocm_keeps_singletons_and_first_capacity_with_identical_query_engines() 
             "--output",
             &index,
             "--k",
-            "49",
+            "31",
             "--index-mode",
             "minimizers",
-            "--minimizer-size",
-            "31",
+            "--window",
+            "19",
             "--minimizer-scheme",
             "open-closed-mod",
             "--hashes",
@@ -192,7 +192,9 @@ fn naive_ocm_keeps_singletons_and_first_capacity_with_identical_query_engines() 
             "--output",
             &reverse_index,
             "--k",
-            "49",
+            "21",
+            "--window",
+            "29",
             "--index-mode",
             "minimizers",
             "--hashes",
@@ -220,7 +222,9 @@ fn naive_ocm_keeps_singletons_and_first_capacity_with_identical_query_engines() 
             "--output",
             &full,
             "--k",
-            "49",
+            "21",
+            "--window",
+            "29",
             "--index-mode",
             "minimizers",
             "--merge-planner",
@@ -274,11 +278,11 @@ fn short_default_command_matches_explicit_optimized_settings() {
             "--output",
             &index,
             "--k",
-            "49",
+            "31",
             "--index-mode",
             "minimizers",
-            "--minimizer-size",
-            "31",
+            "--window",
+            "19",
             "--fingerprint-bits",
             "16",
         ];
@@ -843,7 +847,11 @@ fn non_default_hash_counts_and_feature_modes_use_matching_bank_addresses() {
     }
     for mode in ["minimizers", "modimizers"] {
         let index = f.path(mode);
-        build(&inputs, &index, &["--index-mode", mode]);
+        let mut settings = vec!["--index-mode", mode];
+        if mode == "minimizers" {
+            settings.extend(["--k", "21", "--window", "11"]);
+        }
+        build(&inputs, &index, &settings);
         let result = ok(&["query", "--index", &index, "--query", &reference], "4");
         let total: u64 = result
             .lines()
@@ -1053,14 +1061,7 @@ fn all_cell_storage_modes_preserve_all_feature_extractors() {
     for (mode, settings) in [
         (
             "minimizers",
-            vec![
-                "--k",
-                "49",
-                "--index-mode",
-                "minimizers",
-                "--minimizer-size",
-                "31",
-            ],
+            vec!["--k", "31", "--index-mode", "minimizers", "--window", "19"],
         ),
         (
             "findere",
@@ -1332,14 +1333,7 @@ fn sequential_queries_match_full_loading_for_seed_modes_widths_and_thresholds() 
         ("kmers", &[]),
         (
             "minimizers",
-            &[
-                "--index-mode",
-                "minimizers",
-                "--k",
-                "49",
-                "--minimizer-size",
-                "31",
-            ],
+            &["--index-mode", "minimizers", "--k", "31", "--window", "19"],
         ),
         (
             "simd-minimizers",
@@ -1347,9 +1341,9 @@ fn sequential_queries_match_full_loading_for_seed_modes_widths_and_thresholds() 
                 "--index-mode",
                 "minimizers",
                 "--k",
-                "49",
-                "--minimizer-size",
                 "31",
+                "--window",
+                "19",
                 "--minimizer-scheme",
                 "simd",
             ],
@@ -1364,9 +1358,9 @@ fn sequential_queries_match_full_loading_for_seed_modes_widths_and_thresholds() 
                 "--index-mode",
                 "minimizers",
                 "--k",
-                "49",
-                "--minimizer-size",
                 "31",
+                "--window",
+                "19",
                 "--seed-pattern",
                 "#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#",
             ],
@@ -1388,9 +1382,9 @@ fn sequential_queries_match_full_loading_for_seed_modes_widths_and_thresholds() 
                 "--index-mode",
                 "minimizers",
                 "--k",
-                "49",
-                "--minimizer-size",
                 "31",
+                "--window",
+                "19",
                 "--randstrobemers",
                 "--strobe-min",
                 "9",
@@ -1632,14 +1626,7 @@ fn capped_subindexes_route_hashes_and_preserve_membership_across_seed_modes_and_
         ("kmers", &[]),
         (
             "minimizers",
-            &[
-                "--index-mode",
-                "minimizers",
-                "--k",
-                "49",
-                "--minimizer-size",
-                "31",
-            ],
+            &["--index-mode", "minimizers", "--k", "31", "--window", "19"],
         ),
         (
             "spaced",
@@ -1661,9 +1648,9 @@ fn capped_subindexes_route_hashes_and_preserve_membership_across_seed_modes_and_
                 "--index-mode",
                 "minimizers",
                 "--k",
-                "49",
-                "--minimizer-size",
                 "31",
+                "--window",
+                "19",
                 "--randstrobemers",
                 "--strobe-min",
                 "9",
@@ -2049,9 +2036,9 @@ fn repacking_subindexes_preserves_filter_payloads_and_both_query_modes() {
             "--index-mode",
             "minimizers",
             "--k",
-            "49",
-            "--minimizer-size",
             "31",
+            "--window",
+            "19",
             "--min-subindex-documents",
             "1",
             "--hashes",

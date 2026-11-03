@@ -2,6 +2,11 @@
 
 This document describes Zindex's single-file and merged-directory formats. The exact reader and writer implementations are the source of truth.
 
+In minimizer metadata, the stored `k` remains the selection-window span and
+`minimizer_size` is the seed length. CLI `--k K --window W` maps to stored
+`k = K + W - 1` and `minimizer_size = K`. The CLI change does not alter filter
+bytes or require rebuilding existing indexes.
+
 Both formats are written as zstd streams by default. The magic bytes described
 below are the first bytes of the decompressed payload. Readers detect zstd frame
 magic automatically and also accept raw legacy payloads.
@@ -17,14 +22,14 @@ ZORIDX1\0
 Current format version: `10` (readers also accept versions 2, 3, 4, 5, 7, 8 and 9).
 Version 10 changes randstrobemer extraction to downstream-only construction
 and separate two-orientation querying. Version-9 custom-randstrobemer files
-are rejected with a rebuild message; other version-9 indexes remain readable.
+are rejected with a rebuild message. Other version-9 indexes remain readable.
 
 Header fields:
 
 - version
 - `k`
 - ZOR hash count
-- fingerprint width (`1`, `2`, `4`, `8` or `16`); sub-byte fingerprints are packed eight, four or two per byte, with each stack row rounded up to a whole byte
+- fingerprint width (`1`, `2`, `4`, `8` or `16`). Sub-byte fingerprints are packed eight, four or two per byte, with each stack row rounded up to a whole byte
 - flags
 - seed
 - feature mode
@@ -33,9 +38,9 @@ Header fields:
 - findere z byte, only for findere mode
 - minimizer scheme byte: 0 = SIMD, 1 = open-closed mod (version 8)
 - homopolymer-compression byte: 0 = disabled, 1 = enabled (version 8)
-- seed pattern width byte, followed by that many ASCII `#`/`_` bytes;
+- seed pattern width byte, followed by that many ASCII `#`/`_` bytes.
   width 0 disables masking (version 9)
-- randstrobemer enabled byte: 0 = disabled, 1 = enabled; when enabled,
+- randstrobemer enabled byte: 0 = disabled, 1 = enabled. When enabled,
   followed by inclusive minimum and maximum start distances as little-endian
   `u64` values (version 9)
 - ZOR segmented layout
@@ -48,13 +53,13 @@ For sub-byte fingerprints of width `f`, a plain stack row occupies
 `ceil(technical_bin_count * f / 8)` bytes and a standalone filter (including a
 union graph) occupies `ceil(array_length * f / 8)` bytes. Fingerprints are packed
 from the least-significant bits of each byte. Slice codecs operate on these
-packed bytes with a one-byte codec element width; the header retains width `f`.
+packed bytes with a one-byte codec element width. The header retains width `f`.
 Unused final-byte bits are ignored by queries. The 8- and 16-bit layouts are
 unchanged.
 
 Version-9 anchor settings apply to construction, queries and plain-index
 appends. Pattern syntax, symmetry and width, and randstrobemer distances are
-validated on load. Older indexes have neither masking nor randstrobemers;
+validated on load. Older indexes have neither masking nor randstrobemers.
 older readers reject version 9 rather than silently extracting different keys.
 
 The stack can be stored plain or compressed. Plain stacks store all rows as
@@ -92,7 +97,7 @@ CLI when they are not useful for current experiments.
 ## Zindex power-of-two merged directory
 
 Zindex builds a new merged directory by default, regardless of the output
-extension. `--plain` selects the legacy single-file `.zoridx` layout;
+extension. `--plain` selects the legacy single-file `.zoridx` layout.
 `--power-of-two-merge` remains an optional compatibility flag.
 `manifest.json` contains version `8` (or `9` for hash-partitioned indexes), feature/hash settings, dataset identities,
 group members and widths, bank sizes and abandoned-key map metadata.
@@ -118,14 +123,14 @@ Version 8 adds `segment_length`: one fixed power-of-two segment size for every
 filter/subindex, default 64 cells, independent of filter capacity. Array sizes
 remain powers of two and must fit at least `hashes` complete segments. Queries
 use this stored size. Versions 1 through 7 retain their historical size-dependent
-position mapping; changing a version number alone does not convert an index.
+position mapping. Changing a version number alone does not convert an index.
 
 Version 9 adds hash-routed subindexes. `max_subindex_size` stores the build's
-maximum uncompressed slice-payload bytes (default 8 GiB; a power of two).
+maximum uncompressed slice-payload bytes (default 8 GiB. A power of two).
 Oversized finalized size classes are reconstructed as a power-of-two number
 of partitions. Their bank metadata contains a `routing` object with
 `source_slots`, `partition` (zero-based), and `partitions`. Each has
-`slots * partitions == source_slots`; both slot counts and the partition count
+`slots * partitions == source_slots`. Both slot counts and the partition count
 are powers of two. Unpartitioned banks omit `routing`. Partitions are ordered
 by `(source_slots, partition)` and stored in
 `bank-<source_exponent>-part-<partition>-of-<partitions>.zorbank.zst`.
@@ -134,18 +139,18 @@ The route is `splitmix64(key ^ seed ^ 0x34B61D8F29A7C053) & (partitions - 1)`.
 Every key's H positions are computed using the selected bank's **local** slot
 count. Keys are not replicated or queried in other partitions of the same size
 class. Fingerprints and origin bits are unchanged. Each original document and
-merged group appears once per partition of its size class; cross-class duplicate
+merged group appears once per partition of its size class. Cross-class duplicate
 documents, missing partitions, inconsistent members and invalid geometries are
 rejected. Group order may differ between partitions to improve compression.
 Abandoned keys from every partition still enter the single global 32-bit-hash
-multimap; collisions retain the full union of original document IDs.
+multimap. Collisions retain the full union of original document IDs.
 
 `--max-subindexes` and `min_subindex_documents` apply to original size classes
 before hash partitioning. A size class can consequently contain multiple physical
-bank files. Each bank's byte-padded slice payload fits `max_subindex_size`;
+bank files. Each bank's byte-padded slice payload fits `max_subindex_size`.
 its 40-byte header, metadata and query-result memory are outside that cap.
 The bank payload encoding itself is unchanged. Version-9 readers accept the
-optional fixed segment geometry; legacy library configurations without it keep
+optional fixed segment geometry. Legacy library configurations without it keep
 their historical position mapping. Readers before version 9 reject partitioned
 directories, rather than accidentally querying every partition.
 
@@ -154,7 +159,7 @@ four little-endian `u64` values: slots, bits per row, group count and data bytes
 Rows have `ceil(bits_per_row / 8)` bytes. Each row begins with all groups'
 1-, 2-, 4-, 8- or 16-bit fingerprints, followed immediately by their packed origin bits. Singleton
 groups have no origin bits. Group offsets in the manifest describe the original
-complete-payload prefix; the origin-plane offset for group `i` is
+complete-payload prefix. The origin-plane offset for group `i` is
 `group_count * fingerprint_bits + group.offset - i * fingerprint_bits`.
 
 Construction mode does not change the bank encoding or query layout. The default
@@ -162,15 +167,15 @@ two-pass builder records `construction_cell_storage` as
 `two-pass-temporary-disk-packed-tiled-packing` (verified cells staged in files,
 bit-packed at the group's payload width until bank compression). `--low-disk`
 records `two-pass-memory-packed-no-scratch` (the same packed cells retained in
-RAM); `--disk-backed` records `temporary-disk-u64-tiled-packing`. The two-pass
+RAM). `--disk-backed` records `temporary-disk-u64-tiled-packing`. The two-pass
 publication directory contains only final index files. First-pass projected
-capacities may differ from exact final capacities; this does not change the
+capacities may differ from exact final capacities. This does not change the
 planned dataset membership partition.
 
 New builds also record `construction_abandoned_storage`: `memory`,
 `temporary-disk-sorted-runs`, or `omitted`. Missing legacy metadata means the
 older in-RAM construction behavior. Both disk construction modes now stage
-abandoned-key records as sorted temporary runs and use a bounded external merge;
+abandoned-key records as sorted temporary runs and use a bounded external merge.
 the published `ZORABN2` file, 32-bit hashes, origin unions and query behavior are
 unchanged. Temporary run records contain little-endian `(u32 hash, u32 group ID,
 u64 origin mask)`, and are never part of the published index.
@@ -182,13 +187,13 @@ power-of-two capacity to meet that constraint (missing legacy field defaults
 to 0). Original documents are counted through `group.members`, not by the
 number of merged groups. With fewer total documents than the requested minimum,
 all groups occupy one bank. The planner selects a minimum-padded-bit-cost
-contiguous partition of the exact slot-size buckets; only promoted filters
+contiguous partition of the exact slot-size buckets. Only promoted filters
 require additional input reads and reconstruction. This changes neither the
 bank encoding nor document partitions and creates no temporary key/cell files.
 Fingerprint width and abandoned-key union semantics stay fixed, but changing
 capacity may change which absent keys are false positives. Setting the minimum
 to 1 preserves the old layout. Queries fuse row XOR and fingerprint comparison
-in registers where supported; this is an execution change, not a format change.
+in registers where supported. This is an execution change, not a format change.
 
 `abandoned.zormap.zst` expands to magic `ZORABN2\0`, followed by records:
 the delta from the previous 32-bit hash (initially zero), the origin count,
@@ -196,14 +201,14 @@ then the ascending origin IDs delta-coded from zero within each record.
 Integers use unsigned base-128 variable-length encoding (at most five bytes
 per u32). No hash or origin bits are discarded. The reader also accepts the
 legacy `ZORABN1\0` stream: little-endian u32 hash, count and origin IDs.
-This is one global multimap across all banks;
+This is one global multimap across all banks.
 32-bit hash collisions union origin lists. It is omitted with `--drop-abandoned`.
 
 The current reader also supports manifest versions 1 through 8 and their legacy
 `ZORPOW1\0` interleaved banks. Version-1 per-group abandoned-key records are
 converted to the global 32-bit-hash multimap on load. Older readers cannot read
 new version-9 directories. Merged directories currently cannot be appended or
-repacked; rebuilding requires the complete input list.
+repacked. Rebuilding requires the complete input list.
 
 ### Parallel loading of merged subindexes
 

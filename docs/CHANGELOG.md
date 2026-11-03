@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Make `--k` consistently denote seed length and add `--window` (`-w`) for
+  the minimizer window in consecutive k-mers. Minimizer builds now require
+  `--window`. Existing index files remain readable.
+
 This section describes development changes on main that are not part of a
 tagged release. Existing published release tags have not been moved.
 
@@ -18,7 +22,7 @@ tagged release. Existing published release tags have not been moved.
   CRLF-wrapped sequence lines. Preserve bounded streaming in minimizer-fasta.
 - Default merged queries to one resident subindex, extracting queries and
   scanning abandoned keys once and retaining results in RAM.
-- Add a default 8-GiB uncompressed subindex cap with hash-routed partitions;
+- Add a default 8-GiB uncompressed subindex cap with hash-routed partitions.
   preserve fingerprint width and merged document membership.
 - Add construction memory controls and explicit reports for skipped documents.
 - Add independent Zstd frames and lossless `repack-subindexes` for parallel
@@ -27,7 +31,7 @@ tagged release. Existing published release tags have not been moved.
   documentation, and a one-run benchmark artifact recorder.
 
 Subindex partitioning changes filter cells and approximate false-positive
-identities. Memory guards can exclude oversized input documents; their reports
+identities. Memory guards can exclude oversized input documents. Their reports
 must be checked before treating an index as the complete requested collection.
 Feature extraction identities and index format versions are described in
 [FORMAT.md](FORMAT.md). Package version numbers are separate from those
@@ -38,5 +42,5 @@ builds sharing package version `0.1.0` can be distinguished.
 
 Published tag at commit `9ca1789f2de7922893def6766066c4b4cef91727`.
 This tag predates the Helicase 1.2.0 update and the local query-memory/subindex
-changes described above. Its historical behavior is retained by the tag;
+changes described above. Its historical behavior is retained by the tag.
 unreleased changes should not be attributed to that release.
