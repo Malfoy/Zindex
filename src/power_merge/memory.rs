@@ -399,6 +399,46 @@ pub(super) fn capacity_bound(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn watchdog_stops_measured_growth_in_child_process() {
+        const CHILD: &str = "ZINDEX_TEST_RSS_WATCHDOG_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let baseline = rss_bytes().expect("Linux process RSS");
+            let limit = baseline + (8 << 20);
+            let _guard = RssGuard::start(Some(limit as f64 / 1_000_000_000.0)).unwrap();
+            // Touch and retain resident pages after starting the real watchdog.
+            // No construction admission estimate participates in this fixture.
+            let mut pages = vec![0x5au8; 16 << 20];
+            std::hint::black_box(&mut pages);
+            thread::sleep(Duration::from_secs(5));
+            std::hint::black_box(&pages);
+            panic!("watchdog did not stop a process exceeding its RSS ceiling");
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "power_merge::memory::tests::watchdog_stops_measured_growth_in_child_process",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(86), "{stderr}");
+        let evidence = stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("memory-limit-exceeded\t"))
+            .expect("watchdog must report measured RSS evidence");
+        let evidence: serde_json::Value = serde_json::from_str(evidence).unwrap();
+        assert_eq!(evidence["kind"], "actual_rss_limit");
+        assert!(
+            evidence["rss_bytes"].as_u64().unwrap() > evidence["limit_bytes"].as_u64().unwrap()
+        );
+    }
+
     #[test]
     fn total_decimal_budget_has_no_memavailable_clamp_or_double_counting() {
         assert_eq!(total_bytes(Some(500.0)), Some(500_000_000_000));
