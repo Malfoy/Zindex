@@ -42,9 +42,16 @@ impl Drop for Fixture {
     }
 }
 fn call(args: &[&str], threads: &str) -> Output {
+    let format =
+        if args.first() == Some(&"query") && args.iter().any(|a| ["--records", "-r"].contains(a)) {
+            vec!["--output-format", "compact"]
+        } else {
+            vec![]
+        };
     Command::new(env!("CARGO_BIN_EXE_zorindex"))
         .args(["--threads", threads])
         .args(args)
+        .args(format)
         .output()
         .unwrap()
 }
@@ -180,7 +187,7 @@ fn canonical_string_oracle_checks_membership_boundaries_and_empty_documents() {
         .collect();
     for (case, bits) in ["1", "2", "4", "8", "16"].into_iter().enumerate() {
         let index = f.path(&format!("oracle-{bits}"));
-        let planner = ["streaming", "all-pairs", "streaming-unpruned"][case % 3];
+        let planner = ["streaming", "full"][case % 2];
         build(
             &fof,
             &index,
@@ -261,19 +268,14 @@ fn constructed_singleton_false_positive_rates_follow_fingerprint_width() {
         build(
             &fof,
             &index,
-            &["--fingerprint-bits", &bits.to_string(), "--merge-disabled"],
-        );
-        let output = ok(
             &[
-                "query",
-                "--index",
-                &index,
-                "--query",
-                &query,
-                "--ignore-abandoned",
+                "--fingerprint-bits",
+                &bits.to_string(),
+                "--merge-disabled",
+                "--drop-abandoned",
             ],
-            "2",
         );
+        let output = ok(&["query", "--index", &index, "--query", &query], "2");
         let got = scores(&output)[0] as f64;
         let p = 2f64.powi(-(bits as i32));
         let mean = negative.len() as f64 * p;
@@ -451,9 +453,6 @@ fn invalid_option_boundaries_fail_before_publishing_an_index() {
         vec!["--segment-length", "3"],
         vec!["--segment-length", "8192"],
         vec!["--merge-sketch-size", "3"],
-        vec!["--merge-max-colors", "0"],
-        vec!["--fingerprint-bits", "4", "--merge-max-colors", "61"],
-        vec!["--merge-min-saving", "1"],
         vec!["--merge-plan-margin", "0.5"],
         vec!["--max-subindexes", "0"],
         vec!["--min-subindex-documents", "0"],
@@ -487,7 +486,7 @@ fn maximal_color_payloads_keep_both_origins_distinct_at_all_mergeable_widths() {
         let mut inputs: String = (0..cap).map(|i| format!("a{i:02}\t{a}\n")).collect();
         inputs.push_str(&format!("b0\t{b}\nb1\t{b}\n"));
         let fof = f.write("inputs.fof", inputs);
-        for planner in ["streaming", "all-pairs"] {
+        for planner in ["streaming", "full"] {
             let index = f.path(&format!("full-payload-{bits}-{planner}"));
             build(
                 &fof,
@@ -495,8 +494,6 @@ fn maximal_color_payloads_keep_both_origins_distinct_at_all_mergeable_widths() {
                 &[
                     "--fingerprint-bits",
                     &bits.to_string(),
-                    "--merge-max-colors",
-                    &cap.to_string(),
                     "--merge-planner",
                     planner,
                 ],
@@ -609,22 +606,6 @@ fn invalid_query_options_leave_index_bytes_unchanged() {
     );
     for (path, bytes) in before {
         assert_eq!(fs::read(path).unwrap(), bytes);
-    }
-}
-
-#[test]
-fn duplicate_name_append_fails_without_touching_plain_indexes() {
-    let f = Fixture::new();
-    let reference = f.write("ref.fa", format!(">ref\n{}\n", dna(100, 7)));
-    let fof = f.write("inputs.fof", format!("a\t{reference}\n"));
-    for bits in ["1", "2", "4", "8", "16"] {
-        let index = f.path(&format!("plain-{bits}"));
-        build(&fof, &index, &["--plain", "--fingerprint-bits", bits]);
-        let before = fs::read(&index).unwrap();
-        let output = call(&["append", "--index", &index, "--fof", &fof], "2");
-        assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("duplicate color name"));
-        assert_eq!(fs::read(&index).unwrap(), before);
     }
 }
 

@@ -33,9 +33,16 @@ impl Drop for Fixture {
     }
 }
 fn ok(args: &[&str], threads: &str) -> String {
+    let format =
+        if args.first() == Some(&"query") && args.iter().any(|a| ["--records", "-r"].contains(a)) {
+            vec!["--output-format", "compact"]
+        } else {
+            vec![]
+        };
     let output = Command::new(env!("CARGO_BIN_EXE_zorindex"))
         .args(["--threads", threads])
         .args(args)
+        .args(format)
         .output()
         .unwrap();
     assert!(
@@ -43,8 +50,23 @@ fn ok(args: &[&str], threads: &str) -> String {
         "{args:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    String::from_utf8(output.stdout).unwrap()
+    query_transcript(output)
 }
+
+// Semantic fixtures compare counts and query statistics together. The public
+// stdout/stderr separation is checked independently in user_output_cli.
+fn query_transcript(output: std::process::Output) -> String {
+    let stats = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .find(|line| line.starts_with("#query\t"))
+        .map(str::to_owned);
+    let payload = String::from_utf8(output.stdout).unwrap();
+    match stats {
+        Some(stats) => format!("{stats}\n{payload}"),
+        None => payload,
+    }
+}
+
 fn dna(n: usize) -> Vec<u8> {
     (0..n)
         .map(|i| b"ACGT"[(zorindex::splitmix64(i as u64) & 3) as usize])
@@ -78,7 +100,7 @@ fn score(output: &str) -> (u64, u64) {
 }
 
 #[test]
-fn persisted_schemes_and_homopolymer_setting_match_build_query_and_plain_append() {
+fn persisted_schemes_and_homopolymer_setting_match_build_query() {
     let f = Fixture::new();
     let original = dna(1800);
     let compressed = zorindex::homopolymer_compress(&original);
@@ -92,84 +114,68 @@ fn persisted_schemes_and_homopolymer_setting_match_build_query_and_plain_append(
     let reversed = f.write("rc.fa", fasta(&rc));
     let fof = f.write("inputs.fof", format!("a\t{reference}\n"));
     for bits in ["1", "2", "4", "8", "16"] {
-        for plain in [false, true] {
-            for mode in [
-                IndexMode::Kmers,
-                IndexMode::Minimizers,
-                IndexMode::Modimizers,
-                IndexMode::Findere,
-            ] {
-                for scheme in [MinimizerScheme::Simd, MinimizerScheme::OpenClosedMod] {
-                    let index = f.path(&format!(
-                        "index-fp{bits}-{plain}-{}-{}",
-                        mode.label(),
-                        scheme.label()
-                    ));
-                    let mut args = vec![
-                        "build",
-                        "--fof",
-                        &fof,
-                        "--output",
-                        &index,
-                        "--k",
-                        if mode == IndexMode::Minimizers {
-                            "21"
-                        } else {
-                            "31"
-                        },
-                        "--index-mode",
-                        mode.label(),
-                        "--minimizer-scheme",
-                        scheme.label(),
-                        "--homopolymer-compression",
-                        "--fingerprint-bits",
-                        bits,
-                    ];
+        for mode in [
+            IndexMode::Kmers,
+            IndexMode::Minimizers,
+            IndexMode::Modimizers,
+            IndexMode::Findere,
+        ] {
+            for scheme in [MinimizerScheme::Simd, MinimizerScheme::OpenClosedMod] {
+                let index = f.path(&format!(
+                    "index-fp{bits}-merged-{}-{}",
+                    mode.label(),
+                    scheme.label()
+                ));
+                let mut args = vec![
+                    "build",
+                    "--fof",
+                    &fof,
+                    "--output",
+                    &index,
+                    "--k",
                     if mode == IndexMode::Minimizers {
-                        args.extend(["--window", "11"]);
-                    }
-                    // Plain filters can abandon keys without recovery. Leave room
-                    // for this test to assert extraction matching independently.
-                    if plain {
-                        args.extend(["--plain", "--slot-scale", "8"]);
-                    }
-                    ok(&args, "4");
-                    let info = ok(&["info", "--index", &index], "1");
-                    if mode == IndexMode::Minimizers {
-                        for field in ["k\t21", "window\t11", "window_span\t31"] {
-                            assert!(info.lines().any(|line| line == field), "{info}");
-                        }
-                    }
-                    assert!(info.contains(&format!("minimizer_scheme\t{}", scheme.label())));
-                    assert!(info.contains("homopolymer_compression\ttrue"));
-                    let config = FeatureConfig::new(mode, 21, 16)
-                        .with_minimizer_scheme(scheme)
-                        .with_homopolymer_compression(true);
-                    let mut expected = 0;
-                    if mode == IndexMode::Findere {
-                        expected = (compressed.len() - 31 + 1) as u64;
+                        "21"
                     } else {
-                        scan_index_features(&compressed, 31, 69, config, &mut |_| expected += 1);
+                        "31"
+                    },
+                    "--index-mode",
+                    mode.label(),
+                    "--minimizer-scheme",
+                    scheme.label(),
+                    "--homopolymer-compression",
+                    "--fingerprint-bits",
+                    bits,
+                ];
+                if mode == IndexMode::Minimizers {
+                    args.extend(["--window", "11"]);
+                }
+
+                ok(&args, "4");
+                let info = ok(&["info", "--index", &index], "1");
+                if mode == IndexMode::Minimizers {
+                    for field in ["k\t21", "window\t11", "window_span\t31"] {
+                        assert!(info.lines().any(|line| line == field), "{info}");
                     }
-                    for path in [&reference, &query, &reversed] {
-                        for threads in ["1", "4"] {
-                            let output =
-                                ok(&["query", "--index", &index, "--query", path], threads);
-                            assert_eq!(
-                                score(&output),
-                                (expected, expected),
-                                "{plain} {mode:?} {scheme:?}: {output}"
-                            );
-                        }
-                    }
-                    if plain {
-                        let update = f.write("update.fof", format!("b\t{query}\n"));
-                        ok(&["append", "--index", &index, "--fof", &update], "4");
-                        let output = ok(&["query", "--index", &index, "--query", &reference], "4");
-                        assert_eq!(score(&output), (expected, expected));
-                        assert!(output
-                            .lines()
-                            .any(|line| line.starts_with(&format!("b\t{expected}\t1.00000000\t"))));
+                }
+                assert!(info.contains(&format!("minimizer_scheme\t{}", scheme.label())));
+                assert!(info.contains("homopolymer_compression\ttrue"));
+                let config = FeatureConfig::new(mode, 21, 16)
+                    .with_minimizer_scheme(scheme)
+                    .with_homopolymer_compression(true);
+                let mut expected = 0;
+                if mode == IndexMode::Findere {
+                    expected = (compressed.len() - 31 + 1) as u64;
+                } else {
+                    scan_index_features(&compressed, 31, 69, config, &mut |_| expected += 1);
+                }
+                for path in [&reference, &query, &reversed] {
+                    for threads in ["1", "4"] {
+                        let output = ok(&["query", "--index", &index, "--query", path], threads);
+                        assert_eq!(
+                            score(&output),
+                            (expected, expected),
+                            "merged {mode:?} {scheme:?}: {output}"
+                        );
                     }
                 }
             }
@@ -200,72 +206,48 @@ fn default_is_open_closed_and_legacy_metadata_keeps_simd() {
         "4",
     );
     assert!(ok(&["info", "--index", &index], "1").contains("minimizer_scheme\topen-closed-mod"));
-    for plain in [false, true] {
-        let index = f.path(&format!("legacy-{plain}"));
-        let mut args = vec![
-            "build",
-            "--fof",
-            &fof,
-            "--output",
-            &index,
-            "--index-mode",
-            "minimizers",
-            "--k",
-            "31",
-            "--window",
-            "19",
-            "--minimizer-scheme",
-            "simd",
-        ];
-        if plain {
-            args.push("--plain");
-        } else {
-            // Build a fixed layout identical to the historical geometry before
-            // removing its new metadata. Do not relabel differently hashed cells.
-            args.extend(["--slot-count", "8192", "--segment-length", "2048"]);
-        }
-        ok(&args, "4");
-        let expected = ok(&["query", "--index", &index, "--query", &reference], "1");
-        if plain {
-            let mut bytes = zstd::stream::decode_all(fs::File::open(&index).unwrap()).unwrap();
-            assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 10);
-            // v8 has extraction settings but no seed-pattern/randstrobe tags.
-            bytes[8..12].copy_from_slice(&8u32.to_le_bytes());
-            bytes.drain(36..38);
-            fs::write(
-                &index,
-                zstd::stream::encode_all(bytes.as_slice(), 0).unwrap(),
-            )
-            .unwrap();
-            let v8 = ok(&["query", "--index", &index, "--query", &reference], "1");
-            assert_eq!(score(&expected), score(&v8));
-            // v7 has no scheme or compression byte after the feature header.
-            bytes[8..12].copy_from_slice(&7u32.to_le_bytes());
-            bytes.drain(34..36);
-            fs::write(
-                &index,
-                zstd::stream::encode_all(bytes.as_slice(), 0).unwrap(),
-            )
-            .unwrap();
-        } else {
-            let path = PathBuf::from(&index).join("manifest.json");
-            let mut manifest: serde_json::Value =
-                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            manifest["version"] = 3.into();
-            manifest.as_object_mut().unwrap().remove("minimizer_scheme");
-            manifest.as_object_mut().unwrap().remove("segment_length");
-            manifest
-                .as_object_mut()
-                .unwrap()
-                .remove("homopolymer_compression");
-            fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-        }
-        let info = ok(&["info", "--index", &index], "1");
-        assert!(info.contains("minimizer_scheme\tsimd"));
-        assert!(info.contains("homopolymer_compression\tfalse"));
-        let actual = ok(&["query", "--index", &index, "--query", &reference], "1");
-        assert_eq!(score(&expected), score(&actual));
+
+    let index = f.path(&format!("legacy-merged"));
+    let mut args = vec![
+        "build",
+        "--fof",
+        &fof,
+        "--output",
+        &index,
+        "--index-mode",
+        "minimizers",
+        "--k",
+        "31",
+        "--window",
+        "19",
+        "--minimizer-scheme",
+        "simd",
+    ];
+    {
+        // Build a fixed layout identical to the historical geometry before
+        // removing its new metadata. Do not relabel differently hashed cells.
+        args.extend(["--segment-length", "2048"]);
     }
+    ok(&args, "4");
+    let expected = ok(&["query", "--index", &index, "--query", &reference], "1");
+    {
+        let path = PathBuf::from(&index).join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest["version"] = 3.into();
+        manifest.as_object_mut().unwrap().remove("minimizer_scheme");
+        manifest.as_object_mut().unwrap().remove("segment_length");
+        manifest
+            .as_object_mut()
+            .unwrap()
+            .remove("homopolymer_compression");
+        fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    }
+    let info = ok(&["info", "--index", &index], "1");
+    assert!(info.contains("minimizer_scheme\tsimd"));
+    assert!(info.contains("homopolymer_compression\tfalse"));
+    let actual = ok(&["query", "--index", &index, "--query", &reference], "1");
+    assert_eq!(score(&expected), score(&actual));
 }
 
 #[test]
@@ -304,7 +286,7 @@ fn homopolymer_compression_preserves_breaks_and_feature_settings() {
 }
 
 #[test]
-fn anchor_settings_roundtrip_queries_reverse_complements_and_plain_updates() {
+fn anchor_settings_roundtrip_queries_reverse_complements() {
     use zorindex::RandstrobeConfig;
     let f = Fixture::new();
     let seq = dna(1800);
@@ -320,95 +302,81 @@ fn anchor_settings_roundtrip_queries_reverse_complements_and_plain_updates() {
     );
     let fof = f.write("anchors.fof", format!("a\t{reference}\n"));
     for bits in ["1", "2", "4", "8", "16"] {
-        for plain in [false, true] {
-            for mode in [IndexMode::Kmers, IndexMode::Minimizers] {
-                for scheme in [MinimizerScheme::Simd, MinimizerScheme::OpenClosedMod] {
-                    for choice in 0..3 {
-                        for hpc in [false, true] {
-                            let k = if mode == IndexMode::Kmers { 9 } else { 31 };
-                            let index = f.path(&format!(
-                                "anchors-fp{bits}-{plain}-{mode:?}-{scheme:?}-{choice}-{hpc}"
-                            ));
-                            let masked = choice != 1;
-                            let paired = choice != 0;
-                            let pattern = "##__#__##";
-                            let mut args = vec![
-                                "build",
-                                "--fof",
-                                &fof,
-                                "--output",
-                                &index,
-                                "--k",
+        for mode in [IndexMode::Kmers, IndexMode::Minimizers] {
+            for scheme in [MinimizerScheme::Simd, MinimizerScheme::OpenClosedMod] {
+                for choice in 0..3 {
+                    for hpc in [false, true] {
+                        let k = if mode == IndexMode::Kmers { 9 } else { 31 };
+                        let index = f.path(&format!(
+                            "anchors-fp{bits}-merged-{mode:?}-{scheme:?}-{choice}-{hpc}"
+                        ));
+                        let masked = choice != 1;
+                        let paired = choice != 0;
+                        let pattern = "##__#__##";
+                        let mut args = vec![
+                            "build",
+                            "--fof",
+                            &fof,
+                            "--output",
+                            &index,
+                            "--k",
+                            "9",
+                            "--index-mode",
+                            mode.label(),
+                            "--minimizer-scheme",
+                            scheme.label(),
+                            "--fingerprint-bits",
+                            bits,
+                        ];
+                        if mode == IndexMode::Minimizers {
+                            args.extend(["--window", "23"]);
+                        }
+                        if masked {
+                            args.extend(["--seed-pattern", pattern]);
+                        }
+                        if paired {
+                            args.extend([
+                                "--randstrobemers",
+                                "--strobe-min",
                                 "9",
-                                "--index-mode",
-                                mode.label(),
-                                "--minimizer-scheme",
-                                scheme.label(),
-                                "--fingerprint-bits",
-                                bits,
-                            ];
-                            if mode == IndexMode::Minimizers {
-                                args.extend(["--window", "23"]);
-                            }
-                            if masked {
-                                args.extend(["--seed-pattern", pattern]);
-                            }
-                            if paired {
-                                args.extend([
-                                    "--randstrobemers",
-                                    "--strobe-min",
-                                    "9",
-                                    "--strobe-max",
-                                    "40",
-                                ]);
-                            }
-                            if hpc {
-                                args.push("--homopolymer-compression");
-                            }
-                            if plain {
-                                args.extend(["--plain", "--slot-scale", "8"]);
-                            }
-                            ok(&args, "4");
-                            let info = ok(&["info", "--index", &index], "1");
-                            assert!(info.contains(&format!(
-                                "seed_pattern\t{}",
-                                if masked { pattern } else { "none" }
-                            )));
-                            assert!(info.contains(&format!("randstrobemers\t{paired}")));
-                            if paired {
-                                assert!(info.contains("strobe_min\t9\nstrobe_max\t40"));
-                            }
-                            let config = FeatureConfig::new(mode, 9, 16)
-                                .with_minimizer_scheme(scheme)
-                                .with_homopolymer_compression(hpc)
-                                .with_seed_pattern(masked.then(|| pattern.parse().unwrap()))
-                                .with_randstrobemers(paired.then_some(RandstrobeConfig {
-                                    min_distance: 9,
-                                    max_distance: 40,
-                                }));
-                            let mut expected = 0;
-                            scan_index_features(&seq, k, 69, config, &mut |_| expected += 1);
-                            assert!(expected > 0);
-                            for query in [&reference, &reversed] {
-                                for threads in ["1", "4"] {
-                                    assert_eq!(
-                                        score(&ok(
-                                            &["query", "--index", &index, "--query", query],
-                                            threads
-                                        )),
-                                        (expected, expected)
-                                    );
-                                }
-                            }
-                            if plain {
-                                let update =
-                                    f.write("anchors-update.fof", format!("b\t{reversed}\n"));
-                                ok(&["append", "--index", &index, "--fof", &update], "4");
-                                let result =
-                                    ok(&["query", "--index", &index, "--query", &reference], "4");
-                                assert_eq!(score(&result), (expected, expected));
-                                assert!(result.lines().any(|line| line
-                                    .starts_with(&format!("b\t{expected}\t1.00000000\t"))));
+                                "--strobe-max",
+                                "40",
+                            ]);
+                        }
+                        if hpc {
+                            args.push("--homopolymer-compression");
+                        }
+
+                        ok(&args, "4");
+                        let info = ok(&["info", "--index", &index], "1");
+                        assert!(info.contains(&format!(
+                            "seed_pattern\t{}",
+                            if masked { pattern } else { "none" }
+                        )));
+                        assert!(info.contains(&format!("randstrobemers\t{paired}")));
+                        if paired {
+                            assert!(info.contains("strobe_min\t9\nstrobe_max\t40"));
+                        }
+                        let config = FeatureConfig::new(mode, 9, 16)
+                            .with_minimizer_scheme(scheme)
+                            .with_homopolymer_compression(hpc)
+                            .with_seed_pattern(masked.then(|| pattern.parse().unwrap()))
+                            .with_randstrobemers(paired.then_some(RandstrobeConfig {
+                                min_distance: 9,
+                                max_distance: 40,
+                            }));
+                        let mut expected = 0;
+                        scan_index_features(&seq, k, 69, config, &mut |_| expected += 1);
+                        assert!(expected > 0);
+                        for query in [&reference, &reversed] {
+                            for threads in ["1", "4"] {
+                                assert_eq!(
+                                    score(&ok(
+                                        &["query", "--index", &index, "--query", query],
+                                        threads
+                                    )),
+                                    (expected, expected)
+                                );
                             }
                         }
                     }
@@ -424,30 +392,27 @@ fn seed_pattern_ignores_only_masked_bases_and_is_reused_from_index() {
     let reference = f.write("masked.fa", ">a\nACATACCG\n");
     let query = f.write("mutated.fa", ">a\nACGTAGCG\n");
     let fof = f.write("masked.fof", format!("a\t{reference}\n"));
-    for plain in [false, true] {
-        let index = f.path(&format!("masked-{plain}"));
-        let mut args = vec![
-            "build",
-            "--fof",
-            &fof,
-            "--output",
-            &index,
-            "--k",
-            "8",
-            "--seed-pattern",
-            "##_##_##",
-            "--fingerprint-bits",
-            "16",
-        ];
-        if plain {
-            args.extend(["--plain", "--slot-scale", "8"]);
-        }
-        ok(&args, "1");
-        assert_eq!(
-            score(&ok(&["query", "--index", &index, "--query", &query], "4")),
-            (1, 1)
-        );
-    }
+
+    let index = f.path(&format!("masked-merged"));
+    let args = vec![
+        "build",
+        "--fof",
+        &fof,
+        "--output",
+        &index,
+        "--k",
+        "8",
+        "--seed-pattern",
+        "##_##_##",
+        "--fingerprint-bits",
+        "16",
+    ];
+
+    ok(&args, "1");
+    assert_eq!(
+        score(&ok(&["query", "--index", &index, "--query", &query], "4")),
+        (1, 1)
+    );
 }
 
 #[test]
@@ -545,92 +510,81 @@ fn downstream_strobes_keep_strands_separate_and_reject_custom_legacy_indexes() {
         .unwrap(),
     );
     let fof = f.write("input.fof", format!("a\t{reference}\n"));
-    for plain in [false, true] {
-        let index = f.path(&format!("strands-{plain}"));
-        let mut args = vec![
-            "build",
-            "--fof",
-            &fof,
-            "--output",
-            &index,
-            "--k",
-            "11",
-            "--randstrobemers",
-            "--strobe-min",
-            "15",
-            "--strobe-max",
-            "50",
-            "--fingerprint-bits",
-            "16",
-        ];
-        if plain {
-            args.extend(["--plain", "--slot-scale", "8"]);
+
+    let index = f.path(&format!("strands-merged"));
+    let args = vec![
+        "build",
+        "--fof",
+        &fof,
+        "--output",
+        &index,
+        "--k",
+        "11",
+        "--randstrobemers",
+        "--strobe-min",
+        "15",
+        "--strobe-max",
+        "50",
+        "--fingerprint-bits",
+        "16",
+    ];
+
+    ok(&args, "4");
+    let total = (seq.len() - 11 + 1) as u64;
+    assert_eq!(
+        score(&ok(&["query", "--index", &index, "--query", &mixed], "4")),
+        (2 * total, 2 * total)
+    );
+    assert_eq!(
+        score(&ok(
+            &["query", "--index", &index, "--query", &reverse_fastq],
+            "4"
+        )),
+        (total, total)
+    );
+    {
+        for threads in ["1", "4"] {
+            let records = ok(
+                &[
+                    "query",
+                    "--index",
+                    &index,
+                    "--query",
+                    &mixed,
+                    "--records",
+                    "--min-ratio",
+                    "1",
+                ],
+                threads,
+            );
+            assert_eq!(
+                records.lines().skip(1).collect::<Vec<_>>(),
+                [
+                    format!("forward\t{total}\t0:{total}"),
+                    format!("reverse\t{total}\t0:{total}"),
+                ]
+            );
         }
-        ok(&args, "4");
-        let total = (seq.len() - 11 + 1) as u64;
-        assert_eq!(
-            score(&ok(&["query", "--index", &index, "--query", &mixed], "4")),
-            (2 * total, 2 * total)
-        );
-        assert_eq!(
-            score(&ok(
-                &["query", "--index", &index, "--query", &reverse_fastq],
-                "4"
-            )),
-            (total, total)
-        );
-        if !plain {
-            for threads in ["1", "4"] {
-                let records = ok(
-                    &[
-                        "query",
-                        "--index",
-                        &index,
-                        "--query",
-                        &mixed,
-                        "--records",
-                        "--min-ratio",
-                        "1",
-                    ],
-                    threads,
-                );
-                assert_eq!(
-                    records.lines().skip(1).collect::<Vec<_>>(),
-                    [
-                        format!("forward\t{total}\t0:{total}"),
-                        format!("reverse\t{total}\t0:{total}"),
-                    ]
-                );
-            }
-            let path = PathBuf::from(&index).join("manifest.json");
-            let mut manifest: serde_json::Value =
-                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            assert_eq!(manifest["version"], 8);
-            assert_eq!(manifest["colors"][0]["occurrences"], total);
-            assert_eq!(manifest["randstrobe_scheme"], zorindex::RANDSTROBE_SCHEME);
-            manifest["version"] = 5.into();
-            manifest.as_object_mut().unwrap().remove("segment_length");
-            manifest
-                .as_object_mut()
-                .unwrap()
-                .remove("randstrobe_scheme");
-            fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-        } else {
-            let mut bytes = zstd::stream::decode_all(fs::File::open(&index).unwrap()).unwrap();
-            bytes[8..12].copy_from_slice(&9u32.to_le_bytes());
-            fs::write(
-                &index,
-                zstd::stream::encode_all(bytes.as_slice(), 0).unwrap(),
-            )
-            .unwrap();
-        }
-        let output = Command::new(env!("CARGO_BIN_EXE_zorindex"))
-            .args(["query", "--index", &index, "--query", &mixed])
-            .output()
-            .unwrap();
-        assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("rebuild"));
+        let path = PathBuf::from(&index).join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(manifest["version"], 8);
+        assert_eq!(manifest["colors"][0]["occurrences"], total);
+        assert_eq!(manifest["randstrobe_scheme"], zorindex::RANDSTROBE_SCHEME);
+        manifest["version"] = 5.into();
+        manifest.as_object_mut().unwrap().remove("segment_length");
+        manifest
+            .as_object_mut()
+            .unwrap()
+            .remove("randstrobe_scheme");
+        fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
     }
+    let output = Command::new(env!("CARGO_BIN_EXE_zorindex"))
+        .args(["query", "--index", &index, "--query", &mixed])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("rebuild"));
 }
 
 #[test]
@@ -670,55 +624,39 @@ fn invalid_persisted_anchor_settings_are_rejected() {
     let f = Fixture::new();
     let reference = f.write("corrupt.fa", fasta(&dna(500)));
     let fof = f.write("corrupt.fof", format!("a\t{reference}\n"));
-    for plain in [false, true] {
-        let index = f.path(&format!("corrupt-{plain}"));
-        let mut args = vec![
-            "build",
-            "--fof",
-            &fof,
-            "--output",
-            &index,
-            "--k",
-            "9",
-            "--seed-pattern",
-            "##__#__##",
-            "--randstrobemers",
-        ];
-        if plain {
-            args.extend(["--plain", "--slot-scale", "8"]);
-        }
-        ok(&args, "1");
-        if plain {
-            let mut bytes = zstd::stream::decode_all(fs::File::open(&index).unwrap()).unwrap();
-            // Pattern width follows the scheme and compression bytes.
-            bytes[36] = 32;
-            fs::write(
-                &index,
-                zstd::stream::encode_all(bytes.as_slice(), 0).unwrap(),
-            )
-            .unwrap();
-        } else {
-            let path = PathBuf::from(&index).join("manifest.json");
-            let mut manifest: serde_json::Value =
-                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            manifest["randstrobemers"]["min_distance"] = 0.into();
-            fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-        }
-        let result = Command::new(env!("CARGO_BIN_EXE_zorindex"))
-            .args(["info", "--index", &index])
-            .output()
-            .unwrap();
-        assert!(!result.status.success());
-        let error = String::from_utf8_lossy(&result.stderr);
-        assert!(
-            error.contains(if plain {
-                "invalid seed pattern width"
-            } else {
-                "minimum distance must be greater than zero"
-            }),
-            "{error}"
-        );
+
+    let index = f.path(&format!("corrupt-merged"));
+    let args = vec![
+        "build",
+        "--fof",
+        &fof,
+        "--output",
+        &index,
+        "--k",
+        "9",
+        "--seed-pattern",
+        "##__#__##",
+        "--randstrobemers",
+    ];
+
+    ok(&args, "1");
+    {
+        let path = PathBuf::from(&index).join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest["randstrobemers"]["min_distance"] = 0.into();
+        fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
     }
+    let result = Command::new(env!("CARGO_BIN_EXE_zorindex"))
+        .args(["info", "--index", &index])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        error.contains("minimum distance must be greater than zero"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -847,7 +785,7 @@ fn real_collection_before_after_benchmark() {
                         String::from_utf8_lossy(&result.stderr)
                     );
                     let elapsed = start.elapsed().as_secs_f64();
-                    let text = String::from_utf8(result.stdout).unwrap();
+                    let text = query_transcript(result);
                     let first = text.lines().next().unwrap();
                     // Header differs only in elapsed time; counts/probes match.
                     let header = first.split("\telapsed_s=").next().unwrap().to_string();

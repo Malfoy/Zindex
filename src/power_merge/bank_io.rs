@@ -196,6 +196,12 @@ fn table(path: &Path, raw_total: usize) -> Result<Option<Vec<Frame>>> {
     Ok(Some(frames))
 }
 
+pub(super) fn validate_table(path: &Path, payload: usize) -> Result<()> {
+    let total = payload.checked_add(HEADER).context("bank size overflow")?;
+    table(path, total)?;
+    Ok(())
+}
+
 pub(super) fn zeroed(bytes: usize) -> Vec<u8> {
     if bytes < CHUNK {
         vec![0; bytes]

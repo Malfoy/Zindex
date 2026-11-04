@@ -43,8 +43,9 @@ fn parse_subindex_size(value: &str) -> std::result::Result<u64, String> {
     Ok(bytes)
 }
 pub use storage::{
-    build, info_command, query_command, query_command_with_memory, query_command_with_recovery,
-    query_records_command, query_records_command_with_memory, repack_subindexes,
+    build, fuse_indexes, fuse_many_indexes, info_command, query_command, query_command_with_memory,
+    query_command_with_recovery, query_records_command, query_records_command_with_memory,
+    RecordFormat,
 };
 mod memory;
 
@@ -60,13 +61,15 @@ pub enum QueryMemory {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MergePlanner {
-    /// Full maximum-saving agglomeration (compatibility name: all-pairs).
-    #[value(name = "full", alias = "all-pairs")]
+    /// Full maximum-saving agglomeration.
+    #[value(name = "full")]
     #[serde(alias = "full")]
     AllPairs,
     #[default]
     Streaming,
-    /// Original streaming planner, retained as an unpruned benchmark baseline.
+    /// Exhaustive reference implementation used only by planner tests.
+    #[cfg(test)]
+    #[value(skip)]
     StreamingUnpruned,
     /// No dataset unions: append each dataset to the smallest sufficient existing subindex in FOF order.
     Naive,
@@ -77,7 +80,7 @@ pub enum MergePlanner {
 pub enum ColumnOrder {
     /// Keep width sections contiguous, then use input dataset IDs.
     Width,
-    /// Within width sections, cluster columns by sampled filter cell contents.
+    /// Within width sections, order columns by retained union-sketch fingerprints.
     #[default]
     Compression,
 }
@@ -92,101 +95,127 @@ impl ColumnOrder {
 impl MergePlanner {
     pub fn label(self) -> &'static str {
         match self {
-            Self::AllPairs => "all-pairs",
+            Self::AllPairs => "full",
             Self::Streaming => "streaming",
+            #[cfg(test)]
             Self::StreamingUnpruned => "streaming-unpruned",
             Self::Naive => "naive",
         }
     }
 
     pub fn is_streaming(self) -> bool {
-        matches!(
-            self,
-            Self::Streaming | Self::StreamingUnpruned | Self::Naive
-        )
+        match self {
+            Self::Streaming | Self::Naive => true,
+            #[cfg(test)]
+            Self::StreamingUnpruned => true,
+            _ => false,
+        }
     }
 }
 
 #[derive(Args, Clone, Debug)]
 pub struct MergeArgs {
-    /// Compatibility flag: merged power-of-two banks are already the default.
-    #[arg(long, action = clap::ArgAction::SetTrue, default_value_t = true)]
-    pub power_of_two_merge: bool,
-    /// streaming (default), full/all-pairs, streaming-unpruned, or naive (ordered placement without unions).
-    #[arg(long = "merge-planner", value_enum, default_value_t = MergePlanner::Streaming)]
+    /// streaming (default), full, or naive (ordered placement without unions).
+    #[arg(short = 'P', long = "merge-planner", value_enum, default_value_t = MergePlanner::Streaming)]
     pub planner: MergePlanner,
-    /// Physical group order within each bank. Does not change planning or query output order.
-    #[arg(long = "merge-column-order", value_enum, default_value_t = ColumnOrder::Compression)]
-    pub column_order: ColumnOrder,
     /// Number of SimdSketch buckets (8-bit comparison fingerprints + 32-bit union minima).
-    /// Must be a power of two.
-    #[arg(long = "merge-sketch-size", default_value_t = 128)]
+    ///
+    /// A power of two in 64..=1048576, default 128. Larger sketches improve
+    /// estimation precision at the cost of sketch memory and comparison work.
+    /// Use this to tune planning accuracy against construction resources.
+    #[arg(short = 'K', long = "merge-sketch-size", default_value_t = 128)]
     pub sketch_size: usize,
-    /// Maximum datasets sharing a ZOR payload (fingerprint + membership must fit 64 bits).
-    #[arg(long = "merge-max-colors", default_value_t = 48)]
-    pub max_colors: usize,
-    /// Require this fraction of predicted bit savings before accepting a merge.
-    #[arg(long = "merge-min-saving", default_value_t = 0.0)]
-    pub min_saving: f64,
     /// Plan each merged group as if its estimated union were this fraction larger, so sketch noise does not push
     /// the exact union past the planned power of two at build time (which doubles the group's slots).
-    #[arg(long = "merge-plan-margin", default_value_t = 0.03)]
+    ///
+    /// A finite fraction in [0,0.5), default 0.03. This provides headroom for
+    /// sketch estimation error when choosing a capacity. A larger margin can
+    /// reject merges whose estimated savings depend on a tight capacity fit.
+    #[arg(short = 'G', long = "merge-plan-margin", default_value_t = 0.03)]
     pub plan_margin: f64,
     /// Minimum original documents per subindex. Promote smaller filters, never fold.
-    /// Collections smaller than this use one subindex. Set 1 for the legacy layout.
-    #[arg(long, default_value_t = 128)]
+    /// Collections smaller than this use one subindex. Set 1 to retain small size classes.
+    ///
+    /// Positive count, default 128. Promote undersized classes to larger filter
+    /// capacities to reduce the number of size classes probed during queries.
+    /// This trades filter space for fewer class probes. The naive planner ignores it.
+    #[arg(short = 'D', long, default_value_t = 128)]
     pub min_subindex_documents: usize,
     /// Maximum size-class count before hash partitioning. Promote smaller filters. Omit for unlimited.
-    #[arg(long)]
+    ///
+    /// Positive count. Use this to put an explicit bound on query size classes,
+    /// potentially increasing filter capacity through promotion. Physical hash
+    /// partitions are outside this count. The naive planner ignores it.
+    #[arg(short = 'N', long)]
     pub max_subindexes: Option<usize>,
     /// Maximum uncompressed merged-subindex payload. Hash-partition larger size classes.
     /// A power of two, in bytes or with KiB/MiB/GiB suffix (default: 8 GiB).
-    #[arg(long, default_value = "8GiB", value_parser = parse_subindex_size)]
+    #[arg(short = 'X', long, default_value = "8GiB", value_parser = parse_subindex_size)]
     pub max_subindex_size: u64,
     /// Keep singleton power-of-two banks, for measuring sizing independently of merging.
-    #[arg(long = "merge-disabled")]
+    ///
+    /// Disable dataset unions while retaining the regular construction and
+    /// size-class-promotion pipeline. This is an experimental comparison control,
+    /// distinct from the naive planner's input-order placement.
+    #[arg(short = 'U', long = "merge-disabled")]
     pub disabled: bool,
     /// Omit abandoned-key recovery storage and lookup (merged indexes only).
     /// Abandoned features may then be missed.
-    #[arg(long, conflicts_with = "plain")]
+    ///
+    /// Save recovery-file space and its query work by omitting those records
+    /// during construction. This deliberately allows false negatives. Restoring
+    /// recovery later requires rebuilding the index.
+    #[arg(short = 'R', long)]
     pub drop_abandoned: bool,
+    /// Cache extracted seeds in temporary files.
+    ///
     /// Use temporary feature/cell/abandoned-key files instead of the two-pass build.
     /// The default two-pass build stages completed filters as bit-packed cell files.
-    #[arg(long, conflicts_with = "plain")]
+    #[arg(short = 'e', long)]
     pub disk_backed: bool,
+    /// Keep completed filters and recovery data in RAM instead of scratch files.
+    ///
     /// Keep completed filters (bit-packed) and abandoned-key records in RAM until bank
     /// compression, writing no scratch files. Default false: both are staged on disk next to
     /// the output (bit-packed cell files, sorted abandoned-key runs with a bounded merge),
     /// so peak RSS does not include them.
-    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1,
+    #[arg(short = 'I', long, action = clap::ArgAction::Set, num_args = 0..=1,
         require_equals = true, default_missing_value = "true", default_value_t = false,
-        conflicts_with_all = ["plain", "disk_backed"])]
+        conflicts_with = "disk_backed")]
     pub low_disk: bool,
 
+    /// Estimated concurrent workspace budget in GiB, default 80% of available RAM.
+    ///
     /// Estimated concurrent build-workspace budget in GiB. Default: 80% of
     /// available RAM (including visible cgroup limits). Oversized jobs run alone.
     /// This is admission control, not an RSS cap. Retained filters/recovery and
     /// a single oversized genome still need enough memory. Feature sorting stays in RAM.
-    #[arg(long)]
+    #[arg(short = 'W', long)]
     pub build_memory_gib: Option<f64>,
 
+    /// Sampled process-RSS guard in decimal GB, alternative to --build-memory-gib.
+    ///
     /// Total process resident-memory ceiling in decimal GB (500 = 500000000000
     /// bytes). Fixed admission budget, without automatic available-RAM discount.
     /// Measured RSS is checked every 20 ms. This is not a virtual-address limit.
-    #[arg(long, conflicts_with_all = ["build_memory_gib", "plain"])]
+    #[arg(short = 'g', long, conflicts_with = "build_memory_gib")]
     pub max_ram_gb: Option<f64>,
 
+    /// Skip and report datasets exceeding the per-dataset workspace budget.
+    ///
     /// Skip documents whose estimated extraction/graph workspace exceeds the
-    /// per-document budget (merged builds). Skips are recorded, never silent.
-    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1,
-        require_equals = true, default_missing_value = "true", default_value_t = true,
-        conflicts_with = "plain")]
+    /// per-document budget. Default false: exceeding the budget fails the build.
+    /// Explicit skips are recorded and mark the collection incomplete.
+    #[arg(short = 'J', long, action = clap::ArgAction::Set, num_args = 0..=1,
+        require_equals = true, default_missing_value = "true", default_value_t = false)]
     pub skip_oversized_documents: bool,
 
+    /// Estimated per-dataset workspace limit in GiB, default the build budget.
+    ///
     /// Per-document workspace ceiling in GiB (merged builds). Defaults to the
     /// build workspace budget, and cannot raise that budget. Estimates are
     /// conservative, not a hard process RSS limit.
-    #[arg(long, conflicts_with = "plain")]
+    #[arg(short = 'Q', long)]
     pub max_document_memory_gib: Option<f64>,
 
     /// Runtime-only frozen workspace limit shared with merge candidate checks.
@@ -196,12 +225,8 @@ pub struct MergeArgs {
 impl Default for MergeArgs {
     fn default() -> Self {
         Self {
-            power_of_two_merge: true,
             planner: MergePlanner::Streaming,
-            column_order: ColumnOrder::Compression,
             sketch_size: 128,
-            max_colors: 48,
-            min_saving: 0.0,
             plan_margin: 0.03,
             min_subindex_documents: 128,
             max_subindexes: None,
@@ -212,7 +237,7 @@ impl Default for MergeArgs {
             low_disk: false,
             build_memory_gib: None,
             max_ram_gb: None,
-            skip_oversized_documents: true,
+            skip_oversized_documents: false,
             max_document_memory_gib: None,
             planning_memory_budget_bytes: None,
         }
@@ -234,6 +259,8 @@ pub struct BuildConfig {
     pub fingerprint_bits: usize,
     pub feature_config: FeatureConfig,
     pub slot_scale: f64,
+    /// Cell-count floor for internal layout fixtures. Production sizing is automatic.
+    #[cfg(test)]
     pub minimum_slots: Option<usize>,
     /// Fixed segment size. None is retained for legacy library/layout fixtures.
     pub segment_length: Option<usize>,
@@ -302,20 +329,8 @@ impl BuildConfig {
             "--merge-sketch-size must be a power of two in 64..=1048576"
         );
         ensure!(
-            (1..=64).contains(&self.merge.max_colors),
-            "--merge-max-colors must be in 1..=64"
-        );
-        ensure!(
-            self.merge.min_saving.is_finite() && (0.0..1.0).contains(&self.merge.min_saving),
-            "--merge-min-saving must be in [0, 1)"
-        );
-        ensure!(
             self.merge.plan_margin.is_finite() && (0.0..0.5).contains(&self.merge.plan_margin),
             "--merge-plan-margin must be in [0, 0.5)"
-        );
-        ensure!(
-            self.merge.max_colors + self.fingerprint_bits <= 64,
-            "fingerprint bits + --merge-max-colors must be <= 64"
         );
         ensure!(
             (2..=crate::MAX_HASHES).contains(&self.hashes),
@@ -332,6 +347,10 @@ impl BuildConfig {
         );
         Ok(())
     }
+    /// A multi-dataset payload stores one membership bit per dataset beside its fingerprint.
+    pub fn max_group_members(&self) -> usize {
+        64usize.saturating_sub(self.fingerprint_bits)
+    }
     pub fn width(&self, colors: usize) -> usize {
         self.fingerprint_bits + if colors == 1 { 0 } else { colors }
     }
@@ -341,15 +360,15 @@ impl BuildConfig {
             needed.is_finite() && needed < usize::MAX as f64,
             "filter capacity overflow"
         );
-        let needed = (needed as usize)
-            .max(self.minimum_slots.unwrap_or(0))
-            .max(self.hashes.next_power_of_two())
-            .max(
-                self.segment_length
-                    .unwrap_or(1)
-                    .checked_mul(self.hashes.next_power_of_two())
-                    .context("segment geometry overflow")?,
-            );
+        let needed = needed as usize;
+        #[cfg(test)]
+        let needed = needed.max(self.minimum_slots.unwrap_or(0));
+        let needed = needed.max(self.hashes.next_power_of_two()).max(
+            self.segment_length
+                .unwrap_or(1)
+                .checked_mul(self.hashes.next_power_of_two())
+                .context("segment geometry overflow")?,
+        );
         needed
             .checked_next_power_of_two()
             .context("power-of-two capacity overflow")

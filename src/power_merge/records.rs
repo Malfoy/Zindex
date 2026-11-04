@@ -23,13 +23,14 @@ struct Output {
 pub(super) fn query_file<S: Send>(
     path: &Path,
     batch_size: usize,
+    header: &str,
     init: impl Fn() -> S,
     query: impl Fn(&mut S, &[Record], &mut Vec<u8>) -> Result<()> + Sync,
 ) -> Result<()> {
     let stdout = std::io::stdout();
     // StdoutLock cannot cross threads; the pipeline owns the buffered writer.
     let mut out = BufWriter::with_capacity(1024 * 1024, stdout);
-    query_file_to(path, &mut out, batch_size, init, query)?;
+    query_file_to(path, &mut out, batch_size, header, init, query)?;
     out.flush()?;
     Ok(())
 }
@@ -38,6 +39,7 @@ pub(super) fn query_file_to<S: Send>(
     path: &Path,
     out: &mut (impl Write + Send),
     batch_size: usize,
+    header: &str,
     init: impl Fn() -> S,
     query: impl Fn(&mut S, &[Record], &mut Vec<u8>) -> Result<()> + Sync,
 ) -> Result<()> {
@@ -48,7 +50,7 @@ pub(super) fn query_file_to<S: Send>(
     } else {
         Box::new(file)
     };
-    query_reader_chunks(BufReader::new(input), out, batch_size, init, query)
+    query_reader_chunks(BufReader::new(input), out, batch_size, header, init, query)
 }
 
 /// Parse the file once, prepare each read on the Rayon pool, and retain only
@@ -92,11 +94,12 @@ fn query_reader_chunks<S: Send>(
     reader: impl BufRead + Send,
     out: &mut (impl Write + Send),
     batch_size: usize,
+    header: &str,
     init: impl Fn() -> S,
     query: impl Fn(&mut S, &[Record], &mut Vec<u8>) -> Result<()> + Sync,
 ) -> Result<()> {
     ensure!(batch_size > 0, "record batch size must be positive");
-    writeln!(out, "query_id\tvalid_kmers\thits")?;
+    writeln!(out, "{header}")?;
     let workers = rayon::current_num_threads();
     // Two queued batches bound read-ahead/output memory. Recycle channels only
     // carry these bounded in-flight buffers; nobody waits for a recycled buffer.
@@ -266,14 +269,21 @@ fn query_reader<S: Send>(
     init: impl Fn() -> S,
     query: impl Fn(&mut S, &[u8], &mut Vec<u8>) -> Result<()> + Sync,
 ) -> Result<()> {
-    query_reader_chunks(reader, out, batch_size, init, |state, records, bytes| {
-        for (id, seq) in records {
-            bytes.extend_from_slice(id);
-            bytes.push(b'\t');
-            query(state, seq, bytes)?;
-        }
-        Ok(())
-    })
+    query_reader_chunks(
+        reader,
+        out,
+        batch_size,
+        "query_id\tvalid_kmers\thits",
+        init,
+        |state, records, bytes| {
+            for (id, seq) in records {
+                bytes.extend_from_slice(id);
+                bytes.push(b'\t');
+                query(state, seq, bytes)?;
+            }
+            Ok(())
+        },
+    )
 }
 
 #[cfg(test)]

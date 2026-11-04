@@ -49,8 +49,23 @@ fn ok(bin: &str, args: &[&str]) -> String {
         "{bin} {args:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    String::from_utf8(output.stdout).unwrap()
+    query_transcript(output)
 }
+
+// Semantic fixtures compare counts and query statistics together. The public
+// stdout/stderr separation is checked independently in user_output_cli.
+fn query_transcript(output: std::process::Output) -> String {
+    let stats = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .find(|line| line.starts_with("#query\t"))
+        .map(str::to_owned);
+    let payload = String::from_utf8(output.stdout).unwrap();
+    match stats {
+        Some(stats) => format!("{stats}\n{payload}"),
+        None => payload,
+    }
+}
+
 fn build(bin: &str, fof: &str, output: &str, k: &str, z: Option<&str>, extra: &[&str]) {
     let mut args = vec![
         "build",
@@ -66,7 +81,7 @@ fn build(bin: &str, fof: &str, output: &str, k: &str, z: Option<&str>, extra: &[
     if let Some(z) = z {
         args.extend(["--findere-z", z]);
     }
-    args.extend(["--plain", "--slot-scale", "8", "--fingerprint-bits", "16"]);
+    args.extend(["--slot-scale", "8", "--fingerprint-bits", "16"]);
     args.extend(extra);
     ok(bin, &args);
 }
@@ -120,7 +135,7 @@ fn default_custom_zero_and_long_k_persist_and_query() {
             ("9", Some("0"), 0),
             ("41", None, 10),
         ] {
-            let index = f.path("test.idx");
+            let index = f.path(&format!("test-{k}-{stored_z}.idx"));
             build(bin, &fof, &index, k, z, &[]);
             let info = ok(bin, &["info", "--index", &index]);
             assert!(info.contains("index_mode\tfindere\n"));
@@ -141,14 +156,13 @@ fn default_custom_zero_and_long_k_persist_and_query() {
 }
 
 #[test]
-fn append_repack_union_and_compressed_fastq_keep_findere_semantics() {
+fn compressed_fastq_keeps_findere_semantics() {
     let f = Fixture::new();
     let a = dna(300, 71);
     let b = dna(80, 93);
     let pa = f.write("a.fa", format!(">a\n{a}\n"));
     let pb = f.write("b.fa", format!(">b\n{b}\n"));
-    let fof = f.write("a.fof", format!("a\t{pa}\n"));
-    let append = f.write("b.fof", format!("b\t{pb}\n"));
+    let fof = f.write("input.fof", format!("a\t{pa}\nb\t{pb}\n"));
     let fastq = format!(
         "@b\n{b}\n+\n{}\n@short\nACGTNACGT\n+\nIIIIIIIII\n",
         "I".repeat(b.len())
@@ -158,63 +172,19 @@ fn append_repack_union_and_compressed_fastq_keep_findere_semantics() {
         zstd::bulk::compress(fastq.as_bytes(), 1).unwrap(),
     );
     for bin in binaries() {
-        let index = f.path("initial.idx");
-        let appended = f.path("appended.idx");
-        let extra = vec!["--union-graph", "--stack-compression", "lz4"];
-        build(bin, &fof, &index, "31", Some("7"), &extra);
+        let index = f.path("index");
+        build(bin, &fof, &index, "31", Some("7"), &[]);
         let qa = f.write("qa.fa", format!(">a\n{a}\n"));
         let output = ok(bin, &["query", "--index", &index, "--query", &qa]);
         assert_eq!(matches(&output, "a"), (a.len() - 31 + 1) as u64);
-        {
-            let ignored = ok(
-                bin,
-                &["query", "--index", &index, "--query", &qa, "--ignore-union"],
-            );
-            assert_eq!(matches(&ignored, "a"), matches(&output, "a"));
-        }
-        ok(
-            bin,
-            &[
-                "append", "--index", &index, "--fof", &append, "--output", &appended,
-            ],
-        );
-        let info = ok(bin, &["info", "--index", &appended]);
-        assert!(info.contains("findere_z\t7\n"));
-        let output = ok(bin, &["query", "--index", &appended, "--query", &query]);
+        let output = ok(bin, &["query", "--index", &index, "--query", &query]);
         assert_eq!(matches(&output, "b"), (b.len() - 31 + 1) as u64);
-        {
-            let repacked = f.path("repacked.idx");
-            ok(
-                bin,
-                &[
-                    "repack",
-                    "--index",
-                    &appended,
-                    "--output",
-                    &repacked,
-                    "--stack-compression",
-                    "lz4",
-                ],
-            );
-            let output = ok(
-                bin,
-                &[
-                    "query",
-                    "--index",
-                    &repacked,
-                    "--query",
-                    &query,
-                    "--decode-stack",
-                ],
-            );
-            assert_eq!(matches(&output, "b"), (b.len() - 31 + 1) as u64);
-            assert!(ok(bin, &["info", "--index", &repacked]).contains("findere_z\t7\n"));
-        }
+        assert!(ok(bin, &["info", "--index", &index]).contains("findere_z\t7\n"));
     }
 }
 
 #[test]
-fn rejects_invalid_parameters_and_supports_z_alias() {
+fn rejects_invalid_parameters_and_supports_short_z() {
     let f = Fixture::new();
     let seq = dna(90, 1);
     let reference = f.write("r.fa", format!(">r\n{seq}\n"));
@@ -262,7 +232,7 @@ fn rejects_invalid_parameters_and_supports_z_alias() {
                 "findere",
                 "--k",
                 "31",
-                "--z",
+                "-z",
                 "4",
             ],
         );
@@ -318,8 +288,8 @@ fn query_results_and_probe_counts_match_across_thread_counts() {
     );
     for bin in binaries() {
         for z in ["0", "3", "10"] {
-            let index = f.path("test.idx");
-            let extra = vec!["--union-graph", "--stack-compression", "lz4"];
+            let index = f.path(&format!("test-{z}.idx"));
+            let extra = vec![];
             build(bin, &fof, &index, "31", Some(z), &extra);
             for query in [&plain, &compressed] {
                 let mut expected = None;
@@ -341,7 +311,7 @@ fn query_results_and_probe_counts_match_across_thread_counts() {
                         "{}",
                         String::from_utf8_lossy(&output.stderr)
                     );
-                    let text = String::from_utf8(output.stdout).unwrap();
+                    let text = query_transcript(output);
                     let normalized: Vec<_> = text
                         .lines()
                         .map(|line| line.split("\telapsed_s=").next().unwrap().to_owned())

@@ -46,7 +46,9 @@ recovery matches, metadata and worker buffers use additional memory.
 Construction stages completed filters and abandoned keys on disk by default.
 `--low-disk` retains them in RAM. Inspect `info` and skipped-document reports
 before treating an index as representing the full requested collection.
-See [memory controls](USAGE.md) for admission limits and the sampled RSS guard.
+See [memory controls](../README.md#memory-and-collection-completeness) for
+admission limits and the sampled RSS guard. Oversized datasets fail by default.
+Use `--skip-oversized-documents` only when an incomplete collection is acceptable.
 
 ## Report a failure
 

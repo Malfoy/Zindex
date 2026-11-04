@@ -6,7 +6,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, BinaryHeap},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
-        Mutex,
+        Arc, Mutex,
     },
 };
 mod packed;
@@ -19,10 +19,20 @@ pub struct Group {
     pub slots: usize,
     pub width: usize,
     pub sketch: Sketch,
+    /// Final union-sketch bytes, shared with rebuilt and hash-partitioned filters.
+    pub ordering_key: Option<Arc<Vec<u8>>>,
     /// Sum of exact input cardinalities: a safe union bound, unlike the sketch.
     pub feature_count_upper_bound: usize,
     /// Sum of source workspaces, covering retained vectors during a union.
     pub input_peak_bytes: u64,
+}
+
+impl Group {
+    fn retire_sketch(&mut self) {
+        if !self.sketch.is_released() {
+            self.ordering_key = Some(Arc::new(self.sketch.take_fingerprints()));
+        }
+    }
 }
 
 pub struct Plan {
@@ -72,6 +82,7 @@ pub fn singleton(count: usize, sketch: Sketch, id: usize, config: &BuildConfig) 
         slots: config.slots(count as f64)?,
         width: config.width(1),
         sketch,
+        ordering_key: None,
         feature_count_upper_bound: count,
         input_peak_bytes: 0,
     })
@@ -85,7 +96,7 @@ fn candidate(
     config: &BuildConfig,
 ) -> Result<Option<Candidate>> {
     let count = ga.members.len() + gb.members.len();
-    if count > config.merge.max_colors || !merge_fits_memory(ga, gb, config)? {
+    if count > config.max_group_members() || !merge_fits_memory(ga, gb, config)? {
         return Ok(None);
     }
     let j = ga.sketch.jaccard(&gb.sketch);
@@ -101,7 +112,7 @@ fn candidate_with_similarity(
     j: f64,
 ) -> Result<Option<Candidate>> {
     let count = ga.members.len() + gb.members.len();
-    if count > config.merge.max_colors || !merge_fits_memory(ga, gb, config)? {
+    if count > config.max_group_members() || !merge_fits_memory(ga, gb, config)? {
         return Ok(None);
     }
     let cardinality = ((ga.cardinality + gb.cardinality) / (1.0 + j)).clamp(
@@ -112,7 +123,7 @@ fn candidate_with_similarity(
     let slots = config.slots(cardinality * (1.0 + config.merge.plan_margin))?;
     let old = cost(ga.slots, ga.width) + cost(gb.slots, gb.width);
     let new = cost(slots, config.width(count));
-    if new >= old || (old - new) as f64 <= old as f64 * config.merge.min_saving {
+    if new >= old {
         return Ok(None);
     }
     Ok(Some(Candidate {
@@ -150,20 +161,22 @@ fn merge(mut ga: Group, gb: Group, c: &Candidate, config: &BuildConfig) -> Group
     let mut members = ga.members;
     members.extend(gb.members);
     members.sort_unstable();
-    if members.len() >= config.merge.max_colors {
-        ga.sketch.release();
-    }
-    Group {
+    let mut group = Group {
         width: config.width(members.len()),
         members,
         cardinality: c.cardinality,
         slots: c.slots,
         sketch: ga.sketch,
+        ordering_key: None,
         feature_count_upper_bound: ga
             .feature_count_upper_bound
             .saturating_add(gb.feature_count_upper_bound),
         input_peak_bytes: ga.input_peak_bytes.saturating_add(gb.input_peak_bytes),
+    };
+    if group.members.len() >= config.max_group_members() {
+        group.retire_sketch();
     }
+    group
 }
 
 /// Optimistic cost: union capacity cannot be smaller than either input's
@@ -181,12 +194,12 @@ fn bucket_max_saving(
     config: &BuildConfig,
 ) -> Option<u128> {
     let count = origins + incoming.members.len();
-    if count > config.merge.max_colors {
+    if count > config.max_group_members() {
         return None;
     }
     let old = cost(slots, config.width(origins)) + cost(incoming.slots, incoming.width);
     let lower_new = cost(slots.max(incoming.slots), config.width(count));
-    if lower_new < old && (old - lower_new) as f64 > old as f64 * config.merge.min_saving {
+    if lower_new < old {
         Some(old - lower_new)
     } else {
         None
@@ -242,9 +255,7 @@ impl Bucket {
                 config.slots(card * (1.0 + config.merge.plan_margin))?,
                 width,
             );
-            Ok(new < old
-                && (old - new) as f64 > old as f64 * config.merge.min_saving
-                && can_beat(old - new, self.first, best))
+            Ok(new < old && can_beat(old - new, self.first, best))
         };
         let (mut low, mut high) = (0, size + 1);
         while low < high {
@@ -561,10 +572,13 @@ impl StreamingPlanner {
             self.groups.push(incoming);
             return Ok(());
         }
+        #[cfg(test)]
         let unpruned = config.merge.planner == MergePlanner::StreamingUnpruned;
+        #[cfg(not(test))]
+        let unpruned = false;
         if config.merge.disabled {
-            if incoming.members.len() >= config.merge.max_colors {
-                incoming.sketch.release();
+            if incoming.members.len() >= config.max_group_members() {
+                incoming.retire_sketch();
             }
             self.groups.push(incoming);
             if !unpruned {
@@ -608,14 +622,14 @@ impl StreamingPlanner {
                 group.input_peak_bytes = group
                     .input_peak_bytes
                     .saturating_add(incoming.input_peak_bytes);
-                if group.members.len() >= config.merge.max_colors {
-                    group.sketch.release();
+                if group.members.len() >= config.max_group_members() {
+                    group.retire_sketch();
                 }
                 self.add_to_bucket(c.a);
             }
         } else {
-            if incoming.members.len() >= config.merge.max_colors {
-                incoming.sketch.release();
+            if incoming.members.len() >= config.max_group_members() {
+                incoming.retire_sketch();
             }
             self.groups.push(incoming);
             if !unpruned {
@@ -627,7 +641,7 @@ impl StreamingPlanner {
 
     pub fn finish(mut self) -> Plan {
         for group in &mut self.groups {
-            group.sketch.release();
+            group.retire_sketch();
         }
         Plan {
             groups: self.groups,
@@ -650,7 +664,7 @@ pub fn plan(mut initial: Vec<Group>, config: &BuildConfig) -> Result<Plan> {
     }
     if config.merge.disabled {
         for group in &mut initial {
-            group.sketch.release();
+            group.retire_sketch();
         }
         return Ok(Plan {
             groups: initial,
@@ -659,8 +673,8 @@ pub fn plan(mut initial: Vec<Group>, config: &BuildConfig) -> Result<Plan> {
         });
     }
     for group in &mut initial {
-        if group.members.len() >= config.merge.max_colors {
-            group.sketch.release();
+        if group.members.len() >= config.max_group_members() {
+            group.retire_sketch();
         }
     }
     let mut pair_evaluations = initial.len() as u64 * initial.len().saturating_sub(1) as u64 / 2;
@@ -702,7 +716,7 @@ pub fn plan(mut initial: Vec<Group>, config: &BuildConfig) -> Result<Plan> {
     let mut result: Vec<_> = groups.into_iter().flatten().collect();
     result.sort_by_key(|g| g.members[0]);
     for group in &mut result {
-        group.sketch.release();
+        group.retire_sketch();
     }
     Ok(Plan {
         groups: result,
@@ -908,6 +922,7 @@ mod tests {
             assert_eq!(a.slots, b.slots);
             assert_eq!(a.cardinality, b.cardinality);
             assert_eq!(a.sketch, b.sketch);
+            assert_eq!(a.ordering_key, b.ordering_key);
             assert!(a.sketch.is_released());
         }
     }
@@ -936,8 +951,8 @@ mod tests {
     fn streaming_respects_origin_limit_and_deterministic_ties() {
         let mut c = config(Backend::Zor);
         c.merge.planner = MergePlanner::Streaming;
-        c.merge.max_colors = 2;
-        let identical = vec![(0..1000).collect(); 5];
+        let cap = c.max_group_members();
+        let identical = vec![(0..1000).collect(); 2 * cap + 1];
         let result = plan(initial(&identical, &c), &c).unwrap();
         assert_eq!(
             result
@@ -945,7 +960,11 @@ mod tests {
                 .iter()
                 .map(|g| g.members.clone())
                 .collect::<Vec<_>>(),
-            [vec![0, 1], vec![2, 3], vec![4]]
+            [
+                (0..cap).collect::<Vec<_>>(),
+                (cap..2 * cap).collect::<Vec<_>>(),
+                vec![2 * cap]
+            ]
         );
         assert!(result.groups.iter().all(|g| g.slots.is_power_of_two()));
     }
@@ -1013,7 +1032,6 @@ mod tests {
     fn streaming_parallel_comparisons_have_thread_independent_ties() {
         let mut c = config(Backend::Zor);
         c.merge.planner = MergePlanner::Streaming;
-        c.merge.max_colors = 3;
         let sets = vec![(0..1000).collect(); 16];
         let run = |threads| {
             rayon::ThreadPoolBuilder::new()
@@ -1040,6 +1058,7 @@ mod tests {
             assert_eq!(a.width, b.width);
             assert_eq!(a.cardinality.to_bits(), b.cardinality.to_bits());
             assert_eq!(a.sketch, b.sketch);
+            assert_eq!(a.ordering_key, b.ordering_key);
         }
     }
 
@@ -1048,7 +1067,6 @@ mod tests {
         for size in [64, 256, 4096] {
             let mut c = config(Backend::Zor);
             c.merge.sketch_size = size;
-            c.merge.max_colors = 3;
             c.merge.disabled = true;
             let sets: Vec<Vec<u64>> = (0..100)
                 .map(|i| (i * 8192..i * 8192 + 1000).collect())
@@ -1109,35 +1127,29 @@ mod tests {
             .unwrap();
         pool.install(|| {
             for fingerprint_bits in [1, 2, 4, 8, 16] {
-                for max_colors in [2, 5, 16] {
-                    for min_saving in [0.0, 0.05, 0.5] {
-                        for minimum_slots in [None, Some(256)] {
-                            let mut c = config(Backend::Zor);
-                            c.fingerprint_bits = fingerprint_bits;
-                            c.merge.max_colors = max_colors;
-                            c.merge.min_saving = min_saving;
-                            c.minimum_slots = minimum_slots;
-                            c.merge.sketch_size = 64;
-                            let sets: Vec<Vec<u64>> = (0..60)
-                                .map(|i| {
-                                    let h = crate::splitmix64(i);
-                                    let count = 1usize << ((h % 11) as u32);
-                                    // Overlap, disjoint families, repeated identical sets, and
-                                    // cardinalities exactly at power-of-two boundaries.
-                                    let start = ((h >> 8) % 4) * 4096;
-                                    (start..start + count as u64).collect()
-                                })
-                                .collect();
-                            let original = initial(&sets, &c);
-                            c.merge.planner = MergePlanner::StreamingUnpruned;
-                            let old = plan(original.clone(), &c).unwrap();
-                            c.merge.planner = MergePlanner::Streaming;
-                            let new = plan(original, &c).unwrap();
-                            assert_same_groups(&old.groups, &new.groups);
-                            assert_eq!(new.possible_pair_evaluations, old.pair_evaluations);
-                            assert!(new.pair_evaluations <= old.pair_evaluations);
-                        }
-                    }
+                for minimum_slots in [None, Some(256)] {
+                    let mut c = config(Backend::Zor);
+                    c.fingerprint_bits = fingerprint_bits;
+                    c.minimum_slots = minimum_slots;
+                    c.merge.sketch_size = 64;
+                    let sets: Vec<Vec<u64>> = (0..60)
+                        .map(|i| {
+                            let h = crate::splitmix64(i);
+                            let count = 1usize << ((h % 11) as u32);
+                            // Overlap, disjoint families, repeated identical sets, and
+                            // cardinalities exactly at power-of-two boundaries.
+                            let start = ((h >> 8) % 4) * 4096;
+                            (start..start + count as u64).collect()
+                        })
+                        .collect();
+                    let original = initial(&sets, &c);
+                    c.merge.planner = MergePlanner::StreamingUnpruned;
+                    let old = plan(original.clone(), &c).unwrap();
+                    c.merge.planner = MergePlanner::Streaming;
+                    let new = plan(original, &c).unwrap();
+                    assert_same_groups(&old.groups, &new.groups);
+                    assert_eq!(new.possible_pair_evaluations, old.pair_evaluations);
+                    assert!(new.pair_evaluations <= old.pair_evaluations);
                 }
             }
         });
@@ -1156,7 +1168,6 @@ mod tests {
             let mut c = config(Backend::Zor);
             assert_eq!(c.merge.sketch_size, 128);
             c.merge.plan_margin = plan_margin;
-            c.merge.max_colors = 5;
             let groups = initial(&sets, &c);
             c.merge.planner = MergePlanner::StreamingUnpruned;
             let old = plan(groups.clone(), &c).unwrap();
@@ -1177,7 +1188,7 @@ mod tests {
         assert!(!bucket_can_save(2048, 2, &incoming, &c)); // 16*S == L
         assert!(bucket_can_save(1024, 2, &incoming, &c));
         assert!(!bucket_can_save(1024, 1, &incoming, &c)); // first merge adds TWO bits
-        assert!(!bucket_can_save(128, c.merge.max_colors, &incoming, &c));
+        assert!(!bucket_can_save(128, c.max_group_members(), &incoming, &c));
         assert!(!bucket_can_save(
             4,
             2,
@@ -1195,18 +1206,16 @@ mod tests {
     #[test]
     fn full_origin_groups_are_not_compared_but_larger_future_arrivals_remain_eligible() {
         let mut c = config(Backend::Zor);
-        c.merge.max_colors = 2;
-        let sets = vec![(0..1000).collect(); 12];
+        let sets = vec![(0..1000).collect(); c.max_group_members() + 12];
         let new = plan(initial(&sets, &c), &c).unwrap();
         c.merge.planner = MergePlanner::StreamingUnpruned;
         let old = plan(initial(&sets, &c), &c).unwrap();
         assert_same_groups(&old.groups, &new.groups);
-        assert_eq!(new.pair_evaluations, 6);
+        assert_eq!(new.groups[0].members.len(), c.max_group_members());
         assert!(new.pair_evaluations < old.pair_evaluations);
 
         // A big group skipped for a small arrival must not be permanently retired.
         c.merge.planner = MergePlanner::Streaming;
-        c.merge.max_colors = 48;
         let big: Vec<_> = (0..4096).collect();
         let small: Vec<_> = (0..64).collect();
         let sets = [big.clone(), small, big];
@@ -1296,17 +1305,18 @@ mod tests {
     }
 
     #[test]
-    fn sketches_are_freed_at_the_cap_and_all_are_freed_at_finish() {
+    fn planning_allocations_are_freed_while_ordering_fingerprints_are_retained() {
         let mut c = config(Backend::Zor);
-        c.merge.max_colors = 3;
         c.merge.sketch_size = 64;
-        let sets = vec![(0..1000).collect(); 5];
+        let sets = vec![(0..1000).collect(); c.max_group_members() + 2];
         let mut state = StreamingPlanner::default();
         for g in initial(&sets, &c) {
             state.insert(g, &c).unwrap();
         }
         assert!(state.groups[0].sketch.is_released());
         assert_eq!(state.groups[0].sketch.allocated_bytes(), 0);
+        let key = state.groups[0].ordering_key.clone().unwrap();
+        assert_eq!(key.len(), c.merge.sketch_size);
         assert!(state
             .buckets
             .values()
@@ -1314,12 +1324,54 @@ mod tests {
         assert!(!state.groups[1].sketch.is_released());
         let plan = state.finish();
         assert!(plan.groups.iter().all(|g| g.sketch.allocated_bytes() == 0));
+        assert!(Arc::ptr_eq(
+            &key,
+            plan.groups[0].ordering_key.as_ref().unwrap()
+        ));
+        assert!(plan
+            .groups
+            .iter()
+            .all(|g| g.ordering_key.as_ref().unwrap().len() == c.merge.sketch_size));
         c.merge.planner = MergePlanner::AllPairs;
         assert!(super::plan(initial(&sets, &c), &c)
             .unwrap()
             .groups
             .iter()
             .all(|g| g.sketch.allocated_bytes() == 0));
+    }
+
+    #[test]
+    fn ordering_fingerprints_equal_the_final_group_union_sketch() {
+        let sets: Vec<Vec<u64>> = vec![
+            (0..256).collect(),
+            (128..384).collect(),
+            (4000..4256).collect(),
+            (0..256).collect(),
+            Vec::new(),
+        ];
+        for planner in [MergePlanner::Streaming, MergePlanner::AllPairs] {
+            for disabled in [false, true] {
+                let mut c = config(Backend::Zor);
+                c.merge.planner = planner;
+                c.merge.disabled = disabled;
+                let result = plan(initial(&sets, &c), &c).unwrap();
+                for group in result.groups {
+                    let mut union: Vec<_> = group
+                        .members
+                        .iter()
+                        .flat_map(|&id| sets[id].iter().copied())
+                        .collect();
+                    union.sort_unstable();
+                    union.dedup();
+                    let expected = Sketch::new(&union, c.merge.sketch_size, c.seed);
+                    assert_eq!(
+                        group.ordering_key.as_ref().unwrap().as_slice(),
+                        expected.fingerprints()
+                    );
+                    assert_eq!(group.sketch.allocated_bytes(), 0);
+                }
+            }
+        }
     }
 
     #[test]

@@ -44,7 +44,7 @@ pub(super) struct Guard {
 impl Guard {
     pub fn new(config: &BuildConfig, build_budget: u64) -> Self {
         Self {
-            enabled: config.merge.skip_oversized_documents,
+            enabled: true,
             budget: config
                 .merge
                 .max_document_memory_gib

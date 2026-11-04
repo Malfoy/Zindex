@@ -32,9 +32,16 @@ impl Drop for Fixture {
     }
 }
 fn call(args: &[&str], threads: &str) -> Output {
+    let format =
+        if args.first() == Some(&"query") && args.iter().any(|a| ["--records", "-r"].contains(a)) {
+            vec!["--output-format", "compact"]
+        } else {
+            vec![]
+        };
     Command::new(env!("CARGO_BIN_EXE_zorindex"))
         .args(["--threads", threads])
         .args(args)
+        .args(format)
         .output()
         .unwrap()
 }
@@ -45,8 +52,23 @@ fn ok(args: &[&str], threads: &str) -> String {
         "{args:?}: {}",
         String::from_utf8_lossy(&result.stderr)
     );
-    String::from_utf8(result.stdout).unwrap()
+    query_transcript(result)
 }
+
+// Semantic fixtures compare counts and query statistics together. The public
+// stdout/stderr separation is checked independently in user_output_cli.
+fn query_transcript(output: std::process::Output) -> String {
+    let stats = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .find(|line| line.starts_with("#query\t"))
+        .map(str::to_owned);
+    let payload = String::from_utf8(output.stdout).unwrap();
+    match stats {
+        Some(stats) => format!("{stats}\n{payload}"),
+        None => payload,
+    }
+}
+
 fn dna(n: usize, seed: u64) -> String {
     (0..n)
         .map(|i| b"ACGT"[(zorindex::splitmix64(i as u64 ^ seed) & 3) as usize] as char)
@@ -75,14 +97,7 @@ fn stat(output: &str, field: &str) -> u64 {
         .unwrap()
 }
 fn build(fof: &str, output: &str, extra: &[&str]) {
-    let mut args = vec![
-        "build",
-        "--fof",
-        fof,
-        "--output",
-        output,
-        "--power-of-two-merge",
-    ];
+    let mut args = vec!["build", "--fof", fof, "--output", output];
     for (flag, value) in [
         ("--k", "31"),
         ("--fingerprint-bits", "16"),
@@ -253,11 +268,8 @@ fn short_default_command_matches_explicit_optimized_settings() {
     let fof = f.write("defaults.fof", inputs);
     let query = f.write("query.fa", format!(">query\n{shared}\n"));
     let explicit = [
-        "--power-of-two-merge",
         "--merge-planner",
         "streaming",
-        "--merge-column-order",
-        "compression",
         "--hashes",
         "4",
         "--slot-scale",
@@ -419,16 +431,7 @@ fn merged_origins_and_serialized_size_classes_query_correctly() {
     assert!(stat(&info, "structure_bytes") < stat(&single_info, "structure_bytes"));
     // Existing output must never be overwritten.
     let result = call(
-        &[
-            "build",
-            "--fof",
-            &inputs,
-            "--output",
-            &index,
-            "--k",
-            "31",
-            "--power-of-two-merge",
-        ],
+        &["build", "--fof", &inputs, "--output", &index, "--k", "31"],
         "1",
     );
     assert!(!result.status.success());
@@ -483,7 +486,7 @@ fn expensive_exact_fallback_does_not_revert_the_planned_merge() {
     let seq = dna(700, 13);
     let reference = f.write("a.fa", format!(">a\n{seq}\n"));
     let inputs = f.write("inputs.fof", format!("a\t{reference}\nb\t{reference}\n"));
-    for planner in ["all-pairs", "streaming"] {
+    for planner in ["full", "streaming"] {
         let index = f.path(planner);
         build(
             &inputs,
@@ -537,7 +540,7 @@ fn streaming_planner_preserves_input_order_and_all_origins() {
 }
 
 #[test]
-fn global_abandoned_recovery_can_be_omitted_or_skipped_without_changing_filters() {
+fn global_abandoned_recovery_is_used_unless_omitted_at_construction() {
     let f = Fixture::new();
     // 1024 distinct 31-mers, at scale 1.0: exercise cycle breaking rather than
     // artificially changing filter sizing for this recovery test.
@@ -573,44 +576,44 @@ fn global_abandoned_recovery_can_be_omitted_or_skipped_without_changing_filters(
         );
     }
     let recovered = ok(&["query", "--index", &recovery, "--query", &reference], "4");
-    let ignored = ok(
-        &[
-            "query",
-            "--index",
-            &recovery,
-            "--query",
-            &reference,
-            "--ignore-abandoned",
-        ],
-        "4",
-    );
     let raw = ok(&["query", "--index", &dropped, "--query", &reference], "4");
     for color in ["a", "b"] {
         assert_eq!(matches(&recovered, color), 1024, "{recovered}");
         assert!(matches(&raw, color) < 1024, "{raw}");
-        assert_eq!(matches(&raw, color), matches(&ignored, color));
     }
-    // Skipping recovery does not even open the global map file.
+    // An index declaring recovery cannot silently query without its map.
     fs::remove_file(Path::new(&recovery).join("abandoned.zormap.zst")).unwrap();
-    let skipped = ok(
-        &[
-            "query",
-            "--index",
-            &recovery,
-            "--query",
-            &reference,
-            "--ignore-abandoned",
-        ],
-        "1",
-    );
-    for color in ["a", "b"] {
-        assert_eq!(matches(&skipped, color), matches(&raw, color));
+    for memory in ["all", "subindex"] {
+        assert!(!call(
+            &[
+                "query",
+                "--index",
+                &recovery,
+                "--query",
+                &reference,
+                "--query-memory",
+                memory
+            ],
+            "1"
+        )
+        .status
+        .success());
+        let result = ok(
+            &[
+                "query",
+                "--index",
+                &dropped,
+                "--query",
+                &reference,
+                "--query-memory",
+                memory,
+            ],
+            "1",
+        );
+        for color in ["a", "b"] {
+            assert_eq!(matches(&result, color), matches(&raw, color));
+        }
     }
-    assert!(
-        !call(&["query", "--index", &recovery, "--query", &reference], "1")
-            .status
-            .success()
-    );
 }
 
 #[test]
@@ -639,73 +642,7 @@ fn findere_recovers_abandoned_features_with_one_global_map_in_parallel() {
 }
 
 #[test]
-fn pruned_streaming_builds_identical_banks_and_queries_to_original() {
-    let f = Fixture::new();
-    let mut fof = String::new();
-    for id in 0..24 {
-        let size = [64, 256, 1024, 4096][id % 4];
-        let seq = dna(size, (id % 3) as u64);
-        let path = f.write(&format!("g{id}.fa"), format!(">r\n{seq}\n"));
-        fof.push_str(&format!("g{id}\t{path}\n"));
-    }
-    let inputs = f.write("inputs.fof", fof);
-    let query = f.write("query.fa", format!(">r\n{}\n", dna(4096, 0)));
-    for bits in ["8", "16"] {
-        for order in ["width", "compression"] {
-            let old = f.path(&format!("old-{bits}-{order}"));
-            let new = f.path(&format!("new-{bits}-{order}"));
-            for (path, planner) in [(&old, "streaming-unpruned"), (&new, "streaming")] {
-                build(
-                    &inputs,
-                    path,
-                    &[
-                        "--merge-planner",
-                        planner,
-                        "--fingerprint-bits",
-                        bits,
-                        "--merge-column-order",
-                        order,
-                        "--merge-max-colors",
-                        "3",
-                    ],
-                );
-            }
-            let load = |path: &str| -> serde_json::Value {
-                serde_json::from_slice(&fs::read(Path::new(path).join("manifest.json")).unwrap())
-                    .unwrap()
-            };
-            let a = load(&old);
-            let b = load(&new);
-            assert_eq!(a["slot_scale"], 1.0);
-            assert_eq!(a["banks"], b["banks"]);
-            assert_eq!(a["predicted_logical_bits"], b["predicted_logical_bits"]);
-            assert_eq!(
-                a["planning_pair_evaluations"],
-                b["planning_possible_pair_evaluations"]
-            );
-            assert!(
-                b["planning_pair_evaluations"].as_u64().unwrap()
-                    < a["planning_pair_evaluations"].as_u64().unwrap()
-            );
-            for bank in a["banks"].as_array().unwrap() {
-                let name = bank["file"].as_str().unwrap();
-                assert_eq!(
-                    fs::read(Path::new(&old).join(name)).unwrap(),
-                    fs::read(Path::new(&new).join(name)).unwrap()
-                );
-            }
-            let a = ok(&["query", "--index", &old, "--query", &query], "4");
-            let b = ok(&["query", "--index", &new, "--query", &query], "4");
-            assert_eq!(
-                a.lines().skip(1).collect::<Vec<_>>(),
-                b.lines().skip(1).collect::<Vec<_>>()
-            );
-        }
-    }
-}
-
-#[test]
-fn physical_column_order_preserves_partitions_scores_and_dataset_order() {
+fn automatic_column_order_preserves_dataset_order_across_threads() {
     let f = Fixture::new();
     let sequences: Vec<_> = (0..4).map(|id| dna(700, 777 + id)).collect();
     let paths: Vec<_> = sequences
@@ -725,79 +662,64 @@ fn physical_column_order_preserves_partitions_scores_and_dataset_order() {
             .map(|(id, &origin)| format!("{}\t{}\n", names[id], paths[origin]))
             .collect::<String>(),
     );
-    for planner in ["streaming", "all-pairs"] {
-        let mut baseline = None;
-        let mut baseline_partition = None;
-        for order in ["width", "compression"] {
-            let index = f.path(&format!("{planner}-{order}"));
-            build(
-                &inputs,
-                &index,
-                &[
-                    "--merge-planner",
-                    planner,
-                    "--merge-column-order",
-                    order,
-                    "--merge-max-colors",
-                    "2",
-                ],
-            );
-            let info = ok(&["info", "--index", &index], "1");
-            assert!(info.contains(&format!("merge_planner\t{planner}")));
-            assert!(info.contains(&format!("merge_column_order\t{order}")));
-            assert!(info.contains("merge_reverts_enabled\tfalse"));
-            let manifest: serde_json::Value =
-                serde_json::from_slice(&fs::read(Path::new(&index).join("manifest.json")).unwrap())
-                    .unwrap();
-            let mut partition = Vec::new();
-            for bank in manifest["banks"].as_array().unwrap() {
-                let mut previous_width = 0;
-                for group in bank["groups"].as_array().unwrap() {
-                    let width = group["width"].as_u64().unwrap();
-                    assert!(width >= previous_width);
-                    previous_width = width;
-                    partition.push(
-                        group["members"]
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .map(|id| id.as_u64().unwrap())
-                            .collect::<Vec<_>>(),
-                    );
-                }
-            }
-            partition.sort();
-            if let Some(old) = &baseline_partition {
-                assert_eq!(old, &partition);
-            }
-            baseline_partition = Some(partition);
-            let mut outputs = Vec::new();
-            for (origin, path) in paths.iter().enumerate() {
-                let result = ok(&["query", "--index", &index, "--query", path], "4");
-                // The first line includes a fresh elapsed wall time; compare
-                // result rows, not this deliberately variable timing field.
-                let rows = result.lines().skip(1).collect::<Vec<_>>().join("\n");
-                let single = ok(&["query", "--index", &index, "--query", path], "1");
-                assert_eq!(rows, single.lines().skip(1).collect::<Vec<_>>().join("\n"));
-                for (id, &owner) in origins.iter().enumerate() {
-                    if owner == origin {
-                        assert_eq!(matches(&result, &names[id]), 670);
-                    }
-                }
-                assert_eq!(
-                    result
-                        .lines()
-                        .skip(2)
-                        .map(|line| line.split('\t').next().unwrap())
-                        .collect::<Vec<_>>(),
-                    names
+    for planner in ["streaming", "full", "naive"] {
+        let index = f.path(planner);
+        build(&inputs, &index, &["--merge-planner", planner]);
+        let order = if planner == "naive" {
+            "width"
+        } else {
+            "compression"
+        };
+        let info = ok(&["info", "--index", &index], "1");
+        assert!(info.contains(&format!("merge_planner\t{planner}")));
+        assert!(info.contains(&format!("merge_column_order\t{order}")));
+        let method = if planner == "naive" {
+            "width-then-dataset-id-v1"
+        } else {
+            "union-sketch-fingerprints-lexicographic-v1"
+        };
+        assert!(info.contains(&format!("column_order_method\t{method}")));
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(Path::new(&index).join("manifest.json")).unwrap())
+                .unwrap();
+        let mut members = Vec::new();
+        for bank in manifest["banks"].as_array().unwrap() {
+            let mut previous_width = 0;
+            for group in bank["groups"].as_array().unwrap() {
+                let width = group["width"].as_u64().unwrap();
+                assert!(width >= previous_width);
+                previous_width = width;
+                members.extend(
+                    group["members"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|id| id.as_u64().unwrap()),
                 );
-                outputs.push(rows);
             }
-            if let Some(old) = &baseline {
-                assert_eq!(old, &outputs);
+        }
+        members.sort_unstable();
+        assert_eq!(members, (0..origins.len() as u64).collect::<Vec<_>>());
+        for (origin, path) in paths.iter().enumerate() {
+            let result = ok(&["query", "--index", &index, "--query", path], "4");
+            let single = ok(&["query", "--index", &index, "--query", path], "1");
+            assert_eq!(
+                result.lines().skip(1).collect::<Vec<_>>(),
+                single.lines().skip(1).collect::<Vec<_>>()
+            );
+            for (id, &owner) in origins.iter().enumerate() {
+                if owner == origin {
+                    assert_eq!(matches(&result, &names[id]), 670);
+                }
             }
-            baseline = Some(outputs);
+            assert_eq!(
+                result
+                    .lines()
+                    .skip(2)
+                    .map(|line| line.split('\t').next().unwrap())
+                    .collect::<Vec<_>>(),
+                names
+            );
         }
     }
 }
@@ -809,7 +731,7 @@ fn slice_padding_does_not_revert_a_planned_merge() {
     // 10-bit merged payload once the latter is padded to two bytes per row.
     let reference = f.write("short.fa", ">a\nACGT\n");
     let inputs = f.write("inputs.fof", format!("a\t{reference}\nb\t{reference}\n"));
-    for planner in ["all-pairs", "streaming"] {
+    for planner in ["full", "streaming"] {
         let index = f.path(planner);
         build(
             &inputs,
@@ -874,12 +796,8 @@ fn incompatible_options_and_corrupt_mappings_are_rejected() {
     let reference = f.write("a.fa", format!(">a\n{}\n", dna(100, 2)));
     let inputs = f.write("inputs.fof", format!("a\t{reference}\n"));
     for extra in [
-        vec!["--technical-layout", "split-large"],
-        vec!["--union-graph"],
         vec!["--merge-sketch-size", "1000"],
         vec!["--merge-planner", "unknown"],
-        vec!["--merge-max-colors", "64"],
-        vec!["--stack-compression", "lz4"],
     ] {
         let output = f.path("invalid");
         let mut args = vec![
@@ -890,7 +808,6 @@ fn incompatible_options_and_corrupt_mappings_are_rejected() {
             &output,
             "--k",
             "31",
-            "--power-of-two-merge",
             "--fingerprint-bits",
             "16",
         ];
@@ -921,7 +838,7 @@ fn full_64_bit_membership_payload_survives_unaligned_slice_serialization() {
         fof.push_str(&format!("b{id}\t{b}\n"));
     }
     let inputs = f.write("inputs.fof", fof);
-    for planner in ["all-pairs", "streaming"] {
+    for planner in ["full", "streaming"] {
         let index = f.path(planner);
         build(&inputs, &index, &["--merge-planner", planner]);
         let manifest: serde_json::Value =
@@ -969,82 +886,73 @@ fn all_cell_storage_modes_build_identical_filters_and_queries() {
         "query.fa",
         format!(">present\n{shared}\n>absent\n{}\n", dna(300, 999)),
     );
-    for planner in ["streaming", "streaming-unpruned", "all-pairs"] {
+    for planner in ["streaming", "full"] {
         for fp in ["1", "2", "4", "8", "16"] {
-            for order in ["width", "compression"] {
-                let mut outputs = Vec::new();
-                let mut manifests = Vec::new();
-                let mut results = Vec::new();
-                for (mode, storage) in [
-                    (None, "two-pass-temporary-disk-packed-tiled-packing"),
-                    (Some("--low-disk"), "two-pass-memory-packed-no-scratch"),
-                    (Some("--disk-backed"), "temporary-disk-u64-tiled-packing"),
+            let mut outputs = Vec::new();
+            let mut manifests = Vec::new();
+            let mut results = Vec::new();
+            for (mode, storage) in [
+                (None, "two-pass-temporary-disk-packed-tiled-packing"),
+                (Some("--low-disk"), "two-pass-memory-packed-no-scratch"),
+                (Some("--disk-backed"), "temporary-disk-u64-tiled-packing"),
+            ] {
+                let path = f.path(&format!("{planner}-{fp}-{storage}"));
+                let mut args = vec!["--fingerprint-bits", fp, "--merge-planner", planner];
+                args.extend(mode);
+                build(&fof, &path, &args);
+                let mut json: serde_json::Value = serde_json::from_slice(
+                    &fs::read(Path::new(&path).join("manifest.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(json["construction_cell_storage"], storage);
+                assert_eq!(
+                    json["construction_abandoned_storage"],
+                    if mode == Some("--low-disk") {
+                        "memory"
+                    } else {
+                        "temporary-disk-sorted-runs"
+                    }
+                );
+                assert!(json["merge_memory_budget_bytes"].as_u64().unwrap() > 0);
+                for key in [
+                    "construction_cell_storage",
+                    "construction_abandoned_storage",
+                    "sketch_seconds",
+                    "plan_seconds",
+                    "build_seconds",
+                    // Auto budget snapshots available RAM separately for
+                    // each build; it is provenance, not filter content.
+                    "merge_memory_budget_bytes",
                 ] {
-                    let path = f.path(&format!("{planner}-{fp}-{order}-{storage}"));
-                    let mut args = vec![
-                        "--fingerprint-bits",
-                        fp,
-                        "--merge-planner",
-                        planner,
-                        "--merge-column-order",
-                        order,
-                    ];
-                    args.extend(mode);
-                    build(&fof, &path, &args);
-                    let mut json: serde_json::Value = serde_json::from_slice(
-                        &fs::read(Path::new(&path).join("manifest.json")).unwrap(),
-                    )
-                    .unwrap();
-                    assert_eq!(json["construction_cell_storage"], storage);
-                    assert_eq!(
-                        json["construction_abandoned_storage"],
-                        if mode == Some("--low-disk") {
-                            "memory"
-                        } else {
-                            "temporary-disk-sorted-runs"
-                        }
-                    );
-                    assert!(json["merge_memory_budget_bytes"].as_u64().unwrap() > 0);
-                    for key in [
-                        "construction_cell_storage",
-                        "construction_abandoned_storage",
-                        "sketch_seconds",
-                        "plan_seconds",
-                        "build_seconds",
-                        // Auto budget snapshots available RAM separately for
-                        // each build; it is provenance, not filter content.
-                        "merge_memory_budget_bytes",
-                    ] {
-                        json.as_object_mut().unwrap().remove(key);
-                    }
-                    manifests.push(json);
-                    let output = ok(
-                        &["query", "--index", &path, "--query", &query],
-                        if mode.is_some() { "1" } else { "4" },
-                    );
-                    results.push(
-                        output
-                            .lines()
-                            .filter(|l| !l.starts_with('#'))
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    );
-                    outputs.push(path);
+                    json.as_object_mut().unwrap().remove(key);
                 }
-                for other in 1..outputs.len() {
-                    assert_eq!(manifests[0], manifests[other]);
-                    assert_eq!(results[0], results[other]);
-                    for entry in fs::read_dir(&outputs[0]).unwrap() {
-                        let name = entry.unwrap().file_name();
-                        if name == "manifest.json" {
-                            continue;
-                        }
-                        assert_eq!(
-                            fs::read(Path::new(&outputs[0]).join(&name)).unwrap(),
-                            fs::read(Path::new(&outputs[other]).join(&name)).unwrap(),
-                            "{name:?}"
-                        );
+                manifests.push(json);
+                let output = ok(
+                    &["query", "--index", &path, "--query", &query],
+                    if mode.is_some() { "1" } else { "4" },
+                );
+                results.push(
+                    output
+                        .lines()
+                        .filter(|l| !l.starts_with('#'))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+                outputs.push(path);
+            }
+            for other in 1..outputs.len() {
+                assert_eq!(manifests[0], manifests[other]);
+                assert_eq!(results[0], results[other]);
+                for entry in fs::read_dir(&outputs[0]).unwrap() {
+                    let name = entry.unwrap().file_name();
+                    if name == "manifest.json" {
+                        continue;
                     }
+                    assert_eq!(
+                        fs::read(Path::new(&outputs[0]).join(&name)).unwrap(),
+                        fs::read(Path::new(&outputs[other]).join(&name)).unwrap(),
+                        "{name:?}"
+                    );
                 }
             }
         }
@@ -1111,11 +1019,7 @@ fn all_cell_storage_modes_preserve_all_feature_extractors() {
             }
         }
     }
-    for flags in [
-        ["--plain", "--disk-backed"],
-        ["--plain", "--low-disk"],
-        ["--low-disk", "--disk-backed"],
-    ] {
+    for flags in [["--low-disk", "--disk-backed"]] {
         let invalid = f.path("invalid");
         assert!(!call(
             &["build", flags[0], flags[1], "--fof", &fof, "--output", &invalid, "--k", "31"],
@@ -1243,13 +1147,21 @@ fn record_queries_match_aggregate_counts_and_preserve_order_across_workers() {
         let index = f.path(&format!("records-fp{bits}"));
         build(&fof, &index, &["--fingerprint-bits", bits]);
         for recovery in [true, false] {
+            let index = if recovery {
+                index.clone()
+            } else {
+                let dropped = format!("{index}-no-recovery");
+                build(
+                    &fof,
+                    &dropped,
+                    &["--fingerprint-bits", bits, "--drop-abandoned"],
+                );
+                dropped
+            };
             let mut reference = Vec::new();
             for (id, seq) in sequences.iter().enumerate() {
                 let single = f.write("single-record.fa", format!(">q{id}\n{seq}\n"));
-                let mut args = vec!["query", "--index", &index, "--query", &single];
-                if !recovery {
-                    args.push("--ignore-abandoned");
-                }
+                let args = vec!["query", "--index", &index, "--query", &single];
                 let aggregate = ok(&args, "1");
                 let total: u64 = aggregate
                     .lines()
@@ -1283,9 +1195,9 @@ fn record_queries_match_aggregate_counts_and_preserve_order_across_workers() {
                 for (threads, record_flag, batch_flag, batch) in [
                     ("1", "--records", "--record-batch-size", "1"),
                     ("4", "--records", "--record-batch-size", "3"),
-                    ("4", "--bench-records", "--bench-batch", "4096"),
+                    ("4", "--records", "--record-batch-size", "4096"),
                 ] {
-                    let mut args = vec![
+                    let args = vec![
                         "query",
                         "--index",
                         &index,
@@ -1297,9 +1209,6 @@ fn record_queries_match_aggregate_counts_and_preserve_order_across_workers() {
                         batch_flag,
                         batch,
                     ];
-                    if !recovery {
-                        args.push("--ignore-abandoned");
-                    }
                     assert_eq!(ok(&args, threads), expected, "fp{bits} recovery={recovery}");
                 }
             }
@@ -1312,11 +1221,19 @@ fn sequential_queries_match_full_loading_for_seed_modes_widths_and_thresholds() 
     let f = Fixture::new();
     let shared = dna(700, 310);
     let large = dna(6000, 311);
+    let separate = dna(60_000, 313);
     let mut inputs = String::new();
     // Input order interleaves size classes; shared small documents can merge.
-    for (id, sequence) in [&large, &shared, &shared, &large[..2000].to_owned(), &shared]
-        .into_iter()
-        .enumerate()
+    for (id, sequence) in [
+        &large,
+        &shared,
+        &shared,
+        &large[..2000].to_owned(),
+        &shared,
+        &separate,
+    ]
+    .into_iter()
+    .enumerate()
     {
         let path = f.write(&format!("stream-{id}.fa"), format!(">doc\n{sequence}\n"));
         inputs.push_str(&format!("doc{id}\t{path}\n"));
@@ -1404,7 +1321,7 @@ fn sequential_queries_match_full_loading_for_seed_modes_widths_and_thresholds() 
             // Keep genuinely different size classes while still exercising
             // shared colored filters; otherwise this tiny fixture can collapse
             // entirely into one subindex for some seed schemes.
-            let mut extra = vec!["--fingerprint-bits", bits, "--merge-max-colors", "2"];
+            let mut extra = vec!["--fingerprint-bits", bits];
             extra.extend_from_slice(mode);
             build(&fof, &index, &extra);
             let manifest: serde_json::Value =
@@ -1414,11 +1331,17 @@ fn sequential_queries_match_full_loading_for_seed_modes_widths_and_thresholds() 
                 manifest["banks"].as_array().unwrap().len() >= 2,
                 "fp{bits} {name}"
             );
-            for ignore in [false, true] {
-                let mut args = vec!["query", "--index", &index, "--query", &query];
-                if ignore {
-                    args.push("--ignore-abandoned");
-                }
+            for drop_recovery in [false, true] {
+                let index = if drop_recovery {
+                    let dropped = format!("{index}-no-recovery");
+                    let mut options = extra.clone();
+                    options.push("--drop-abandoned");
+                    build(&fof, &dropped, &options);
+                    dropped
+                } else {
+                    index.clone()
+                };
+                let args = vec!["query", "--index", &index, "--query", &query];
                 let streamed = call(&args, "1");
                 assert!(
                     streamed.status.success(),
@@ -1442,7 +1365,7 @@ fn sequential_queries_match_full_loading_for_seed_modes_widths_and_thresholds() 
                         "fp{bits} {name}: direct dense/minimizer query path is required"
                     );
                 }
-                let streamed = String::from_utf8(streamed.stdout).unwrap();
+                let streamed = query_transcript(streamed);
                 let mut full = args.clone();
                 full.extend(["--query-memory", "all"]);
                 let full = ok(&full, "4");
@@ -1455,12 +1378,12 @@ fn sequential_queries_match_full_loading_for_seed_modes_widths_and_thresholds() 
                         .split("\telapsed_s=")
                         .next(),
                     full.lines().next().unwrap().split("\telapsed_s=").next(),
-                    "fp{bits} {name} ignore={ignore}"
+                    "fp{bits} {name} drop_recovery={drop_recovery}"
                 );
                 assert_eq!(
                     streamed.lines().skip(1).collect::<Vec<_>>(),
                     full.lines().skip(1).collect::<Vec<_>>(),
-                    "fp{bits} {name} ignore={ignore}"
+                    "fp{bits} {name} drop_recovery={drop_recovery}"
                 );
                 if name != "findere" {
                     for ratio in ["0", "0.8", "1"] {
@@ -1477,7 +1400,7 @@ fn sequential_queries_match_full_loading_for_seed_modes_widths_and_thresholds() 
                         assert_eq!(
                             streamed,
                             ok(&records, "1"),
-                            "fp{bits} {name} ratio={ratio} ignore={ignore}"
+                            "fp{bits} {name} ratio={ratio} drop_recovery={drop_recovery}"
                         );
                         assert!(fs::read_dir(&f.0).unwrap().all(|entry| !entry
                             .unwrap()
@@ -1548,21 +1471,27 @@ fn dense_direct_queries_preserve_long_ambiguous_and_repeated_feature_counts() {
     );
     for bits in ["4", "8", "16"] {
         let index = f.path(&format!("dense-direct-{bits}"));
-        build(
-            &fof,
-            &index,
-            &[
-                "--fingerprint-bits",
-                bits,
-                "--slot-count",
-                "8192",
-                "--max-subindexes",
-                "1",
-                "--max-subindex-size",
-                "4KiB",
-            ],
-        );
-        for ignore in [false, true] {
+        let extra = [
+            "--fingerprint-bits",
+            bits,
+            "--slot-scale",
+            "2",
+            "--max-subindexes",
+            "1",
+            "--max-subindex-size",
+            "4KiB",
+        ];
+        build(&fof, &index, &extra);
+        for drop_recovery in [false, true] {
+            let index = if drop_recovery {
+                let dropped = format!("{index}-no-recovery");
+                let mut options = extra.to_vec();
+                options.push("--drop-abandoned");
+                build(&fof, &dropped, &options);
+                dropped
+            } else {
+                index.clone()
+            };
             for ratio in ["0", "0.8", "1"] {
                 let mut args = vec![
                     "query",
@@ -1576,9 +1505,6 @@ fn dense_direct_queries_preserve_long_ambiguous_and_repeated_feature_counts() {
                     "--record-batch-size",
                     "2",
                 ];
-                if ignore {
-                    args.push("--ignore-abandoned");
-                }
                 let direct = call(&args, "4");
                 assert!(
                     direct.status.success(),
@@ -1595,7 +1521,7 @@ fn dense_direct_queries_preserve_long_ambiguous_and_repeated_feature_counts() {
                 );
                 assert_eq!(
                     direct.stdout, full.stdout,
-                    "fp{bits} ratio{ratio} ignore{ignore}"
+                    "fp{bits} ratio{ratio} drop_recovery{drop_recovery}"
                 );
             }
         }
@@ -1666,8 +1592,12 @@ fn capped_subindexes_route_hashes_and_preserve_membership_across_seed_modes_and_
             let mut extra = vec![
                 "--fingerprint-bits",
                 bits,
-                "--slot-count",
-                "8192",
+                "--slot-scale",
+                if mode.contains("minimizer") {
+                    "64"
+                } else {
+                    "4"
+                },
                 "--max-subindexes",
                 "1",
                 "--max-subindex-size",
@@ -1683,14 +1613,15 @@ fn capped_subindexes_route_hashes_and_preserve_membership_across_seed_modes_and_
             assert_eq!(m["max_subindexes"], 1);
             let banks = m["banks"].as_array().unwrap();
             let count = banks.len();
+            let source_slots = banks[0]["routing"]["source_slots"].as_u64().unwrap();
             assert!(count > 1 && count.is_power_of_two());
             for (part, bank) in banks.iter().enumerate() {
                 let slots = bank["slots"].as_u64().unwrap();
                 assert!(slots.is_power_of_two());
-                assert_eq!(slots * count as u64, 8192);
+                assert_eq!(slots * count as u64, source_slots);
                 assert_eq!(bank["routing"]["partition"], part);
                 assert_eq!(bank["routing"]["partitions"], count);
-                assert_eq!(bank["routing"]["source_slots"], 8192);
+                assert_eq!(bank["routing"]["source_slots"], source_slots);
                 let raw = zstd::decode_all(
                     fs::File::open(Path::new(&index).join(bank["file"].as_str().unwrap())).unwrap(),
                 )
@@ -1699,23 +1630,29 @@ fn capped_subindexes_route_hashes_and_preserve_membership_across_seed_modes_and_
                 assert_eq!(raw.len() as u64, 40 + payload);
                 assert!(payload <= 4096);
             }
-            for ignored in [false, true] {
+            for drop_recovery in [false, true] {
+                let index = if drop_recovery {
+                    let dropped = format!("{index}-no-recovery");
+                    let mut options = extra.clone();
+                    options.push("--drop-abandoned");
+                    build(&fof, &dropped, &options);
+                    dropped
+                } else {
+                    index.clone()
+                };
                 let mut args = vec!["query", "--index", &index, "--query", &query];
-                if ignored {
-                    args.push("--ignore-abandoned");
-                }
                 let a = call(&args, "4");
                 assert!(a.status.success(), "{}", String::from_utf8_lossy(&a.stderr));
                 let log = String::from_utf8_lossy(&a.stderr);
                 assert!(log.contains("input_passes=1\tseed_extraction_passes=1"));
-                assert!(log.contains(if ignored {
+                assert!(log.contains(if drop_recovery {
                     "abandoned_file_scans=0"
                 } else {
                     "abandoned_file_scans=1"
                 }));
                 assert!(log.contains("result_storage=RAM"));
                 args.extend(["--query-memory", "all"]);
-                let a = String::from_utf8(a.stdout).unwrap();
+                let a = query_transcript(a);
                 let b = ok(&args, "1");
                 assert_eq!(
                     a.lines().skip(1).collect::<Vec<_>>(),
@@ -1734,9 +1671,6 @@ fn capped_subindexes_route_hashes_and_preserve_membership_across_seed_modes_and_
                             "--min-ratio",
                             threshold,
                         ];
-                        if ignored {
-                            records.push("--ignore-abandoned");
-                        }
                         let a = ok(&records, "4");
                         records.extend(["--query-memory", "all"]);
                         assert_eq!(
@@ -1800,8 +1734,8 @@ fn partition_caps_validate_and_all_construction_storage_modes_agree() {
     ] {
         let index = f.path(name);
         let mut args = vec![
-            "--slot-count",
-            "8192",
+            "--slot-scale",
+            "4",
             "--max-subindex-size",
             "2KiB",
             "--fingerprint-bits",
@@ -1884,7 +1818,7 @@ fn malformed_hash_partition_metadata_is_rejected_before_reading_payloads() {
     build(
         &fof,
         &index,
-        &["--slot-count", "8192", "--max-subindex-size", "4KiB"],
+        &["--slot-scale", "4", "--max-subindex-size", "4KiB"],
     );
     let manifest_path = Path::new(&index).join("manifest.json");
     let original: serde_json::Value =
@@ -1950,6 +1884,8 @@ fn sequential_record_queries_parse_non_replayable_input_once() {
             "--query",
             "/dev/stdin",
             "--records",
+            "--output-format",
+            "compact",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2002,126 +1938,16 @@ fn legacy_manifest_without_planner_fields_still_loads() {
         "merge_reverts_enabled",
         "construction_cell_storage",
         "column_order",
+        "column_order_method",
     ] {
         manifest.as_object_mut().unwrap().remove(field);
     }
     fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
     let info = ok(&["info", "--index", &index], "1");
-    assert!(info.contains("merge_planner\tall-pairs"));
+    assert!(info.contains("merge_planner\tfull"));
     assert!(info.contains("merge_reverts_enabled\ttrue"));
     assert!(info.contains("construction_cell_storage\tin-memory-u64"));
     assert!(info.contains("merge_column_order\twidth"));
     let query = ok(&["query", "--index", &index, "--query", &reference], "4");
     assert_eq!(matches(&query, "a"), 670);
-}
-
-#[test]
-fn repacking_subindexes_preserves_filter_payloads_and_both_query_modes() {
-    use std::io::Read;
-    let f = Fixture::new();
-    let a = dna(5000, 9921);
-    let b = dna(3000, 9922);
-    let pa = f.write("a.fa", format!(">a\n{a}\n"));
-    let pb = f.write("b.fa", format!(">b\n{b}\n"));
-    let fof = f.write("input.fof", format!("a\t{pa}\nb\t{pb}\n"));
-    let index = f.path("before");
-    let output = f.path("after");
-    ok(
-        &[
-            "build",
-            "--fof",
-            &fof,
-            "--output",
-            &index,
-            "--index-mode",
-            "minimizers",
-            "--k",
-            "31",
-            "--window",
-            "19",
-            "--min-subindex-documents",
-            "1",
-            "--hashes",
-            "4",
-        ],
-        "4",
-    );
-    ok(
-        &["repack-subindexes", "--index", &index, "--output", &output],
-        "4",
-    );
-    assert_eq!(
-        fs::read(Path::new(&index).join("manifest.json")).unwrap(),
-        fs::read(Path::new(&output).join("manifest.json")).unwrap()
-    );
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(Path::new(&index).join("manifest.json")).unwrap())
-            .unwrap();
-    for bank in manifest["banks"].as_array().unwrap() {
-        let name = bank["file"].as_str().unwrap();
-        let mut before = Vec::new();
-        let mut after = Vec::new();
-        zorindex::open_index_reader(&Path::new(&index).join(name))
-            .unwrap()
-            .read_to_end(&mut before)
-            .unwrap();
-        zorindex::open_index_reader(&Path::new(&output).join(name))
-            .unwrap()
-            .read_to_end(&mut after)
-            .unwrap();
-        assert_eq!(before, after);
-    }
-    let query = f.write(
-        "queries.fa",
-        format!(
-            ">a\n{}\n>negative\n{}\n>empty\nNNN\n",
-            &a[50..1050],
-            dna(1000, 9221)
-        ),
-    );
-    for ratio in ["0", "0.8", "1"] {
-        let expected = ok(
-            &[
-                "query",
-                "--index",
-                &index,
-                "--query",
-                &query,
-                "--records",
-                "--min-ratio",
-                ratio,
-                "--query-memory",
-                "all",
-            ],
-            "4",
-        );
-        for dir in [&index, &output] {
-            for mode in ["all", "subindex"] {
-                assert_eq!(
-                    expected,
-                    ok(
-                        &[
-                            "query",
-                            "--index",
-                            dir,
-                            "--query",
-                            &query,
-                            "--records",
-                            "--min-ratio",
-                            ratio,
-                            "--query-memory",
-                            mode
-                        ],
-                        "4"
-                    )
-                );
-            }
-        }
-    }
-    assert!(!call(
-        &["repack-subindexes", "--index", &index, "--output", &output],
-        "4"
-    )
-    .status
-    .success());
 }

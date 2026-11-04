@@ -1,106 +1,18 @@
-# Index Format Notes
-
-This document describes Zindex's single-file and merged-directory formats. The exact reader and writer implementations are the source of truth.
-
-In minimizer metadata, the stored `k` remains the selection-window span and
-`minimizer_size` is the seed length. CLI `--k K --window W` maps to stored
-`k = K + W - 1` and `minimizer_size = K`. The CLI change does not alter filter
-bytes or require rebuilding existing indexes.
-
-Both formats are written as zstd streams by default. The magic bytes described
-below are the first bytes of the decompressed payload. Readers detect zstd frame
-magic automatically and also accept raw legacy payloads.
-
-## Zindex (`.zoridx`)
-
-Magic:
-
-```text
-ZORIDX1\0
-```
-
-Current format version: `10` (readers also accept versions 2, 3, 4, 5, 7, 8 and 9).
-Version 10 changes randstrobemer extraction to downstream-only construction
-and separate two-orientation querying. Version-9 custom-randstrobemer files
-are rejected with a rebuild message. Other version-9 indexes remain readable.
-
-Header fields:
-
-- version
-- `k`
-- ZOR hash count
-- fingerprint width (`1`, `2`, `4`, `8` or `16`). Sub-byte fingerprints are packed eight, four or two per byte, with each stack row rounded up to a whole byte
-- flags
-- seed
-- feature mode
-- minimizer size
-- modimizer sampling
-- findere z byte, only for findere mode
-- minimizer scheme byte: 0 = SIMD, 1 = open-closed mod (version 8)
-- homopolymer-compression byte: 0 = disabled, 1 = enabled (version 8)
-- seed pattern width byte, followed by that many ASCII `#`/`_` bytes.
-  width 0 disables masking (version 9)
-- randstrobemer enabled byte: 0 = disabled, 1 = enabled. When enabled,
-  followed by inclusive minimum and maximum start distances as little-endian
-  `u64` values (version 9)
-- ZOR segmented layout
-- color metadata
-- technical layout and technical-bin metadata (version 7)
-- slot-major stack
-- optional union graph
-
-For sub-byte fingerprints of width `f`, a plain stack row occupies
-`ceil(technical_bin_count * f / 8)` bytes and a standalone filter (including a
-union graph) occupies `ceil(array_length * f / 8)` bytes. Fingerprints are packed
-from the least-significant bits of each byte. Slice codecs operate on these
-packed bytes with a one-byte codec element width. The header retains width `f`.
-Unused final-byte bits are ignored by queries. The 8- and 16-bit layouts are
-unchanged.
-
-Version-9 anchor settings apply to construction, queries and plain-index
-appends. Pattern syntax, symmetry and width, and randstrobemer distances are
-validated on load. Older indexes have neither masking nor randstrobemers.
-older readers reject version 9 rather than silently extracting different keys.
-
-The stack can be stored plain or compressed. Plain stacks store all rows as
-contiguous little-endian fingerprint bytes (or packed bits at width 1). Compressed stacks store row offsets
-and codec payload bytes. Each compressed row expands to:
-
-```text
-ceil(technical_bin_count * fingerprint_bits / 8)
-```
-
-The query path computes row positions once per feature. In plain mode it XORs
-directly from the interleaved rows. In compressed mode it decodes the selected
-rows into scratch buffers and XORs those rows.
-
-## Experimental Zindex Stack Codecs
-
-The experimental stored stack-codec byte maps to:
-
-```text
-0  none
-1  svb32 legacy
-2  svb32-0124
-3  bitpack legacy
-5  lz4
-6  snappy
-7  fastpfor256
-8  lz4-lib
-9  lz4-hc
-10 fastpfor-pack
-```
-
-Legacy codecs remain readable for old local indexes but are hidden from the
-CLI when they are not useful for current experiments.
+# Index format notes
 
 ## Zindex power-of-two merged directory
 
-Zindex builds a new merged directory by default, regardless of the output
-extension. `--plain` selects the legacy single-file `.zoridx` layout.
-`--power-of-two-merge` remains an optional compatibility flag.
-`manifest.json` contains version `8` (or `9` for hash-partitioned indexes), feature/hash settings, dataset identities,
+Zindex stores each index in a directory containing a manifest, compressed
+subindexes and optional recovery data.
+`manifest.json` contains version `8` (or `9` for hash-partitioned indexes and `10`
+for combined indexes), feature/hash settings, dataset identities,
 group members and widths, bank sizes and abandoned-key map metadata.
+`input_document_count` records the original requested collection size,
+`source_document_ids` maps indexed datasets to their original input positions,
+and `skipped_documents` lists explicit memory exclusions. `info` derives
+`collection_status` from these fields. An index with exclusions is `incomplete`.
+Builds require all datasets unless skipping is explicitly enabled. Successful
+skip reports use status `incomplete`, and failed all-skipped builds publish no index.
 Version 4 adds `minimizer_scheme` (`simd` or `open-closed-mod`) and
 `homopolymer_compression` (boolean). These govern both construction and queries.
 Missing legacy fields default to SIMD selection and compression disabled.
@@ -154,6 +66,33 @@ optional fixed segment geometry. Legacy library configurations without it keep
 their historical position mapping. Readers before version 9 reject partitioned
 directories, rather than accidentally querying every partition.
 
+Version 10 combines existing index collections without rebuilding filters.
+Each bank has a `component` ID identifying its original collection. Components
+are flattened and assigned consecutive IDs starting at 1 during fusion, including
+when an input is itself fused. Banks are ordered by
+`(component, source_slots, partition)` and named
+`component-<id>-bank-<exponent>[-part-<partition>-of-<partitions>].zorbank.zst`.
+Within a component, the version-9 routing and dataset-mapping invariants apply.
+Queries route independently within each `(component, source_slots)` group, so
+collections with different partition geometries can coexist. Existing indexes
+have implicit component 0 and retain their filenames and ordering.
+
+Compressed bank bytes and their headers are copied unchanged. Linux fusion operations
+attempt an independent copy-on-write reflink and validate the resulting
+snapshot. If cloning is unavailable, one streaming pass validates decoded
+payloads while copying the original compressed bytes. Both paths validate
+seek-table geometry and checksums, bank headers, decoded lengths and payload
+checksums when present. A failed copy removes its partial destination.
+Independent banks are copied and validated in parallel using the requested worker
+pool, alongside recovery merging. Each recovery input has a fixed-size buffer.
+The combined manifest offsets each input's dataset IDs by the indexed dataset
+count of all preceding inputs. A heap merges recovery files in hash order in one
+pass, concatenating postings after the same ID remapping, including for colliding
+hashes. Source document IDs and skipped-input reports use the original document
+count of all preceding inputs as their offset. The combined index is self-contained. Readers before
+version 10 reject it. Query and info validation reject invalid component order,
+filenames and dataset assignments.
+
 Each `bank-<exponent>.zorbank.zst` expands to magic `ZORPOW3\0`, followed by
 four little-endian `u64` values: slots, bits per row, group count and data bytes.
 Rows have `ceil(bits_per_row / 8)` bytes. Each row begins with all groups'
@@ -161,6 +100,17 @@ Rows have `ceil(bits_per_row / 8)` bytes. Each row begins with all groups'
 groups have no origin bits. Group offsets in the manifest describe the original
 complete-payload prefix. The origin-plane offset for group `i` is
 `group_count * fingerprint_bits + group.offset - i * fingerprint_bits`.
+
+`column_order_method` identifies construction ordering independently of the
+`column_order` label. Current full/streaming builds record
+`union-sketch-fingerprints-lexicographic-v1`: keep equal-width sections together,
+sort by the existing final union-sketch fingerprint bytes, then break ties by
+the first dataset ID. Only these 8-bit sketch bytes remain after planning.
+The 32-bit union minima are freed. Rebuilt filters and memory/hash partitions
+share their planned parent's key without new sketches or filter-cell reads.
+The keys are construction-only and are not stored in the index. Naive builds
+record `width-then-dataset-id-v1`. Fusion preserves input column layouts and
+omits a single construction-order method for the combined collection.
 
 Construction mode does not change the bank encoding or query layout. The default
 two-pass builder records `construction_cell_storage` as
@@ -207,8 +157,8 @@ This is one global multimap across all banks.
 The current reader also supports manifest versions 1 through 8 and their legacy
 `ZORPOW1\0` interleaved banks. Version-1 per-group abandoned-key records are
 converted to the global 32-bit-hash multimap on load. Older readers cannot read
-new version-9 directories. Merged directories currently cannot be appended or
-repacked. Rebuilding requires the complete input list.
+new version-9 or version-10 directories. To add datasets, combine compatible
+indexes with `zorindex fusion` or rebuild from the complete input list.
 
 ### Parallel loading of merged subindexes
 
@@ -228,5 +178,4 @@ header, and the reader bounds frame and table allocations before decoding.
 Streaming readers ignore the skippable table and concatenate the frames normally.
 Parallel readers use disjoint output slices and bound compressed scratch to a
 single frame per active worker. This compression framing does not change matrix
-geometry, fingerprints, document IDs or membership semantics. `repack-subindexes`
-converts existing merged indexes to this framing without reconstructing filters.
+geometry, fingerprints, document IDs or membership semantics.

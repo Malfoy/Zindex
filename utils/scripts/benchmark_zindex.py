@@ -109,7 +109,7 @@ def main():
     parser.add_argument("--index-mode", choices=["kmers", "minimizers", "modimizers", "findere"], default="minimizers")
     parser.add_argument("--hashes", type=int, default=4)
     parser.add_argument("--fingerprint-bits", type=int, choices=[1, 2, 4, 8, 16], default=8)
-    parser.add_argument("--merge-planner", choices=["streaming", "full", "all-pairs", "streaming-unpruned", "naive"], default="streaming")
+    parser.add_argument("--merge-planner", choices=["streaming", "full", "naive"], default="streaming")
     parser.add_argument("--query-memory", choices=["subindex", "all"], default="subindex")
     parser.add_argument("--max-subindex-size", default="8GiB")
     parser.add_argument("--max-subindexes", type=int)
@@ -162,8 +162,8 @@ def main():
                  "--threads", str(args.threads), "--k", str(args.k), "--index-mode", args.index_mode,
                  "--minimizer-scheme", args.minimizer_scheme,
                  "--hashes", str(args.hashes), "--fingerprint-bits", str(args.fingerprint_bits),
-                 "--merge-planner", args.merge_planner, "--merge-column-order", "compression",
-                 "--merge-sketch-size", "128", "--merge-max-colors", "48", "--seed", "69",
+                 "--merge-planner", args.merge_planner,
+                 "--merge-sketch-size", "128", "--seed", "69",
                  "--slot-scale", "1.0", "--merge-plan-margin", str(args.merge_plan_margin),
                  "--cycle-break", "no-heuristic", "--tie-scan", "1", "--segment-length", "64",
                  "--min-subindex-documents", str(args.min_subindex_documents),
@@ -185,7 +185,7 @@ def main():
                        "--threads", str(args.threads), "--query-memory", args.query_memory,
                        "--min-ratio", str(args.min_ratio)]
             if args.index_mode != "findere":
-                command.append("--records")
+                command += ["--records", "--output-format", "compact"]
             result["stages"][label] = measured(root, label, command)
             save(root / "results.json", result)
         if args.hash_index:

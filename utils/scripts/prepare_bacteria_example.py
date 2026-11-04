@@ -146,6 +146,21 @@ def check_results(path, truth=None):
         expected = list(csv.DictReader(source, delimiter="\t"))
     with path.open(newline="") as source:
         rows = list(csv.DictReader(source, delimiter="\t"))
+    # Normalize the named and compact schemas to one record per query.
+    if rows and "dataset_id" in rows[0]:
+        grouped = []
+        for row in rows:
+            if not grouped or grouped[-1]["query_id"] != row["query_id"]:
+                grouped.append(dict(query_id=row["query_id"],
+                                    valid_kmers=row["queried_seeds"], hits=""))
+            record = grouped[-1]
+            if record["valid_kmers"] != row["queried_seeds"]:
+                raise ValueError("Inconsistent query seed counts")
+            if row["dataset_id"] != ".":
+                if record["hits"]:
+                    record["hits"] += ","
+                record["hits"] += row["dataset_id"] + ":" + row["matches"]
+        rows = grouped
     if [r["query_id"] for r in rows] != [r["query_id"] for r in expected]:
         raise ValueError("Missing, additional or reordered query records")
     positives = 0

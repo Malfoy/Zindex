@@ -13,6 +13,11 @@ cargo fmt --all -- --check
 cargo test --workspace --locked
 ```
 
+CI also executes the README's usage commands in a temporary directory using
+the bundled genomes. After building, run `python3 utils/scripts/check_readme.py`
+to check them locally. The README is the user guide. Keep format details,
+troubleshooting and measurement methods in their focused reference documents.
+
 CI runs the release suite with native and portable x86-64 code generation.
 Use the pinned Rust toolchain from `rust-toolchain.toml` when reproducing CI;
 the workflow installs that same compiler. Compiler upgrades should be validated

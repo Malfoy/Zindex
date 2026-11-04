@@ -28,6 +28,20 @@ and actual manifest are retained. Parameter options include hash/fingerprint
 width, planner, maximum subindexes, minimum documents, maximum subindex bytes,
 and query memory mode. See `python3 utils/scripts/benchmark_zindex.py --help`.
 
+Current builds size filters automatically and derive the maximum merged group
+from the 64-bit payload width: `64 - fingerprint_bits`, or 56 datasets at fp8.
+Merges require strictly positive predicted filter-cell savings. Column order is
+selected internally: streaming/full construction sorts equal-width columns by
+their retained union-sketch fingerprints. It reuses the sketches without
+sampling filter cells. The naive planner uses width order.
+
+The retained 4K and 16K October experiments explicitly used compression column
+order and a maximum of 48 datasets per group at fp8. Their generic `compression`
+label does not identify how ordering keys were obtained. Current manifests add
+`column_order_method` to record the sketch-fingerprint method explicitly. The
+automatic fp8 group limit is also now 56. Historical timing and size measurements
+must not be attributed to these changes without checking their frozen sources.
+
 The runner disables skipping oversized documents and checks the final document
 count. A failed full-collection build is a failed point, not a smaller benchmark.
 This does not turn memory admission estimates into hard memory guarantees.
@@ -76,19 +90,3 @@ Historical measurements retain their original settings and timing definitions.
 See [REPRODUCIBILITY.md](REPRODUCIBILITY.md) for the current artifact inventory
 and missing material needed to reproduce the manuscript's large collections.
 The bundled example and this runner do not reproduce unpublished experiments.
-
-## Legacy slice-compression experiments
-
-`--stack-compression`, ordinary `repack` and `--decode-stack` concern the
-legacy `--plain` format. Merged subindexes instead use Zstd-compressed slices.
-To study a legacy slice codec:
-
-```bash
-./target/release/zorindex build --plain --fof samples.fof --k 31 \
-  --index-mode minimizers --window 19 --output /results/base.zoridx
-./target/release/zorindex repack --index /results/base.zoridx \
-  --stack-compression lz4-hc --output /results/base.lz4hc.zoridx
-```
-
-Compare stored-query and decoded-query time separately, include loading in
-end-to-end measurements, and retain repack time and both on-disk sizes.

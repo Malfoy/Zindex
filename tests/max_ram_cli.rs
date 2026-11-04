@@ -84,7 +84,7 @@ fn files(path: &Path, base: &Path, out: &mut std::collections::BTreeMap<PathBuf,
     }
 }
 #[test]
-fn invalid_total_budget_and_legacy_conflict_are_rejected() {
+fn invalid_total_budget_and_conflicting_budgets_are_rejected() {
     let f = Fixture::new(2000);
     for value in ["0", "-1", "NaN", "inf", "1e100", "0.0000000001"] {
         let out = f.build("invalid", &["--max-ram-gb", value]);
@@ -173,6 +173,8 @@ fn fixed_budget_keeps_native_filter_bytes_and_queries_identical() {
                 "--query",
                 f.0.join("query.fa").to_str().unwrap(),
                 "--records",
+                "--output-format",
+                "compact",
                 "--min-ratio",
                 "1",
             ])

@@ -79,7 +79,7 @@ impl IndexMode {
 )]
 #[serde(rename_all = "kebab-case")]
 pub enum MinimizerScheme {
-    /// Standard canonical SIMD hash minimizers (also used by legacy indexes).
+    /// Standard canonical SIMD hash minimizers.
     #[default]
     Simd,
     /// Canonical open-closed mod minimizers, with a syncmer-prioritized anchor.
