@@ -40,8 +40,19 @@ mod bank_io;
 
 #[path = "query_stream.rs"]
 mod query_stream;
+#[path = "record_output.rs"]
+mod record_output;
 #[path = "record_query.rs"]
 mod record_query;
+pub use record_output::RecordFormat;
+
+#[path = "fusion.rs"]
+mod fusion;
+pub use fusion::{fuse_indexes, fuse_many_indexes};
+
+#[path = "abandoned_io.rs"]
+mod abandoned_io;
+use abandoned_io::AbandonedReader;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Color {
@@ -62,6 +73,8 @@ struct GroupMeta {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct BankMeta {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    component: usize,
     file: String,
     slots: usize,
     row_bits: usize,
@@ -70,6 +83,10 @@ struct BankMeta {
     fingerprint_first: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     routing: Option<Routing>,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +101,19 @@ fn partition_id(key: u64, seed: u64, partitions: usize) -> usize {
 }
 
 impl BankMeta {
+    fn source_group(&self) -> (usize, usize) {
+        (self.component, self.source_slots())
+    }
+
+    fn expected_filename(&self) -> String {
+        let name = Self::filename(self.slots, self.routing);
+        if self.component == 0 {
+            name
+        } else {
+            format!("component-{}-{name}", self.component)
+        }
+    }
+
     fn source_slots(&self) -> usize {
         self.routing.map_or(self.slots, |r| r.source_slots)
     }
@@ -137,6 +167,8 @@ struct Manifest {
     merge_planner: MergePlanner,
     #[serde(default = "legacy_column_order")]
     column_order: ColumnOrder,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    column_order_method: Option<String>,
     #[serde(default)]
     planning_pair_evaluations: u64,
     #[serde(default)]
@@ -199,6 +231,15 @@ fn legacy_cell_storage() -> String {
     "in-memory-u64".into()
 }
 impl Manifest {
+    fn collection_status(&self) -> &'static str {
+        if self.skipped_documents.is_empty()
+            && self.input_document_count.max(self.colors.len()) == self.colors.len()
+        {
+            "complete"
+        } else {
+            "incomplete"
+        }
+    }
     fn features(&self) -> Result<FeatureConfig> {
         ensure!(self.randstrobemers.is_none() || (self.version >= 6 && self.randstrobe_scheme.as_deref() == Some(crate::RANDSTROBE_SCHEME)),
             "unsupported legacy/custom randstrobemer extraction; rebuild this index with the current downstream scheme");
@@ -217,6 +258,7 @@ impl Manifest {
     }
 }
 struct BuiltGroup {
+    ordering_key: Option<std::sync::Arc<Vec<u8>>>,
     meta: GroupMeta,
     slots: usize,
     cells: CompletedCells,
@@ -463,11 +505,15 @@ pub fn build(
 ) -> Result<()> {
     if config.merge.planner == MergePlanner::Naive {
         // Naive means ordered placement only: neither a global size-class
-        // promotion pass nor sample-based physical reordering is performed.
+        // promotion pass nor sketch-based physical reordering is performed.
         config.merge.min_subindex_documents = 1;
         config.merge.max_subindexes = None;
-        config.merge.column_order = ColumnOrder::Width;
     }
+    let column_order = if config.merge.planner == MergePlanner::Naive {
+        ColumnOrder::Width
+    } else {
+        ColumnOrder::Compression
+    };
     config.validate()?;
     let rss_guard = super::memory::RssGuard::start(config.merge.max_ram_gb)?;
     config.feature_config.validate_anchors(config.k)?;
@@ -503,6 +549,9 @@ pub fn build(
     let mut skipped_documents = Vec::new();
     for (id, (input, &cost)) in original_inputs.into_iter().zip(&original_costs).enumerate() {
         if let Err(error) = guard.check("input-size", cost) {
+            if !config.merge.skip_oversized_documents {
+                return Err(error).with_context(|| format!("dataset {id} {} exceeds its memory budget, use --skip-oversized-documents to allow exclusions", input.name));
+            }
             let skipped = guard.skipped(id, &input, &error).unwrap();
             eprintln!("skipping document {id} {}: {}", input.name, skipped.reason);
             skipped_documents.push(skipped);
@@ -588,10 +637,24 @@ pub fn build(
                 let (keys, occurrences) = match guard.collect(input, &config) {
                     Ok(result) => result,
                     Err(error) => {
+                        if !config.merge.skip_oversized_documents {
+                            if guard
+                                .skipped(prefiltered_source_ids[id], input, &error)
+                                .is_some()
+                            {
+                                return Err(error).with_context(|| format!("dataset {} {} exceeds its memory budget, use --skip-oversized-documents to allow exclusions", prefiltered_source_ids[id], input.name));
+                            }
+                            return Err(error).with_context(|| {
+                                format!(
+                                    "reading dataset {} {}",
+                                    prefiltered_source_ids[id], input.name
+                                )
+                            });
+                        }
                         return match guard.skipped(prefiltered_source_ids[id], input, &error) {
                             Some(skipped) => Ok(Err(skipped)),
                             None => Err(error),
-                        }
+                        };
                     }
                 };
                 let sketch_start = Instant::now();
@@ -779,6 +842,7 @@ pub fn build(
         &config,
         &graph,
     )?;
+    drop(planned);
     let partitioned = built.iter().any(|g| g.routing.is_some());
     if partitioned {
         exact_group_verifications = built
@@ -798,12 +862,7 @@ pub fn build(
     } else {
         save_abandoned_groups(&mut built, &stage.0)?
     };
-    let banks = pack_banks_streaming(
-        built,
-        config.merge.column_order,
-        config.fingerprint_bits,
-        &stage.0,
-    )?;
+    let banks = pack_banks_streaming(built, column_order, config.fingerprint_bits, &stage.0)?;
     if config.merge.disk_backed {
         fs::remove_dir(stage.0.join("features"))?;
     }
@@ -843,7 +902,12 @@ pub fn build(
         sketch_size: config.merge.sketch_size,
         sketch_method: "simd-sketch-0.3.0 feature-ID/union extensions; 8-bit fingerprints, 32-bit union minima, AVX2 collection/comparison/union; collision-corrected Jaccard".into(),
         merge_planner: config.merge.planner,
-        column_order: config.merge.column_order,
+        column_order,
+        column_order_method: Some(if column_order == ColumnOrder::Compression {
+            "union-sketch-fingerprints-lexicographic-v1"
+        } else {
+            "width-then-dataset-id-v1"
+        }.into()),
         planning_pair_evaluations,
         planning_possible_pair_evaluations,
         merge_reverts_enabled: false,
@@ -894,7 +958,7 @@ pub fn build(
             input_document_count,
             manifest.colors.len(),
             &skipped_documents,
-            "indexed",
+            "incomplete",
             guard.budget,
         )?;
         fs::copy(&skip_report, stage.0.join("skipped-documents.json"))?;
@@ -906,6 +970,13 @@ pub fn build(
     );
     rss_guard.check()?;
     fs::rename(&stage.0, output)?;
+    eprintln!(
+        "collection\tstatus={}\trequested={}\tindexed={}\tskipped={}",
+        manifest.collection_status(),
+        input_document_count,
+        manifest.colors.len(),
+        skipped_documents.len()
+    );
     eprintln!("built {} in {:.3}s: banks={}, groups={}, stack_bytes={}, fallback_bytes={}, rejected_groups={}, overflow_groups={}",
         output.display(), start.elapsed().as_secs_f64(), manifest.banks.len(), manifest.banks.iter().map(|b| b.groups.len()).sum::<usize>(),
         manifest.banks.iter().map(|b| b.slots * b.row_bits.div_ceil(8)).sum::<usize>(), abandoned_hashes * 8 + abandoned_origins * 4, rejected_groups, overflow_groups);
@@ -1145,6 +1216,7 @@ fn guard_groups(
                     slots: config.slots(colors[id].unique_kmers as f64)?,
                     width: config.width(1),
                     sketch: group.sketch.clone(),
+                    ordering_key: group.ordering_key.clone(),
                     feature_count_upper_bound: colors[id].unique_kmers,
                     input_peak_bytes: input_costs[id].max(super::memory::feature_resident_bytes(
                         colors[id].occurrences,
@@ -1452,6 +1524,7 @@ fn construct_group_at_slots(
     };
     Ok((
         BuiltGroup {
+            ordering_key: group.ordering_key.clone(),
             meta,
             slots,
             cells,
@@ -1530,7 +1603,7 @@ fn promote_small_subindexes(
         usize::MAX,
         &costs,
         super::memory::workspace_budget(&config.merge),
-        !config.merge.skip_oversized_documents,
+        false,
         config.merge.build_memory_gib.is_some(),
         super::memory::total_bytes(config.merge.max_ram_gb),
         |_, &(id, slots, group)| {
@@ -1618,7 +1691,7 @@ fn partition_large_subindexes(
         usize::MAX,
         &costs,
         super::memory::workspace_budget(&config.merge),
-        !config.merge.skip_oversized_documents,
+        false,
         config.merge.build_memory_gib.is_some(),
         super::memory::total_bytes(config.merge.max_ram_gb),
         |_, &(group, source_slots, local, partitions)| {
@@ -1669,54 +1742,22 @@ fn partition_large_subindexes(
     Ok(result)
 }
 
-// Sample eight short windows across the complete filter, including its ends.
-// This bounds ordering memory/I/O independently of filter capacity. Using the
-// actual assigned cells avoids assuming Jaccard predicts XOR solution similarity.
-fn column_sample(group: &BuiltGroup) -> Result<Vec<u8>> {
-    group.cells.validate(group.slots, group.meta.width)?;
-    let mut file = group.cells.open()?;
-    let window = group.slots.min(16);
-    let windows = if group.slots <= 16 { 1 } else { 8 };
-    let mut sample = vec![0; windows * window * 8];
-    for i in 0..windows {
-        let slot = if windows == 1 {
-            0
-        } else {
-            ((group.slots - window) as u128 * i as u128 / (windows - 1) as u128) as u64
-        };
-        group.cells.read_block(
-            slot as usize,
-            &mut sample[i * window * 8..(i + 1) * window * 8],
-            file.as_mut(),
-        )?;
-    }
-    Ok(sample)
-}
-
-fn order_columns(groups: &mut [BuiltGroup], order: ColumnOrder) -> Result<()> {
-    // Width sorting is retained: variable-width sections stay contiguous and
-    // physical reordering never changes origin bit assignments or color IDs.
-    groups.sort_by_key(|g| (g.meta.width, g.meta.members[0]));
-    if order == ColumnOrder::Width || groups.len() < 2 {
-        return Ok(());
-    }
-    for section in groups.chunk_by_mut(|a, b| a.meta.width == b.meta.width) {
-        if section.len() < 2 {
-            continue;
-        }
-        let samples = section
-            .par_iter()
-            .map(|g| Ok((g.meta.members[0], column_sample(g)?)))
-            .collect::<Result<BTreeMap<_, _>>>()?;
-        // A lexicographic locality heuristic, not a global compression optimum.
-        // No quadratic similarity matrix, no filter rebuild, no merge reverts.
-        section.sort_by(|a, b| {
-            samples[&a.meta.members[0]]
-                .cmp(&samples[&b.meta.members[0]])
-                .then_with(|| a.meta.members[0].cmp(&b.meta.members[0]))
-        });
-    }
-    Ok(())
+fn order_columns(groups: &mut [BuiltGroup], order: ColumnOrder) {
+    // Keep equal-width sections contiguous, then reuse the final union-sketch
+    // fingerprints. No filter-cell sampling, feature pass or new sketch is needed.
+    groups.sort_by(|a, b| {
+        a.meta
+            .width
+            .cmp(&b.meta.width)
+            .then_with(|| {
+                if order == ColumnOrder::Compression {
+                    a.ordering_key.cmp(&b.ordering_key)
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .then_with(|| a.meta.members[0].cmp(&b.meta.members[0]))
+    });
 }
 
 #[cfg(test)]
@@ -1727,7 +1768,7 @@ fn transpose(groups: Vec<BuiltGroup>, order: ColumnOrder) -> Result<Vec<Bank>> {
     }
     let mut banks = Vec::new();
     for (slots, mut groups) in by_size {
-        order_columns(&mut groups, order)?;
+        order_columns(&mut groups, order);
         let mut row_bits = 0;
         for group in &mut groups {
             group.meta.offset = row_bits;
@@ -1761,6 +1802,7 @@ fn transpose(groups: Vec<BuiltGroup>, order: ColumnOrder) -> Result<Vec<Bank>> {
             }
         }
         let meta = BankMeta {
+            component: 0,
             file: format!("bank-{}.zorbank.zst", slots.ilog2()),
             slots,
             row_bits,
@@ -1835,7 +1877,7 @@ fn pack_banks_streaming(
                 .all(|g| g.slots == slots && g.routing == routing),
             "inconsistent partition geometry"
         );
-        order_columns(&mut groups, order)?;
+        order_columns(&mut groups, order);
         let mut row_bits = 0usize;
         for group in &mut groups {
             group.meta.offset = row_bits;
@@ -1845,6 +1887,7 @@ fn pack_banks_streaming(
             group.cells.validate(slots, group.meta.width)?;
         }
         let meta = BankMeta {
+            component: 0,
             file: BankMeta::filename(slots, routing),
             slots,
             row_bits,
@@ -2231,106 +2274,10 @@ fn visit_abandoned_file(
     manifest: &Manifest,
     mut visit: impl FnMut(u32, &[u32]) -> Result<()>,
 ) -> Result<()> {
-    ensure!(
-        manifest.abandoned_file.as_deref() == Some(ABANDONED_FILE),
-        "invalid abandoned map filename"
-    );
-    // Buffer decompression output: small integer reads must not repeatedly enter
-    // the streaming decoder. Postings are decoded in bulk below, not per integer.
-    let mut reader = BufReader::with_capacity(
-        256 * 1024,
-        open_index_reader(&directory.join(ABANDONED_FILE))?,
-    );
-    let mut magic = [0; 8];
-    reader.read_exact(&mut magic)?;
-    ensure!(
-        &magic == ABANDONED_MAGIC || &magic == ABANDONED_DELTA_MAGIC,
-        "invalid abandoned map magic"
-    );
-    let delta_encoded = &magic == ABANDONED_DELTA_MAGIC;
-    let mut origins = Vec::new();
-    let mut bytes = vec![0; 64 * 1024];
-    let mut previous_hash = 0u32;
-    let mut associations = 0usize;
-    for record in 0..manifest.abandoned_hashes {
-        let hash = if delta_encoded {
-            let delta = read_var_u32(&mut reader)?;
-            ensure!(
-                record == 0 || delta != 0,
-                "unsorted/duplicate abandoned hashes"
-            );
-            previous_hash
-                .checked_add(delta)
-                .context("abandoned hash delta overflow")?
-        } else {
-            read_u32(&mut reader)?
-        };
-        ensure!(
-            record == 0 || previous_hash < hash,
-            "unsorted/duplicate abandoned hashes"
-        );
-        previous_hash = hash;
-        let count = if delta_encoded {
-            read_var_u32(&mut reader)?
-        } else {
-            read_u32(&mut reader)?
-        } as usize;
-        ensure!(
-            count > 0 && count <= manifest.colors.len(),
-            "invalid abandoned origin count"
-        );
-        ensure!(
-            count <= manifest.abandoned_origins.saturating_sub(associations),
-            "abandoned origins exceed manifest"
-        );
-        associations += count;
-        origins.clear();
-        let mut remaining = count;
-        if delta_encoded {
-            let mut previous_origin = 0u32;
-            for n in 0..count {
-                let delta = read_var_u32(&mut reader)?;
-                ensure!(n == 0 || delta != 0, "duplicate abandoned origins");
-                let origin = previous_origin
-                    .checked_add(delta)
-                    .context("abandoned origin delta overflow")?;
-                ensure!(
-                    (origin as usize) < manifest.colors.len(),
-                    "invalid abandoned dataset ID"
-                );
-                origins.push(origin);
-                previous_origin = origin;
-            }
-            remaining = 0;
-        }
-        while remaining != 0 {
-            let n = remaining.min(bytes.len() / 4);
-            reader.read_exact(&mut bytes[..n * 4])?;
-            for word in bytes[..n * 4].chunks_exact(4) {
-                let origin = u32::from_le_bytes(word.try_into().unwrap());
-                ensure!(
-                    (origin as usize) < manifest.colors.len(),
-                    "invalid abandoned dataset ID"
-                );
-                origins.push(origin);
-            }
-            remaining -= n;
-        }
-        ensure!(
-            origins.windows(2).all(|pair| pair[0] < pair[1]),
-            "unsorted/duplicate abandoned origins"
-        );
-        visit(hash, &origins)?;
+    let mut reader = AbandonedReader::new(directory, manifest)?;
+    while let Some(hash) = reader.advance()? {
+        visit(hash, &reader.origins)?;
     }
-    ensure!(
-        associations == manifest.abandoned_origins,
-        "abandoned origin count differs from manifest"
-    );
-    let mut extra = [0];
-    ensure!(
-        reader.read(&mut extra)? == 0,
-        "unexpected abandoned map data"
-    );
     Ok(())
 }
 
@@ -2357,54 +2304,6 @@ fn read_u64(reader: &mut impl Read) -> Result<u64> {
     let mut bytes = [0; 8];
     reader.read_exact(&mut bytes)?;
     Ok(u64::from_le_bytes(bytes))
-}
-
-// Modern banks are independent compressed streams. Validate the manifest first,
-// then decompress banks in parallel, concurrently with the auxiliary map.
-/// Reframe existing subindexes for parallel loading without rebuilding filters.
-/// The original index is read-only and the new directory is published atomically.
-pub fn repack_subindexes(source: &Path, output: &Path) -> Result<()> {
-    ensure!(!output.exists(), "output already exists");
-    let index = Index::load_mode(source, false, None, true)?;
-    ensure!(
-        index.manifest.version >= 2,
-        "repacking requires a modern merged index"
-    );
-    let parent = output
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    fs::create_dir_all(parent)?;
-    let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let path = parent.join(format!(".zor-repack-{}-{stamp}", std::process::id()));
-    fs::create_dir(&path)?;
-    let stage = Staging(path);
-    fs::copy(source.join("manifest.json"), stage.0.join("manifest.json"))?;
-    if let Some(name) = &index.manifest.abandoned_file {
-        fs::copy(source.join(name), stage.0.join(name))?;
-    }
-    for meta in &index.manifest.banks {
-        let expected = meta
-            .slots
-            .checked_mul(meta.row_bits.div_ceil(8))
-            .context("bank size overflow")?;
-        let mut reader = open_index_reader(&source.join(&meta.file))?;
-        let mut header = [0; 40];
-        reader.read_exact(&mut header)?;
-        validate_bank_header(&mut header.as_slice(), meta, expected)?;
-        let mut writer = bank_io::Writer::new(&stage.0.join(&meta.file))?;
-        writer.write_all(&header)?;
-        let limit = u64::try_from(expected)?
-            .checked_add(1)
-            .context("bank size overflow")?;
-        ensure!(
-            std::io::copy(&mut reader.take(limit), &mut writer)? == expected as u64,
-            "bank payload differs from manifest"
-        );
-        writer.finish()?;
-    }
-    fs::rename(&stage.0, output)?;
-    Ok(())
 }
 
 fn validate_bank_header(
@@ -2501,7 +2400,7 @@ impl Index {
             None
         };
         ensure!(
-            (1..=9).contains(&manifest.version) && manifest.backend == Backend::Zor,
+            (1..=10).contains(&manifest.version) && manifest.backend == Backend::Zor,
             "unsupported power-of-two index format"
         );
         ensure!(
@@ -2509,7 +2408,7 @@ impl Index {
             "invalid hash count"
         );
         ensure!(
-            if manifest.version == 9 {
+            if manifest.version >= 9 {
                 manifest
                     .segment_length
                     .is_none_or(|n| n.is_power_of_two() && n <= 4096)
@@ -2573,7 +2472,7 @@ impl Index {
         let classes = manifest
             .banks
             .iter()
-            .map(BankMeta::source_slots)
+            .map(BankMeta::source_group)
             .collect::<std::collections::BTreeSet<_>>()
             .len();
         ensure!(
@@ -2587,11 +2486,15 @@ impl Index {
             manifest.max_subindex_size.is_none_or(u64::is_power_of_two),
             "invalid maximum subindex size"
         );
-        let mut previous_slots = 0;
+        let mut previous_group = (0, 0);
         let mut next_partition = 0;
         let mut partition_count = 1;
         let mut first_class_bank = 0;
         for (bank_id, meta) in manifest.banks.iter().enumerate() {
+            ensure!(
+                meta.component == 0 || manifest.version >= 10,
+                "unsupported index component"
+            );
             ensure!(
                 !meta.fingerprint_first || manifest.version >= 3,
                 "unsupported bank layout"
@@ -2612,13 +2515,13 @@ impl Index {
                         && meta.slots.checked_mul(partitions) == Some(meta.source_slots())),
                 "invalid hash partition geometry"
             );
-            if meta.source_slots() != previous_slots {
+            if meta.source_group() != previous_group {
                 ensure!(
-                    meta.source_slots() > previous_slots
-                        && (previous_slots == 0 || next_partition == partition_count),
+                    meta.source_group() > previous_group
+                        && (previous_group == (0, 0) || next_partition == partition_count),
                     "invalid/incomplete partition order"
                 );
-                previous_slots = meta.source_slots();
+                previous_group = meta.source_group();
                 next_partition = 0;
                 partition_count = partitions;
                 first_class_bank = bank_id;
@@ -2637,7 +2540,7 @@ impl Index {
                 );
             }
             ensure!(
-                meta.file == BankMeta::filename(meta.slots, meta.routing),
+                meta.file == meta.expected_filename(),
                 "invalid bank file name"
             );
             let mut offset = 0;
@@ -2663,17 +2566,17 @@ impl Index {
                     ensure!(
                         id < seen.len()
                             && local_seen.insert(id)
-                            && seen[id].is_none_or(|source| source == meta.source_slots()),
+                            && seen[id].is_none_or(|source| source == meta.source_group()),
                         "invalid/duplicate dataset mapping"
                     );
                     if partition == 0 {
-                        seen[id] = Some(meta.source_slots());
+                        seen[id] = Some(meta.source_group());
                         groups_seen[id] = Some((bank_id, group_id));
                     } else {
                         let (first_bank, first_group) =
                             groups_seen[id].context("missing partition dataset")?;
                         ensure!(
-                            seen[id] == Some(meta.source_slots())
+                            seen[id] == Some(meta.source_group())
                                 && manifest.banks[first_bank].groups[first_group].members
                                     == group.members,
                             "inconsistent partition dataset mapping"
@@ -3304,6 +3207,45 @@ struct RecordScores {
 }
 
 impl RecordScores {
+    fn write_record(
+        &mut self,
+        name: &[u8],
+        total: u64,
+        min_ratio: f64,
+        format: RecordFormat,
+        colors: &[Color],
+        out: &mut impl Write,
+    ) -> Result<()> {
+        let all = if min_ratio == 0.0 {
+            self.values.len()
+        } else {
+            0
+        };
+        let sparse = if min_ratio > 0.0 && total != 0 {
+            self.touched.sort_unstable();
+            self.touched.len()
+        } else {
+            0
+        };
+        let hits = self.values[..all]
+            .iter()
+            .copied()
+            .enumerate()
+            .chain(
+                self.touched[..sparse]
+                    .iter()
+                    .map(|&id| (id, self.values[id])),
+            )
+            .filter(|&(_, count)| {
+                let ratio = if total == 0 {
+                    0.0
+                } else {
+                    count as f64 / total as f64
+                };
+                ratio >= min_ratio
+            });
+        format.write_record(out, name, total, hits, colors)
+    }
     fn new(colors: usize) -> Self {
         Self {
             values: vec![0; colors],
@@ -3317,6 +3259,7 @@ impl RecordScores {
         }
     }
 
+    #[cfg(test)]
     fn write(&mut self, total: u64, min_ratio: f64, out: &mut impl Write) -> Result<()> {
         write!(out, "{total}\t")?;
         let mut separator = "";
@@ -3748,7 +3691,7 @@ pub fn query_command(directory: &Path, query: &Path, min_ratio: f64) -> Result<(
 }
 
 /// Record-level reporting for ordinary feature modes. Uses the native lookup
-/// and original benchmark TSV format, but retains counters/scratch per worker
+/// with named or compact TSV output, retaining counters/scratch per worker
 /// and formats only touched origins (unless threshold zero requires all).
 pub fn query_records_command(
     directory: &Path,
@@ -3756,6 +3699,7 @@ pub fn query_records_command(
     min_ratio: f64,
     recover: bool,
     batch_size: usize,
+    format: RecordFormat,
 ) -> Result<()> {
     query_records_command_with_memory(
         directory,
@@ -3764,6 +3708,7 @@ pub fn query_records_command(
         recover,
         batch_size,
         QueryMemory::default(),
+        format,
     )
 }
 
@@ -3774,6 +3719,7 @@ pub fn query_records_command_with_memory(
     recover: bool,
     batch_size: usize,
     memory: QueryMemory,
+    format: RecordFormat,
 ) -> Result<()> {
     let load_start = Instant::now();
     ensure!(
@@ -3782,7 +3728,9 @@ pub fn query_records_command_with_memory(
     );
     ensure!(batch_size > 0, "record batch size must be positive");
     if memory == QueryMemory::Subindex {
-        return query_stream::query_records(directory, query, min_ratio, recover, batch_size);
+        return query_stream::query_records(
+            directory, query, min_ratio, recover, batch_size, format,
+        );
     }
     let index = Index::load_with_recovery(directory, recover)
         .with_context(|| format!("loading {}", directory.display()))?;
@@ -3796,8 +3744,11 @@ pub fn query_records_command_with_memory(
     super::records::query_file(
         query,
         batch_size,
+        format.header(),
         || record_query::Worker::new(&index),
-        |worker, records, out| worker.query_records(&index, features, min_ratio, records, out),
+        |worker, records, out| {
+            worker.query_records(&index, features, min_ratio, format, records, out)
+        },
     )?;
     eprintln!(
         "query_timings\tload_s={:.6}\tquery_s={:.6}",
@@ -3845,7 +3796,7 @@ pub fn query_command_with_memory(
                 .manifest
                 .banks
                 .iter()
-                .map(BankMeta::source_slots)
+                .map(BankMeta::source_group)
                 .collect::<std::collections::BTreeSet<_>>()
                 .len() as u64,
         min_ratio,
@@ -3913,9 +3864,9 @@ fn print_aggregate(
     seconds: f64,
 ) {
     let mode = IndexMode::from_u8(manifest.index_mode).expect("validated index mode");
-    println!("#query\t{}\tk={}\tindex_mode={}\ttotal_features={}\tstack_probes={}\tbank_probes={}\telapsed_s={:.6}",
+    eprintln!("#query\t{}\tk={}\tindex_mode={}\ttotal_features={}\tstack_probes={}\tbank_probes={}\telapsed_s={:.6}",
         query.display(), if mode == IndexMode::Minimizers { manifest.minimizer_size } else { manifest.k }, mode.label(), total, probes, bank_probes, seconds);
-    println!("color\tmatches\tratio\tunique_kmers\tabandoned");
+    println!("color\tmatches\tratio\tunique_kmers");
     for (color, &matches) in manifest.colors.iter().zip(scores) {
         let ratio = if total == 0 {
             0.0
@@ -3924,7 +3875,7 @@ fn print_aggregate(
         };
         if ratio >= min_ratio {
             println!(
-                "{}\t{}\t{:.8}\t{}\t0",
+                "{}\t{}\t{:.8}\t{}",
                 color.name, matches, ratio, color.unique_kmers
             );
         }
@@ -4000,6 +3951,22 @@ pub fn info_command(directory: &Path) -> Result<()> {
         }
     }
     let m = &index.manifest;
+    println!(
+        "collection_status\t{}\nindexed_documents\t{}",
+        m.collection_status(),
+        m.colors.len()
+    );
+    let copied = m.construction_cell_storage == "copied-compressed-banks";
+    if copied {
+        println!(
+            "components\t{}",
+            m.banks
+                .iter()
+                .map(|b| b.component)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        );
+    }
     let features = m.features()?;
     let groups: usize = m.banks.iter().map(|b| b.groups.len()).sum();
     let logical_bits: usize = m.banks.iter().map(|b| b.slots * b.row_bits).sum();
@@ -4044,7 +4011,7 @@ pub fn info_command(directory: &Path) -> Result<()> {
         "size_classes\t{}\nmax_subindex_size\t{}\nlargest_subindex_bytes\t{}\nhash_partitions\t{}",
         m.banks
             .iter()
-            .map(BankMeta::source_slots)
+            .map(BankMeta::source_group)
             .collect::<std::collections::BTreeSet<_>>()
             .len(),
         m.max_subindex_size
@@ -4081,7 +4048,7 @@ pub fn info_command(directory: &Path) -> Result<()> {
     crate::anchors::print_settings(features);
     println!(
         "merge_planner\t{}\nplanning_pair_evaluations\t{}\nplanning_possible_pair_evaluations\t{}\nmerge_reverts_enabled\t{}",
-        m.merge_planner.label(),
+        if copied { "preserved" } else { m.merge_planner.label() },
         m.planning_pair_evaluations,
         m.planning_possible_pair_evaluations,
         m.merge_reverts_enabled
@@ -4100,7 +4067,17 @@ pub fn info_command(directory: &Path) -> Result<()> {
         println!("segment_length\t{length}");
     }
     println!("overflow_groups\t{}", m.overflow_groups);
-    println!("merge_column_order\t{}", m.column_order.label());
+    println!(
+        "merge_column_order\t{}",
+        if copied {
+            "preserved"
+        } else {
+            m.column_order.label()
+        }
+    );
+    if let Some(method) = &m.column_order_method {
+        println!("column_order_method\t{method}");
+    }
     println!("abandoned_recovery\t{}\nabandoned_hash_bits\t32\nabandoned_keys\t{}\nabandoned_unique_hashes\t{}\nabandoned_dataset_associations\t{}\nabandoned_map_ram_bytes\t{}",
         m.abandoned_recovery,
         m.banks.iter().flat_map(|b| &b.groups).map(|g| g.abandoned_keys.unwrap_or(g.fallback_keys)).sum::<usize>(),
@@ -4204,6 +4181,7 @@ mod tests {
             slots: config.slots(200_000.0).unwrap(),
             width: 10,
             sketch: Sketch::new(&[], 64, 69),
+            ordering_key: None,
             feature_count_upper_bound: 200_000,
             input_peak_bytes: 16 << 20,
         };
@@ -4403,7 +4381,7 @@ mod tests {
     }
 
     #[test]
-    fn packed_cells_preserve_samples_and_reads_for_all_payload_widths() {
+    fn packed_cells_preserve_reads_for_all_payload_widths() {
         let stage = temporary_stage();
         for width in 1..=64 {
             for slots in [4, 17, 65] {
@@ -4414,7 +4392,6 @@ mod tests {
                 };
                 let cells: Vec<_> = (0..slots).map(|i| splitmix64(i as u64) & mask).collect();
                 let mut group = test_group(&stage, width * 100 + slots, width, &cells);
-                let expected_sample = column_sample(&group).unwrap();
                 group.cells.remove().unwrap();
                 group.cells = CompletedCells::packed(&cells, width).unwrap();
                 if let CompletedCells::Packed { data, .. } = &group.cells {
@@ -4430,7 +4407,6 @@ mod tests {
                             (width * slots).div_ceil(8) as u64
                         );
                     }
-                    assert_eq!(column_sample(&group).unwrap(), expected_sample);
                     let mut block = vec![0; (slots - 1) * 8];
                     group.cells.read_block(1, &mut block, None).unwrap();
                     let actual: Vec<_> = block
@@ -4504,6 +4480,7 @@ mod tests {
             slots: 8,
             width: 8,
             sketch: Sketch::new(&keys, 64, 69),
+            ordering_key: None,
             feature_count_upper_bound: keys.len(),
             input_peak_bytes: 0,
         };
@@ -4561,6 +4538,7 @@ mod tests {
             let mut records = vec![(u32::MAX, 1), (0, 2), (43, 3), (id as u32, 1)];
             records.extend(std::iter::repeat_n((19, 3), 1100));
             let group = || BuiltGroup {
+                ordering_key: None,
                 meta: GroupMeta {
                     members: vec![id * 3, id * 3 + 1],
                     width: 10,
@@ -5066,6 +5044,7 @@ mod tests {
         let path = stage.0.join(format!("{id}.u64"));
         cache_write(&path, cells).unwrap();
         BuiltGroup {
+            ordering_key: None,
             meta: GroupMeta {
                 members: vec![id],
                 width,
@@ -5092,6 +5071,7 @@ mod tests {
             slots: 8,
             width: 11,
             sketch: Sketch::new(&[], 4096, 69),
+            ordering_key: None,
             feature_count_upper_bound: 5,
             input_peak_bytes: 0,
         };
@@ -5116,7 +5096,7 @@ mod tests {
     }
 
     #[test]
-    fn sampled_order_keeps_widths_contiguous_and_stable_ties() {
+    fn sketch_fingerprints_order_keeps_widths_contiguous_and_stable_ties() {
         let stage = temporary_stage();
         let mut groups = vec![
             test_group(&stage, 0, 18, &[9; 32]),
@@ -5125,12 +5105,18 @@ mod tests {
             test_group(&stage, 3, 18, &[9; 32]),
             test_group(&stage, 4, 16, &[2; 32]),
         ];
-        order_columns(&mut groups, ColumnOrder::Compression).unwrap();
+        for (group, key) in groups.iter_mut().zip([9, 250, 3, 9, 2]) {
+            group.ordering_key = Some(std::sync::Arc::new(vec![key]));
+            if let CompletedCells::Disk(path) = &group.cells {
+                fs::remove_file(path).unwrap();
+            }
+        }
+        order_columns(&mut groups, ColumnOrder::Compression);
         assert_eq!(
             groups.iter().map(|g| g.meta.members[0]).collect::<Vec<_>>(),
             [4, 1, 2, 0, 3]
         );
-        order_columns(&mut groups, ColumnOrder::Width).unwrap();
+        order_columns(&mut groups, ColumnOrder::Width);
         assert_eq!(
             groups.iter().map(|g| g.meta.members[0]).collect::<Vec<_>>(),
             [1, 4, 0, 2, 3]
@@ -5193,24 +5179,6 @@ mod tests {
     }
 
     #[test]
-    fn sampling_checks_cache_length_and_includes_filter_ends() {
-        let stage = temporary_stage();
-        for slots in [4, 16, 32, 1024] {
-            let cells: Vec<_> = (0..slots as u64).collect();
-            let mut group = test_group(&stage, slots, 16, &cells);
-            let sample = column_sample(&group).unwrap();
-            assert_eq!(u64::from_le_bytes(sample[..8].try_into().unwrap()), 0);
-            assert_eq!(
-                u64::from_le_bytes(sample[sample.len() - 8..].try_into().unwrap()),
-                slots as u64 - 1
-            );
-            assert!(sample.len() <= 1024);
-            group.slots *= 2;
-            assert!(column_sample(&group).is_err());
-        }
-    }
-
-    #[test]
     fn compression_order_clusters_repeated_columns_and_preserves_payloads() {
         let stage = temporary_stage();
         let slots = 1024;
@@ -5227,6 +5195,7 @@ mod tests {
                         .collect();
                     let mut group = test_group(&stage, prefix + id, 16, &cells);
                     group.meta.members = vec![id];
+                    group.ordering_key = Some(std::sync::Arc::new(vec![pattern as u8]));
                     group.fallback = vec![(id as u32, cells[0])];
                     group
                 })
@@ -5313,6 +5282,7 @@ mod tests {
             abandoned_keys: Some(usize::from(!recovered.is_empty())),
         };
         let meta = BankMeta {
+            component: 0,
             file: "bank-2.zorbank.zst".into(),
             fingerprint_first: false,
             routing: None,
@@ -5363,6 +5333,7 @@ mod tests {
             sketch_method: "test".into(),
             merge_planner: MergePlanner::Streaming,
             column_order: ColumnOrder::Width,
+            column_order_method: None,
             planning_pair_evaluations: 0,
             planning_possible_pair_evaluations: 0,
             merge_reverts_enabled: false,
@@ -5765,6 +5736,7 @@ mod tests {
         let mut index = union_index(key, &[1]);
         index.banks[0].fallback = vec![vec![(abandoned::hash(key, 69), 2)]];
         let meta = BankMeta {
+            component: 0,
             file: "bank-3.zorbank.zst".into(),
             fingerprint_first: false,
             routing: None,

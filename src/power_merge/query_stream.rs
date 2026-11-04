@@ -167,6 +167,7 @@ fn query_ordinary(
     recover: bool,
     batch_size: usize,
     records: bool,
+    format: RecordFormat,
     mut index: Index,
     f: FeatureConfig,
     start: Instant,
@@ -199,9 +200,9 @@ fn query_ordinary(
     let mut groups = Vec::new();
     let mut begin = 0;
     while begin < index.manifest.banks.len() {
-        let source = index.manifest.banks[begin].source_slots();
+        let source = index.manifest.banks[begin].source_group();
         let mut end = begin + 1;
-        while end < index.manifest.banks.len() && index.manifest.banks[end].source_slots() == source
+        while end < index.manifest.banks.len() && index.manifest.banks[end].source_group() == source
         {
             end += 1;
         }
@@ -405,18 +406,16 @@ fn query_ordinary(
     let output = Instant::now();
     if records {
         let mut out = BufWriter::with_capacity(1024 * 1024, std::io::stdout());
-        writeln!(out, "query_id\tvalid_kmers\thits")?;
+        writeln!(out, "{}", format.header())?;
         for (read, hits) in reads.iter().zip(&mut result) {
-            out.write_all(&read.name)?;
-            write!(out, "\t{}\t", read.total)?;
-            hits.sort_unstable_by_key(|h| h.0);
-            for (i, (origin, count)) in hits.iter().enumerate() {
-                if i != 0 {
-                    write!(out, ",")?;
-                }
-                write!(out, "{origin}:{count}")?;
-            }
-            writeln!(out)?;
+            hits.sort_unstable_by_key(|hit| hit.0);
+            format.write_record(
+                &mut out,
+                &read.name,
+                read.total,
+                hits.iter().map(|&(id, count)| (id as usize, count)),
+                &index.manifest.colors,
+            )?;
         }
         out.flush()?;
     } else {
@@ -424,7 +423,7 @@ fn query_ordinary(
             .manifest
             .banks
             .iter()
-            .map(BankMeta::source_slots)
+            .map(BankMeta::source_group)
             .collect::<std::collections::BTreeSet<_>>()
             .len();
         print_aggregate(
@@ -723,9 +722,9 @@ fn execute(
     let mut load_seconds = 0.0;
     let mut first = 0;
     while first < index.manifest.banks.len() {
-        let source = index.manifest.banks[first].source_slots();
+        let source = index.manifest.banks[first].source_group();
         let mut end = first + 1;
-        while end < index.manifest.banks.len() && index.manifest.banks[end].source_slots() == source
+        while end < index.manifest.banks.len() && index.manifest.banks[end].source_group() == source
         {
             end += 1;
         }
@@ -880,6 +879,7 @@ pub(super) fn query_aggregate(
             recover,
             4096,
             false,
+            RecordFormat::Compact,
             index,
             f,
             start,
@@ -922,7 +922,7 @@ pub(super) fn query_aggregate(
         .manifest
         .banks
         .iter()
-        .map(BankMeta::source_slots)
+        .map(BankMeta::source_group)
         .collect::<std::collections::BTreeSet<_>>()
         .len();
     print_aggregate(
@@ -951,6 +951,7 @@ pub(super) fn query_records(
     ratio: f64,
     recover: bool,
     batch_size: usize,
+    format: RecordFormat,
 ) -> Result<()> {
     let start = Instant::now();
     let mut index = Index::load_mode(directory, false, None, true)?;
@@ -964,6 +965,7 @@ pub(super) fn query_records(
             recover,
             batch_size,
             true,
+            format,
             index,
             f,
             start,
@@ -985,18 +987,16 @@ pub(super) fn query_records(
         execute(directory, &mut index, &prepared, f, ratio, true, recover)?;
     load_seconds += loaded;
     let mut out = BufWriter::with_capacity(1024 * 1024, std::io::stdout());
-    writeln!(out, "query_id\tvalid_kmers\thits")?;
+    writeln!(out, "{}", format.header())?;
     for (read, hits) in prepared.reads.iter().zip(&mut results) {
-        out.write_all(&read.name)?;
-        write!(out, "\t{}\t", read.total)?;
         hits.sort_unstable_by_key(|hit| hit.0);
-        for (i, (origin, count)) in hits.iter().enumerate() {
-            if i != 0 {
-                write!(out, ",")?;
-            }
-            write!(out, "{origin}:{count}")?;
-        }
-        writeln!(out)?;
+        format.write_record(
+            &mut out,
+            &read.name,
+            read.total,
+            hits.iter().map(|&(id, count)| (id as usize, count)),
+            &index.manifest.colors,
+        )?;
     }
     out.flush()?;
     report(

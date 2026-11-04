@@ -50,6 +50,7 @@ impl Fixture {
                 "1",
                 "--max-document-memory-gib",
                 "0.01",
+                "--skip-oversized-documents",
             ])
             .args(extra)
             .output()
@@ -68,6 +69,47 @@ fn dna(n: usize) -> String {
     (0..n)
         .map(|i| b"ACGT"[(zorindex::splitmix64(i as u64) & 3) as usize] as char)
         .collect()
+}
+
+#[test]
+fn default_build_requires_every_dataset_for_all_planners() {
+    let f = Fixture::new();
+    let small = f.write("small.fa", format!(">small\n{}\n", dna(1000)));
+    let large = f.write("large.fa", format!(">large\n{}\n", dna(600_000)));
+    let fof = f.write("inputs.fof", format!("small\t{small}\nlarge\t{large}\n"));
+    for planner in ["streaming", "full", "naive"] {
+        let output = f.path(planner);
+        let result = Command::new(env!("CARGO_BIN_EXE_zorindex"))
+            .args([
+                "-t",
+                "2",
+                "build",
+                "-f",
+                &fof,
+                "-o",
+                &output,
+                "-k",
+                "31",
+                "--merge-planner",
+                planner,
+                "--max-document-memory-gib",
+                "0.01",
+            ])
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("--skip-oversized-documents"));
+        assert!(!f.0.join(planner).exists());
+        assert!(!f
+            .0
+            .join(format!("{planner}.skipped-documents.json"))
+            .exists());
+    }
+    assert!(!fs::read_dir(&f.0).unwrap().any(|p| p
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".zor-pow2-building-")));
 }
 
 #[test]
@@ -94,7 +136,7 @@ fn oversized_document_is_skipped_without_losing_included_document_identity() {
     assert_eq!(manifest["skipped_documents"][0]["name"], "oversized");
     assert_eq!(
         f.report("index.skipped-documents.json")["status"],
-        "indexed"
+        "incomplete"
     );
     assert_eq!(
         f.report("index/skipped-documents.json")["indexed_documents"],
@@ -109,6 +151,8 @@ fn oversized_document_is_skipped_without_losing_included_document_identity() {
             "--query",
             &query,
             "--records",
+            "--output-format",
+            "compact",
             "--min-ratio",
             "1",
         ])
@@ -119,6 +163,15 @@ fn oversized_document_is_skipped_without_losing_included_document_identity() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("collection\tstatus=incomplete\trequested=3\tindexed=2\tskipped=1"));
+    let info = Command::new(env!("CARGO_BIN_EXE_zorindex"))
+        .args(["-t", "2", "info", "-i", &f.path("index")])
+        .output()
+        .unwrap();
+    assert!(info.status.success());
+    assert!(String::from_utf8_lossy(&info.stdout)
+        .contains("collection_status\tincomplete\nindexed_documents\t2\n"));
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.contains("0:970"), "{text}");
     assert!(text.contains("1:970"), "{text}");
@@ -220,7 +273,7 @@ fn oversized_merge_is_rejected_during_planning_and_all_documents_still_query() {
         .unwrap()
         .get()
         .to_string();
-    for mode in ["streaming", "streaming-unpruned", "all-pairs"] {
+    for mode in ["streaming", "full"] {
         let name = format!("index-{mode}");
         let out = Command::new(env!("CARGO_BIN_EXE_zorindex"))
             .args([
@@ -269,6 +322,8 @@ fn oversized_merge_is_rejected_during_planning_and_all_documents_still_query() {
                 "--query",
                 &query,
                 "--records",
+                "--output-format",
+                "compact",
                 "--min-ratio",
                 "1",
             ])

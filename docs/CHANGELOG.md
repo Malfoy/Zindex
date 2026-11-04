@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+- Default per-record queries to named TSV rows with dataset IDs, names, counts
+  and ratios. Keep compact output selectable with `--output-format compact`.
+  Send aggregate query diagnostics to stderr.
+- Require every input dataset by default. Keep memory guards active, make
+  exclusions opt-in, and report collection completeness in build summaries
+  and `info`.
+- Consolidate usage in the README and remove fusion's `--other` option.
+
+- Order equal-width columns by the retained union-sketch fingerprints, removing
+  filter-cell sampling. Free planning minima, share ordering keys across rebuilt
+  filters and partitions, and record the ordering method in the manifest.
+
+- Remove the capacity-floor, column-order, dataset-cap and minimum-saving CLI
+  controls. Select column order internally, derive the group limit from the
+  64-bit payload width, and require strictly positive predicted merge savings.
+
+- Remove the query-time recovery opt-out. Queries automatically use recovery
+  whenever it is stored in the index.
+
+- Add the paper workflow figure and a build-to-query introduction to the README.
+  Split regular help (`-h`) from advanced help (`-ah`), keeping ZOR heuristics
+  in advanced help. Remove the unused aggregate-output column.
+
+- Add `fusion -i FIRST SECOND [MORE ...] -o OUTPUT` for compatible index collections.
+  Preserve compressed filter bytes and source match counts, stream recovery
+  postings with remapped dataset IDs, and support repeated fusions and different
+  subindex partition geometries in manifest version 10.
+  Use reflinks where available or combine validation and copying in one pass.
+  Copy independent subindexes with the requested worker pool and merge all
+  recovery streams once, avoiding intermediate pairwise indexes. Move bank
+  metadata and reuse recovery buffers.
+
+- Remove the single-file index backend, row-codec experiments, maintenance
+  commands and the unpruned streaming CLI mode. Each remaining option has
+  one long name and one short flag.
+
 - Make `--k` consistently denote seed length and add `--window` (`-w`) for
   the minimizer window in consecutive k-mers. Minimizer builds now require
   `--window`. Existing index files remain readable.
@@ -25,8 +61,8 @@ tagged release. Existing published release tags have not been moved.
 - Add a default 8-GiB uncompressed subindex cap with hash-routed partitions.
   preserve fingerprint width and merged document membership.
 - Add construction memory controls and explicit reports for skipped documents.
-- Add independent Zstd frames and lossless `repack-subindexes` for parallel
-  loading, plus additional planner and query execution improvements.
+- Add independent Zstd frames for parallel loading, plus additional planner
+  and query execution improvements.
 - Add a checked small demonstration, build-revision reporting, corrected
   documentation, and a one-run benchmark artifact recorder.
 

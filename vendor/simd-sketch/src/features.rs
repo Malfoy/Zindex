@@ -63,6 +63,11 @@ impl MergeableSketch {
         self.minima = Vec::new();
         self.fingerprints = Vec::new();
     }
+    /// Free union minima and move existing comparison bytes into downstream ordering.
+    pub fn take_fingerprints(&mut self) -> Vec<u8> {
+        self.minima = Vec::new();
+        std::mem::take(&mut self.fingerprints)
+    }
     pub fn is_released(&self) -> bool {
         self.minima.is_empty()
     }
@@ -289,7 +294,14 @@ mod tests {
                 assert_eq!(union, MergeableSketch::new(&all, size, 69));
                 assert_eq!(union.jaccard(&union), 1.0);
             }
-            union.release();
+            let mut released = union.clone();
+            released.release();
+            assert_eq!(released.allocated_bytes(), 0);
+            let expected = union.fingerprints().to_vec();
+            let ptr = union.fingerprints().as_ptr();
+            let fingerprints = union.take_fingerprints();
+            assert_eq!(fingerprints, expected);
+            assert_eq!(fingerprints.as_ptr(), ptr);
             assert!(union.is_released());
             assert_eq!(union.allocated_bytes(), 0);
         }

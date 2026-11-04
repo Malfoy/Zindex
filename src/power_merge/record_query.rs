@@ -451,13 +451,14 @@ impl Worker {
         index: &Index,
         features: FeatureConfig,
         ratio: f64,
+        format: RecordFormat,
         records: &[Record],
         out: &mut Vec<u8>,
     ) -> Result<()> {
         if features.randstrobemers.is_some() {
-            return self.query_strobe_records(index, features, ratio, records, out);
+            return self.query_strobe_records(index, features, ratio, format, records, out);
         }
-        self.query_records_forward(index, features, ratio, records, out)
+        self.query_records_forward(index, features, ratio, format, records, out)
     }
 
     /// Merge sorted strand keys for full counts; thresholded queries retain
@@ -467,6 +468,7 @@ impl Worker {
         index: &Index,
         features: FeatureConfig,
         ratio: f64,
+        format: RecordFormat,
         records: &[Record],
         out: &mut Vec<u8>,
     ) -> Result<()> {
@@ -477,9 +479,14 @@ impl Worker {
             // by twice the input length even before counting their anchors.
             if records[first].1.len() > FEATURE_BUDGET / 2 {
                 let total = self.query_sequence(index, features, ratio, &records[first].1);
-                out.extend_from_slice(&records[first].0);
-                out.push(b'\t');
-                self.scores.write(total, ratio, out)?;
+                self.scores.write_record(
+                    &records[first].0,
+                    total,
+                    ratio,
+                    format,
+                    &index.manifest.colors,
+                    out,
+                )?;
                 first += 1;
                 continue;
             }
@@ -552,9 +559,14 @@ impl Worker {
             if end == first {
                 // Oversized reads retain the bounded two-pass strand fallback.
                 let total = self.query_sequence(index, features, ratio, &records[first].1);
-                out.extend_from_slice(&records[first].0);
-                out.push(b'\t');
-                self.scores.write(total, ratio, out)?;
+                self.scores.write_record(
+                    &records[first].0,
+                    total,
+                    ratio,
+                    format,
+                    &index.manifest.colors,
+                    out,
+                )?;
                 first += 1;
                 continue;
             }
@@ -577,9 +589,8 @@ impl Worker {
                     self.merge_forward_scores();
                     total
                 };
-                out.extend_from_slice(id);
-                out.push(b'\t');
-                self.scores.write(total, ratio, out)?;
+                self.scores
+                    .write_record(id, total, ratio, format, &index.manifest.colors, out)?;
                 start = stop;
             }
             first = end;
@@ -711,6 +722,7 @@ impl Worker {
         index: &Index,
         features: FeatureConfig,
         ratio: f64,
+        format: RecordFormat,
         records: &[Record],
         out: &mut Vec<u8>,
     ) -> Result<()> {
@@ -747,9 +759,14 @@ impl Worker {
             }
             if let Some(total) = long {
                 self.query_long(index, features, &records[first].1, total, ratio);
-                out.extend_from_slice(&records[first].0);
-                out.push(b'\t');
-                self.scores.write(total, ratio, out)?;
+                self.scores.write_record(
+                    &records[first].0,
+                    total,
+                    ratio,
+                    format,
+                    &index.manifest.colors,
+                    out,
+                )?;
                 first += 1;
                 continue;
             }
@@ -758,9 +775,8 @@ impl Worker {
             for (offset, (id, _)) in records[first..end].iter().enumerate() {
                 let next = self.ends[offset];
                 let total = self.query_features(index, start..next, ratio);
-                out.extend_from_slice(id);
-                out.push(b'\t');
-                self.scores.write(total, ratio, out)?;
+                self.scores
+                    .write_record(id, total, ratio, format, &index.manifest.colors, out)?;
                 start = next;
             }
             first = end;
@@ -802,6 +818,7 @@ mod tests {
                 .collect();
             index.banks.push(Bank {
                 meta: BankMeta {
+                    component: 0,
                     file: format!("bank-{}.zorbank.zst", slots.ilog2()),
                     slots,
                     row_bits: offset,
@@ -1163,7 +1180,14 @@ mod tests {
                 let mut worker = Worker::new(&index);
                 let mut actual = Vec::new();
                 worker
-                    .query_records(&index, features, ratio, &records, &mut actual)
+                    .query_records(
+                        &index,
+                        features,
+                        ratio,
+                        RecordFormat::Compact,
+                        &records,
+                        &mut actual,
+                    )
                     .unwrap();
                 assert_eq!(actual, expected, "features={features:?} ratio={ratio}");
                 assert!(worker.keys.len() <= FEATURE_BUDGET);

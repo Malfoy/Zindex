@@ -25,6 +25,8 @@ implementation are preserved here, with these explicit changes:
   estimator's exact f32 rounding. The transposed SIMD scan lives in ZORINDEX,
   not in the upstream SimdSketch implementation.
 - Correct the generic scalar compaction fallback to accept u32 output.
+- Move the existing fingerprint allocation into final filter ordering while
+  releasing union minima, avoiding another sketch or filter-cell sampling pass.
 - Library-only dependency manifest (upstream CLI dependencies are omitted).
 
 BinDash 2.0 was examined for b-bit comparisons and SIMD/popcount techniques:

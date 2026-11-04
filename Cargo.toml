@@ -23,19 +23,16 @@ anyhow = "1.0"
 ocm-minimizers = { version = "0.1.0", path = "utils/ocm-minimizers" }
 clap = { version = "4.5", features = ["derive"] }
 deko = { version = "0.6", default-features = false, features = ["flate2", "zstd", "xz", "bzip2"] }
-fastpfor = { version = "0.9", default-features = false, features = ["rust"] }
 helicase = { version = "1.2.0", path = "vendor/helicase", default-features = false, features = ["std", "gz", "zstd"] }
-bitpacking = "0.9"
-lz4_flex = "0.11"
-lzzzz = "2.0"
 rayon = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 simd-minimizers = "2.3"
 simd-sketch = { version = "0.3.0", path = "vendor/simd-sketch" }
-snap = "1.1"
-svb = { version = "0.2", features = ["simd-auto"] }
 zstd = { version = "0.13", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 # simd-minimizers refuses to compile without AVX2/NEON; use its scalar fallback there.
 [target.'cfg(not(any(target_feature = "avx2", target_feature = "neon")))'.dependencies]

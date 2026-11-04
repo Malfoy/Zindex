@@ -60,6 +60,20 @@ class BacteriaExampleTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Source minimizers missing"):
                 example.check_results(hits)
 
+            with hits.open("w", newline="") as dest:
+                writer = csv.writer(dest, delimiter="\t")
+                writer.writerow(["query_id", "dataset_id", "dataset_name", "matches", "queried_seeds", "ratio"])
+                for row in truth:
+                    if row["document_id"] == "-":
+                        writer.writerow([row["query_id"], ".", ".", 0, 100, 0])
+                    else:
+                        writer.writerow([row["query_id"], 0, 'name with "quotes"\nand newline', 100, 100, 1])
+                        writer.writerow([row["query_id"], 1, "related dataset", 90, 100, 0.9])
+            example.check_results(hits)
+            hits.write_text(hits.read_text().replace("\t100\t100\t1", "\t99\t100\t1", 1))
+            with self.assertRaisesRegex(ValueError, "Source minimizers missing"):
+                example.check_results(hits)
+
     def test_checksum_failure_removes_partial_and_does_not_publish_fof(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

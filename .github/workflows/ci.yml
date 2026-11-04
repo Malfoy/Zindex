@@ -33,6 +33,8 @@ jobs:
         run: cargo build --workspace --release --locked --bins
       - name: Checked demonstration
         run: bash utils/scripts/demo.sh "$RUNNER_TEMP/zindex-demo-${{ matrix.cpu }}"
+      - name: README usage examples
+        run: python3 utils/scripts/check_readme.py
       - name: Check benchmark recorder
         run: >-
           python3 utils/scripts/benchmark_zindex.py
