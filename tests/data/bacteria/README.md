@@ -1,7 +1,7 @@
 # Bacterial example
 
 Ten real RefSeq bacterial assemblies are bundled under `genomes/`.
-They were selected from [the accession list](../../../docs/benchmarks/accessions_128_bacterial.txt)
+They were selected from [the accession list](accessions_128_bacterial.txt)
 with random seed 20261102. Accession versions, original NCBI URLs and checksums
 are recorded in [assemblies.json](assemblies.json) and [sources.json](sources.json).
 

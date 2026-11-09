@@ -1,7 +1,7 @@
 /target/
 
 # Local research scripts, frozen sources, datasets and generated benchmark runs.
-# Publish curated benchmark summaries under docs/ instead.
+# Keep generated benchmark outputs outside the source tree.
 /experiments/
 
 # Local data and generated indexes
@@ -45,3 +45,7 @@ __pycache__/
 !/tests/data/bacteria/*.fa
 !/tests/data/bacteria/*.tsv
 !/tests/data/bacteria/genomes/*.fna.gz
+
+# Published manuscript and automatically named indexes.
+!/Zindex.pdf
+/myindex-*/

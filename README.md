@@ -14,7 +14,9 @@ Seed extraction includes the
 by Ragnar Groot Koerkamp et al. FASTA/FASTQ parsing uses
 [Helicase](https://doi.org/10.64898/2026.03.19.712912) by Igor Martayan et al.
 
-![Interleaved Bloom filters (left) and interleaved ZOR filters (right)](docs/images/interleaved-filters.svg)
+![Interleaved Bloom filters (left) and interleaved ZOR filters (right)](figures/interleaved-filters.svg)
+
+Comparative benchmarks: [KmerIndexBenchmark](https://github.com/Malfoy/KmerIndexBenchmark).
 
 ## Install and test
 
@@ -69,25 +71,25 @@ indexed seeds in each dataset.
 | Short | Option | Default | Meaning |
 |---|---|---|---|
 | `-f` | `--fof` | Required | File listing one FASTA/FASTQ path per dataset, optionally preceded by a name and a tab |
-| `-o` | `--output` | Required | New index directory |
 | `-k` | `--k` | Required | K-mer length, or window length in bases when indexing minimizers |
 
 Relative input paths use the working directory. Gzip, zstd, xz and bzip2 inputs
-are supported. Dense k-mers support `1 <= k <= 31`.
+are supported. Dense k-mers accept any positive `k`.
 
 ### Important
 
 | Short | Option | Default | Meaning |
 |---|---|---|---|
+| `-o` | `--output` | `myindex-DATE-TIME` | New index directory, automatically named with a UTC timestamp |
 | `-t` | `--threads` | Available CPU threads | Worker count for construction, queries and fusion |
 | `-H` | `--hashes` | `4` | Number of cell locations read and XORed per filter, from 2 to 32 |
 | `-b` | `--fingerprint-bits` | `8` | Fingerprint width, one of 1, 2, 4, 8 or 16 bits |
 | `-i` | `--index-mode` | `kmers` | `kmers`, `minimizers`, `modimizers` or `findere` |
 | `-m` | `--minimizer-size` | Required in minimizer mode | Length of each selected minimizer, from 1 to 31 bases |
 | `-M` | `--minimizer-scheme` | `open-closed-mod` | `open-closed-mod` or standard SIMD hash minimizers (`simd`) |
+| `-X` | `--max-subindex-size` | `8GiB` | Maximum uncompressed subindex size, a power of two in bytes or KiB/MiB/GiB |
 
-More hash locations increase query reads and construction work, while changing
-filter peeling and recovery requirements. Queries reuse the stored hash count.
+More hash functions can make the index smaller, but slow queries.
 Wider fingerprints reduce accidental matches at a space cost, with fingerprint
 collision probability approximately `2^-b` for `b` bits.
 
@@ -146,7 +148,11 @@ less specific to its full window.
 |---|---|---|---|
 | `-t` | `--threads` | Available CPU threads | Query workers |
 | `-a` | `--min-ratio` | `0` | Minimum matching fraction, from 0 to 1 |
-| `-r` | `--records` | `false` | Report each query record separately, unavailable for findere |
+| `-r` | `--records` | `false` | Score each FASTA sequence or FASTQ read separately |
+
+Without `--records`, counts are combined across the whole query file. With
+`--records`, each sequence or read has its own results. Findere currently
+supports only combined counts for the whole file.
 
 Report datasets matching at least 80% of each query's seeds:
 
@@ -201,7 +207,7 @@ tail -n 5 tests/data/bacteria/samples.fof > second.fof
 | Short | Option | Default | Meaning |
 |---|---|---|---|
 | `-i` | `--index` | Required | At least two input index directories, in output dataset order |
-| `-o` | `--output` | Required | New fused directory outside all inputs |
+| `-o` | `--output` | `myindex-DATE-TIME` | New fused directory outside all inputs |
 | `-t` | `--threads` | Available CPU threads | Fusion workers |
 
 Inputs must use identical seed extraction and hash settings. Fusion preserves
@@ -214,29 +220,20 @@ A spaced seed retains positions marked `#` and skips positions marked `_`.
 The pattern must be symmetric under reversal. Its width is `k` for dense
 indexing and `m` for minimizers.
 
-These masks maximize the worst-case number of unchanged hits for **100-base
-sequences with up to three substitutions**, among symmetric 31-base masks
-beginning and ending with `#` at each retained-base count. They were computed
-by exhaustive search using the MaxMinHits criterion of
-[Zentgraf et al. (2025)](https://doi.org/10.4230/LIPIcs.WABI.2025.22).
+Example symmetric seeds following
+[Zentgraf et al. (2025)](https://doi.org/10.4230/LIPIcs.WABI.2025.22):
 
-| Retained bases | Guaranteed hits | Copyable `--seed-pattern` value |
-|---|---|---|
-| 21 | 16 | `##_#_####_#_#_###_#_#_####_#_##` |
-| 23 | 12 | `#####__###__#######__###__#####` |
-| 25 | 9 | `######__####_#####_####__######` |
+| Retained bases | Copyable `--seed-pattern` value |
+|---|---|
+| 21 | `##_#_####_#_#_###_#_#_####_#_##` |
+| 23 | `#####__###__#######__###__#####` |
+| 25 | `######__####_#####_####__######` |
 
 ```bash
 ./target/release/zorindex build --fof tests/data/bacteria/samples.fof \
   --output bacteria.spaced.zindex --k 31 \
   --seed-pattern '##_#_####_#_#_###_#_#_####_#_##' --threads 4
 ```
-
-A 100-base query has 70 dense seed positions with these patterns. For the first
-mask, `--min-ratio 0.22` retains the guaranteed 16 hits. Choose the mask and
-threshold for your sequence length and expected substitution count.
-[Karami et al. (2026)](https://doi.org/10.4230/LIPIcs.WABI.2026.21) also studies
-combining hit counts with coverage. These guarantees apply without sampling.
 
 ## Randstrobemers
 
@@ -248,6 +245,10 @@ Sahlin, link separated sequence pieces to improve tolerance to indels.
   --output bacteria.strobe.zindex --k 21 --randstrobemers \
   --strobe-min 25 --strobe-max 100
 ```
+
+In this example, `--k 21` sets the length of each strobe to 21 bases.
+`--strobe-min 25` and `--strobe-max 100` place the second strobe's start
+between 25 and 100 bases after the first strobe's start.
 
 Zindex uses [strobealign's](https://doi.org/10.1186/s13059-022-02831-7)
 partner-selection rule. Without sampling, each strobe has length `k`. With
@@ -265,14 +266,9 @@ Advanced controls follow the mandatory and important options in `-ah` /
 
 | Short | Option | Default | Meaning |
 |---|---|---|---|
-| `-g` | `--max-ram-gb` | Unset | Sampled process-RSS guard in decimal GB, conflicts with `--build-memory-gib` |
-| `-W` | `--build-memory-gib` | 80% of available RAM | Estimated concurrent workspace budget in GiB |
-| `-Q` | `--max-document-memory-gib` | Build workspace budget | Per-dataset workspace estimate limit, cannot increase the build budget |
-| `-J` | `--skip-oversized-documents` | `false` | Skip and report datasets exceeding that estimate limit |
-| `-X` | `--max-subindex-size` | `8GiB` | Power-of-two uncompressed subindex payload cap, accepts bytes or KiB/MiB/GiB |
+| `-g` | `--max-ram-gb` | 80% of available RAM | Construction memory limit in decimal GB, used for admission and RSS checks |
 | `-P` | `--merge-planner` | `streaming` | Layout algorithm, `streaming`, `full` for smaller collections, or `naive` for input-order placement |
-| `-e` | `--disk-backed` | `false` | Cache extracted seeds in temporary files instead of rereading inputs |
-| `-I` | `--low-disk` | `false` | Retain completed filters and recovery data in RAM instead of temporary files, conflicts with `--disk-backed` |
+| `-e` | `--build-storage` | `disk` | `disk` stages filters on disk, `cached` also caches seeds to avoid rereading inputs, or `memory` keeps completed filters in RAM without scratch files |
 | `-D` | `--min-subindex-documents` | `128` | Minimum original datasets per size class, use 1 to retain small classes |
 | `-N` | `--max-subindexes` | Unlimited | Size-class cap before hash partitioning, trades padding for fewer query probes |
 | `-K` | `--merge-sketch-size` | `128` | Power-of-two sketch bucket count, from 64 to 1048576 |
@@ -283,15 +279,9 @@ Advanced controls follow the mandatory and important options in `-ah` /
 | `-L` | `--segment-length` | `64` | Power-of-two hash segment length, from 1 to 4096 cells |
 | `-R` | `--drop-abandoned` | `false` | Omit recovery data, allowing present seeds to be missed |
 
-Workspace limits use estimates and the RSS guard is sampled. The payload cap
-limits an individual subindex, not total process RAM. All numeric memory limits
-must be positive. Builds fail on oversized datasets unless skipping is enabled.
-Explicit exclusions are listed in `skipped-documents.json` and a sibling report,
-and mark the collection `incomplete` in build output and `info`.
-Unreadable or malformed inputs fail construction.
-
-`--low-disk` and `--skip-oversized-documents` accept `=true` or `=false`, including
-with their short flags. The naive planner ignores size-class promotion settings.
+Construction fails if a dataset cannot fit within the memory limit. The
+subindex size cap controls filter payload and is separate from the RAM limit.
+The naive planner ignores size-class promotion settings.
 
 ### Seed extraction
 
@@ -307,7 +297,7 @@ with their short flags. The naive planner ignores size-class promotion settings.
 
 Masks are supported for dense k-mers and minimizers. Findere requires
 `0 <= z < k <= 255` and `1 <= k-z <= 31`, and uses aggregate queries.
-Modimizers support `1 <= k <= 31` and retain roughly one in `--modimizer-sampling`
+Modimizers accept any positive `k` and retain roughly one in `--modimizer-sampling`
 canonical k-mers.
 
 ### Queries
@@ -345,6 +335,8 @@ Short flags are case-sensitive and apply within their subcommand. `info` accepts
 
 ## Citation
 
-TBD.
+Okçu et al. (2026). *Toward space-optimal approximate colored indexes at scale.*
+[bioRxiv](https://www.biorxiv.org/content/10.64898/2026.11.05.764633v1) ·
+[PDF](Zindex.pdf).
 
 [MIT license](LICENSE).

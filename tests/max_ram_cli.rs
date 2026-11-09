@@ -58,7 +58,6 @@ impl Fixture {
                 "8",
                 "--min-subindex-documents",
                 "1",
-                "--skip-oversized-documents=false",
             ])
             .args(extra)
             .output()
@@ -96,7 +95,7 @@ fn invalid_total_budget_and_conflicting_budgets_are_rejected() {
         &["--max-ram-gb", "500", "--build-memory-gib", "1"],
     );
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot be used with"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unexpected argument"));
 }
 #[test]
 fn measured_rss_above_small_total_fails_without_publishing() {
@@ -138,7 +137,7 @@ fn oversized_construction_is_rejected_by_workspace_or_rss_guard() {
             stderr.contains("exceeds document memory budget"),
             "{stderr}"
         );
-        assert!(stderr.contains("--skip-oversized-documents"), "{stderr}");
+        assert!(stderr.contains("--max-ram-gb"), "{stderr}");
     }
     assert!(!f.0.join("growing").exists());
 }

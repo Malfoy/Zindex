@@ -127,7 +127,7 @@
   "negative_lcg_seed": 20261102,
   "queries_sha256": "d9395bfb8b01a515b0c818de94cf95a5d177019abaf69ac622cfa1193000c5f6",
   "selection": {
-    "pool": "docs/benchmarks/accessions_128_bacterial.txt",
+    "pool": "tests/data/bacteria/accessions_128_bacterial.txt",
     "seed": 20261102,
     "count": 10
   }

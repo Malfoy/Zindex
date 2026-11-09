@@ -47,9 +47,9 @@ struct FusionArgs {
     /// Input index directories, in output dataset order (at least two in total).
     #[arg(short = 'i', long, required = true, num_args = 1..)]
     index: Vec<PathBuf>,
-    /// New output index directory.
+    /// Output directory. Defaults to a new myindex-DATE-TIME directory.
     #[arg(short = 'o', long)]
-    output: PathBuf,
+    output: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -59,21 +59,18 @@ struct BuildArgs {
     /// One FASTA/FASTQ path per line, optionally preceded by a name and a tab.
     #[arg(short = 'f', long)]
     fof: PathBuf,
-    /// K-mer length, or window span in bases for minimizers (up to 255).
+    /// Positive k-mer length, or window span in bases for minimizers.
     #[arg(short = 'k', long)]
     k: usize,
     /// Selected minimizer length in bases (1..=31). Required for minimizers.
     #[arg(short = 'm', long, required_if_eq("index_mode", "minimizers"))]
     minimizer_size: Option<usize>,
-    /// New output index directory.
+    /// Output directory. Defaults to a new myindex-DATE-TIME directory.
     #[arg(short = 'o', long)]
-    output: PathBuf,
+    output: Option<PathBuf>,
     /// Hash locations per ZOR equation, from 2 to 32.
     ///
-    /// Each queried seed reads and XORs this many cells in each relevant filter.
-    /// More locations increase query work and per-key graph storage, and change
-    /// peeling and recovery requirements. Fingerprint width controls the
-    /// fingerprint collision probability. The stored count is reused for queries.
+    /// More hash functions can make the index smaller, but slow queries.
     #[arg(short = 'H', long, default_value_t = 4)]
     hashes: usize,
     /// Fingerprint width in bits: 1, 2, 4, 8 or 16.
@@ -172,7 +169,10 @@ struct QueryArgs {
     /// Minimum matched fraction to report.
     #[arg(short = 'a', long, default_value_t = 0.0)]
     min_ratio: f64,
-    /// Report each FASTA record separately, except in findere mode.
+    /// Score each FASTA sequence or FASTQ read separately.
+    ///
+    /// Without this flag, counts are combined across the whole query file.
+    /// Findere currently supports only combined file counts.
     #[arg(short = 'r', long)]
     records: bool,
     /// Per-record output: named TSV rows (default) or compact dataset_id:count hits.
@@ -205,13 +205,8 @@ struct IndexArg {
 
 const ADVANCED_BUILD_OPTIONS: &[&str] = &[
     "max_ram_gb",
-    "build_memory_gib",
-    "max_document_memory_gib",
-    "skip_oversized_documents",
-    "max_subindex_size",
     "planner",
-    "disk_backed",
-    "low_disk",
+    "build_storage",
     "min_subindex_documents",
     "max_subindexes",
     "sketch_size",
@@ -250,10 +245,10 @@ fn cli_command(advanced: bool) -> clap::Command {
         };
         let mut configured = subcommand.clone().after_help(ADVANCED_HELP_HINT);
         let mandatory: &[&str] = match subcommand.get_name() {
-            "build" => &["fof", "output", "k"],
+            "build" => &["fof", "k"],
             "query" => &["index", "query"],
             "info" => &["index"],
-            "fusion" => &["index", "output"],
+            "fusion" => &["index"],
             _ => &[],
         };
         for (order, &id) in mandatory.iter().enumerate() {
@@ -263,13 +258,16 @@ fn cli_command(advanced: bool) -> clap::Command {
         }
         let important: &[&str] = match subcommand.get_name() {
             "build" => &[
+                "output",
                 "hashes",
                 "fingerprint_bits",
                 "index_mode",
                 "minimizer_size",
                 "minimizer_scheme",
+                "max_subindex_size",
             ],
             "query" => &["min_ratio", "records"],
+            "fusion" => &["output"],
             _ => &[],
         };
         for (order, &id) in important.iter().enumerate() {
@@ -344,7 +342,7 @@ fn main() -> Result<()> {
         Command::Build(args) => build_command(args),
         Command::Query(args) => query_command(args),
         Command::Fusion(args) => {
-            zorindex::power_merge::fuse_many_indexes(&args.index, &args.output)
+            zorindex::power_merge::fuse_many_indexes(&args.index, &output_directory(args.output)?)
         }
         Command::Info(args) => {
             ensure!(
@@ -358,6 +356,7 @@ fn main() -> Result<()> {
 
 fn build_command(args: BuildArgs) -> Result<()> {
     validate_build_args(&args)?;
+    let output = output_directory(args.output.clone())?;
     let segment_length = args
         .segment_length
         .unwrap_or(zorindex::power_merge::DEFAULT_SEGMENT_LENGTH);
@@ -372,7 +371,7 @@ fn build_command(args: BuildArgs) -> Result<()> {
         segment_length: Some(segment_length),
         merge: args.merge.clone(),
     };
-    zorindex::power_merge::build(&args.fof, &args.output, config, |keys, slots| {
+    zorindex::power_merge::build(&args.fof, &output, config, |keys, slots| {
         let layout = calculate_layout_with_segment_length(slots, args.hashes, segment_length)?;
         ensure!(layout.array_length == slots, "invalid power-of-two layout");
         peel_zor_graph(
@@ -387,6 +386,41 @@ fn build_command(args: BuildArgs) -> Result<()> {
             },
         )
     })
+}
+
+fn output_directory(path: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = path {
+        return Ok(path);
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let days = now.as_secs() / 86400;
+    // Gregorian civil date from days since 1970-01-01.
+    let z = days as i64 + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    let seconds = now.as_secs() % 86400;
+    let hour = seconds / 3600;
+    let minute = seconds / 60 % 60;
+    let second = seconds % 60;
+    let stem = format!(
+        "myindex-{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}-{:09}",
+        now.subsec_nanos()
+    );
+    let mut path = PathBuf::from(&stem);
+    let mut collision = 0u64;
+    while path.exists() {
+        collision += 1;
+        path = PathBuf::from(format!("{stem}-{collision}"));
+    }
+    eprintln!("Output index: {}", path.display());
+    Ok(path)
 }
 
 fn query_command(args: QueryArgs) -> Result<()> {
@@ -451,10 +485,7 @@ fn feature_config_from_args(args: &BuildArgs) -> FeatureConfig {
 }
 
 fn validate_build_args(args: &BuildArgs) -> Result<()> {
-    ensure!(
-        (1..=u8::MAX as usize).contains(&args.k),
-        "k must be in 1..=255"
-    );
+    ensure!(args.k > 0, "--k must be positive");
     ensure!(
         (2..=32).contains(&args.hashes),
         "--hashes must be in 2..=32"
@@ -494,15 +525,12 @@ fn validate_feature_config(k: usize, config: FeatureConfig) -> Result<()> {
             zorindex::findere::indexed_length(k, config.findere_z)?;
         }
         IndexMode::Kmers => {
-            ensure!(
-                (1..=31).contains(&k),
-                "k must be in 1..=31 for full k-mer indexes"
-            );
+            ensure!(k > 0, "--k must be positive");
         }
         IndexMode::Minimizers => {
             ensure!(
-                k % 2 == 1,
-                "canonical minimizer indexes require an odd window span"
+                k > 0 && k <= 255 && k % 2 == 1,
+                "canonical minimizer indexes require an odd window span in 1..=255"
             );
             ensure!(
                 (1..=k).contains(&config.minimizer_size),
@@ -510,10 +538,7 @@ fn validate_feature_config(k: usize, config: FeatureConfig) -> Result<()> {
             );
         }
         IndexMode::Modimizers => {
-            ensure!(
-                (1..=31).contains(&k),
-                "k must be in 1..=31 for modimizer indexes"
-            );
+            ensure!(k > 0, "--k must be positive");
         }
     }
     Ok(())
@@ -1368,6 +1393,7 @@ mod tests {
             assert!(help.contains("--fingerprint-bits"));
             assert!(help.contains("--hashes"));
             assert!(help.contains("--minimizer-size"));
+            assert!(help.contains("--max-subindex-size"));
             assert!(help.contains("Mandatory options"));
             assert!(help.contains("Important options"));
             assert!(
@@ -1426,6 +1452,23 @@ mod tests {
 
     #[test]
     fn removed_commands_flags_and_long_aliases_are_rejected() {
+        for removed in [
+            "--build-memory-gib",
+            "--max-document-memory-gib",
+            "--skip-oversized-documents",
+            "--disk-backed",
+            "--low-disk",
+        ] {
+            let error =
+                parse_cli_from(["zorindex", "build", "-f", "inputs.fof", "-k", "31", removed])
+                    .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{removed}"
+            );
+        }
+
         for flag in ["-j", "--other"] {
             let error = parse_cli_from([
                 "zorindex", "fusion", "-i", "first", "second", "-o", "output", flag, "third",

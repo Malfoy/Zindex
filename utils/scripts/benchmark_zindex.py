@@ -167,7 +167,7 @@ def main():
                  "--slot-scale", "1.0", "--merge-plan-margin", str(args.merge_plan_margin),
                  "--cycle-break", "no-heuristic", "--tie-scan", "1", "--segment-length", "64",
                  "--min-subindex-documents", str(args.min_subindex_documents),
-                 "--max-subindex-size", args.max_subindex_size, "--skip-oversized-documents=false"]
+                 "--max-subindex-size", args.max_subindex_size]
         if args.index_mode == "minimizers":
             build += ["--minimizer-size", str(args.minimizer_size)]
         if args.max_subindexes is not None:

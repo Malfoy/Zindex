@@ -115,7 +115,7 @@ fn fixed_workspace(total: u64, baseline: u64, cgroup_free: Option<u64>) -> u64 {
 pub(super) fn workspace_budget(args: &super::MergeArgs) -> u64 {
     total_bytes(args.max_ram_gb)
         .map(|n| fixed_workspace(n, rss_bytes().unwrap_or(0), cgroup_available_bytes()).max(1))
-        .unwrap_or_else(|| budget(args.build_memory_gib))
+        .unwrap_or_else(|| budget(None))
 }
 
 /// Active workspace estimates already include active resident arrays. In total

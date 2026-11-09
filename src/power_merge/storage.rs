@@ -1,6 +1,6 @@
 use super::{
     abandoned::{self, OriginMap},
-    document_guard::{self, Guard, SkippedDocument},
+    document_guard::{Guard, SkippedDocument},
     planner,
     sketch::Sketch,
     Backend, BuildConfig, ColumnOrder, MergePlanner, PeelGraph, QueryMemory,
@@ -515,6 +515,9 @@ pub fn build(
         ColumnOrder::Compression
     };
     config.validate()?;
+    if config.merge.max_ram_gb.is_none() && super::memory::rss_bytes().is_some() {
+        config.merge.max_ram_gb = Some(super::memory::budget(None) as f64 / 1_000_000_000.0);
+    }
     let rss_guard = super::memory::RssGuard::start(config.merge.max_ram_gb)?;
     config.feature_config.validate_anchors(config.k)?;
     ensure!(
@@ -528,12 +531,6 @@ pub fn build(
     let extraction_budget = super::memory::workspace_budget(&config.merge);
     let guard = Guard::new(&config, extraction_budget);
     config.merge.planning_memory_budget_bytes = Some(guard.budget);
-    let skip_report = document_guard::report_path(output);
-    ensure!(
-        !skip_report.exists(),
-        "skip report {} already exists; choose a new output",
-        skip_report.display()
-    );
     let original_costs = original_inputs
         .par_iter()
         // The file-size heuristic only schedules extraction concurrency. It
@@ -543,46 +540,13 @@ pub fn build(
                 .map(|hint| hint.min((guard.budget / 4).max(1)))
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut inputs = Vec::new();
-    let mut input_costs = Vec::new();
-    let mut prefiltered_source_ids = Vec::new();
-    let mut skipped_documents = Vec::new();
-    for (id, (input, &cost)) in original_inputs.into_iter().zip(&original_costs).enumerate() {
-        if let Err(error) = guard.check("input-size", cost) {
-            if !config.merge.skip_oversized_documents {
-                return Err(error).with_context(|| format!("dataset {id} {} exceeds its memory budget, use --skip-oversized-documents to allow exclusions", input.name));
-            }
-            let skipped = guard.skipped(id, &input, &error).unwrap();
-            eprintln!("skipping document {id} {}: {}", input.name, skipped.reason);
-            skipped_documents.push(skipped);
-        } else {
-            inputs.push(input);
-            input_costs.push(cost);
-            prefiltered_source_ids.push(id);
-        }
+    for (id, (input, &cost)) in original_inputs.iter().zip(&original_costs).enumerate() {
+        guard
+            .check("input-size", cost)
+            .with_context(|| format!("dataset {id} {} exceeds --max-ram-gb", input.name))?;
     }
-    document_guard::report(
-        &skip_report,
-        input_document_count,
-        0,
-        &skipped_documents,
-        "filtering",
-        guard.budget,
-    )?;
-    if inputs.is_empty() && !skipped_documents.is_empty() {
-        document_guard::report(
-            &skip_report,
-            input_document_count,
-            0,
-            &skipped_documents,
-            "all_skipped",
-            guard.budget,
-        )?;
-        anyhow::bail!(
-            "all documents were skipped by the memory guard; see {}",
-            skip_report.display()
-        );
-    }
+    let inputs = original_inputs;
+    let input_costs = original_costs;
     ensure!(!inputs.is_empty(), "{} contains no inputs", fof.display());
     ensure!(
         inputs.len() <= u32::MAX as usize,
@@ -595,10 +559,10 @@ pub fn build(
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let stage = Staging(parent.join(format!(".zor-pow2-building-{}-{stamp}", std::process::id())));
     fs::create_dir(&stage.0)?;
-    if config.merge.disk_backed {
+    if config.merge.cache_features() {
         fs::create_dir(stage.0.join("features"))?;
     }
-    if config.merge.disk_backed || !config.merge.low_disk {
+    if config.merge.cache_features() || !config.merge.in_memory() {
         fs::create_dir(stage.0.join("cells"))?;
         if !config.merge.drop_abandoned {
             fs::create_dir(stage.0.join("abandoned"))?;
@@ -631,32 +595,12 @@ pub fn build(
             &input_costs,
             extraction_budget,
             !guard.enabled,
-            config.merge.build_memory_gib.is_some(),
+            config.merge.max_ram_gb.is_some(),
             super::memory::total_bytes(config.merge.max_ram_gb),
             |id, input| {
-                let (keys, occurrences) = match guard.collect(input, &config) {
-                    Ok(result) => result,
-                    Err(error) => {
-                        if !config.merge.skip_oversized_documents {
-                            if guard
-                                .skipped(prefiltered_source_ids[id], input, &error)
-                                .is_some()
-                            {
-                                return Err(error).with_context(|| format!("dataset {} {} exceeds its memory budget, use --skip-oversized-documents to allow exclusions", prefiltered_source_ids[id], input.name));
-                            }
-                            return Err(error).with_context(|| {
-                                format!(
-                                    "reading dataset {} {}",
-                                    prefiltered_source_ids[id], input.name
-                                )
-                            });
-                        }
-                        return match guard.skipped(prefiltered_source_ids[id], input, &error) {
-                            Some(skipped) => Ok(Err(skipped)),
-                            None => Err(error),
-                        };
-                    }
-                };
+                let (keys, occurrences) = guard.collect(input, &config).with_context(|| {
+                    format!("reading dataset {id} {} within --max-ram-gb", input.name)
+                })?;
                 let sketch_start = Instant::now();
                 let sketch = if config.merge.planner == MergePlanner::Naive {
                     Sketch::default()
@@ -664,7 +608,7 @@ pub fn build(
                     Sketch::new(&keys, config.merge.sketch_size, config.seed)
                 };
                 let sketch_sec = sketch_start.elapsed().as_secs_f64();
-                if config.merge.disk_backed {
+                if config.merge.cache_features() {
                     cache_write(&cache_path(&stage.0, id), &keys)?;
                 }
                 let signature = feature_signature(&keys, occurrences);
@@ -674,37 +618,16 @@ pub fn build(
                     occurrences,
                     unique_kmers: keys.len(),
                 };
-                Ok(Ok((color, sketch, sketch_sec, signature)))
+                Ok((color, sketch, sketch_sec, signature))
             },
             |original_id, result| {
-                let (color, sketch, seconds, signature) = match result {
-                    Ok(result) => result,
-                    Err(skipped) => {
-                        eprintln!(
-                            "skipping document {} {}: {}",
-                            skipped.source_document_id, skipped.name, skipped.reason
-                        );
-                        skipped_documents.push(skipped);
-                        document_guard::report(
-                            &skip_report,
-                            input_document_count,
-                            colors.len(),
-                            &skipped_documents,
-                            "filtering",
-                            guard.budget,
-                        )?;
-                        return Ok(());
-                    }
-                };
+                let (color, sketch, seconds, signature) = result;
                 let id = colors.len();
-                if config.merge.disk_backed && original_id != id {
-                    fs::rename(cache_path(&stage.0, original_id), cache_path(&stage.0, id))?;
-                }
                 let mut group = planner::singleton(color.unique_kmers, sketch, id, &config)?;
                 group.input_peak_bytes = super::memory::feature_resident_bytes(color.occurrences);
                 included_inputs.push(inputs[original_id].clone());
                 included_costs.push(super::memory::feature_resident_bytes(color.occurrences));
-                source_document_ids.push(prefiltered_source_ids[original_id]);
+                source_document_ids.push(original_id);
                 input_signatures.push(signature);
                 colors.push(color);
                 singleton_logical_bits += planner::cost(group.slots, group.width);
@@ -720,20 +643,6 @@ pub fn build(
             },
         )
     })?;
-    if colors.is_empty() {
-        document_guard::report(
-            &skip_report,
-            input_document_count,
-            0,
-            &skipped_documents,
-            "all_skipped",
-            guard.budget,
-        )?;
-        anyhow::bail!(
-            "all documents were skipped by the memory guard; see {}",
-            skip_report.display()
-        );
-    }
     let inputs = included_inputs;
     let input_costs = included_costs;
     eprintln!(
@@ -776,9 +685,9 @@ pub fn build(
         plan_seconds,
         planning_pair_evaluations
     );
-    if !config.merge.disk_backed && config.merge.low_disk {
+    if !config.merge.cache_features() && config.merge.in_memory() {
         eprintln!("two-pass construction: projected {} power-of-two banks, {} logical bits; rereading inputs, no temporary key/cell files; completed filters stay bit-packed in RAM", projected_banks, predicted_logical_bits);
-    } else if !config.merge.disk_backed {
+    } else if !config.merge.cache_features() {
         eprintln!("two-pass construction: projected {} power-of-two banks, {} logical bits; rereading inputs, completed filters and abandoned keys staged on disk", projected_banks, predicted_logical_bits);
     }
     let mut built = Vec::new();
@@ -790,22 +699,22 @@ pub fn build(
         .collect::<Result<Vec<_>>>()?;
     let construction_budget = super::memory::workspace_budget(&config.merge);
     eprintln!("build workspace admission: construction budget={} bytes, workers={}; completed filters and abandoned keys retained in {}",
-        construction_budget, rayon::current_num_threads(), if config.merge.low_disk && !config.merge.disk_backed { "RAM (additional to workspace)" } else { "temporary disk files" });
+        construction_budget, rayon::current_num_threads(), if config.merge.in_memory() && !config.merge.cache_features() { "RAM (additional to workspace)" } else { "temporary disk files" });
     pull_jobs_budgeted_with_policy(
         &planned,
         usize::MAX,
         &group_costs,
         construction_budget,
         !guard.enabled,
-        config.merge.build_memory_gib.is_some(),
+        config.merge.max_ram_gb.is_some(),
         super::memory::total_bytes(config.merge.max_ram_gb),
         |_, group| {
-            if config.merge.disk_backed {
+            if config.merge.cache_features() {
                 build_group(group, &stage.0, &config, &graph)
             } else {
                 let (keys, values) =
                     union_input_features(group, &inputs, &colors, &input_signatures, &config)?;
-                let stage = (!config.merge.low_disk).then_some(stage.0.as_path());
+                let stage = (!config.merge.in_memory()).then_some(stage.0.as_path());
                 construct_group(group, keys, values, stage, &config, &graph, None)
             }
         },
@@ -863,10 +772,10 @@ pub fn build(
         save_abandoned_groups(&mut built, &stage.0)?
     };
     let banks = pack_banks_streaming(built, column_order, config.fingerprint_bits, &stage.0)?;
-    if config.merge.disk_backed {
+    if config.merge.cache_features() {
         fs::remove_dir(stage.0.join("features"))?;
     }
-    if config.merge.disk_backed || !config.merge.low_disk {
+    if config.merge.cache_features() || !config.merge.in_memory() {
         fs::remove_dir(stage.0.join("cells"))?;
         if !config.merge.drop_abandoned {
             fs::remove_dir(stage.0.join("abandoned"))?;
@@ -911,9 +820,9 @@ pub fn build(
         planning_pair_evaluations,
         planning_possible_pair_evaluations,
         merge_reverts_enabled: false,
-        construction_cell_storage: if config.merge.disk_backed {
+        construction_cell_storage: if config.merge.cache_features() {
             "temporary-disk-u64-tiled-packing"
-        } else if config.merge.low_disk {
+        } else if config.merge.in_memory() {
             "two-pass-memory-packed-no-scratch"
         } else {
             "two-pass-temporary-disk-packed-tiled-packing"
@@ -921,7 +830,7 @@ pub fn build(
         .into(),
         construction_abandoned_storage: Some(if config.merge.drop_abandoned {
             "omitted"
-        } else if config.merge.low_disk && !config.merge.disk_backed {
+        } else if config.merge.in_memory() && !config.merge.cache_features() {
             "memory"
         } else {
             "temporary-disk-sorted-runs"
@@ -942,7 +851,7 @@ pub fn build(
         build_seconds: 0.0,
         input_document_count,
         source_document_ids,
-        skipped_documents: skipped_documents.clone(),
+        skipped_documents: Vec::new(),
         memory_guard_split_groups,
         merge_memory_budget_bytes: config.merge.planning_memory_budget_bytes,
         colors,
@@ -952,17 +861,6 @@ pub fn build(
     let mut writer = BufWriter::new(File::create(stage.0.join("manifest.json"))?);
     serde_json::to_writer_pretty(&mut writer, &manifest)?;
     writer.flush()?;
-    if !skipped_documents.is_empty() {
-        document_guard::report(
-            &skip_report,
-            input_document_count,
-            manifest.colors.len(),
-            &skipped_documents,
-            "incomplete",
-            guard.budget,
-        )?;
-        fs::copy(&skip_report, stage.0.join("skipped-documents.json"))?;
-    }
     ensure!(
         !output.exists(),
         "output appeared during build: {}",
@@ -975,7 +873,7 @@ pub fn build(
         manifest.collection_status(),
         input_document_count,
         manifest.colors.len(),
-        skipped_documents.len()
+        manifest.skipped_documents.len()
     );
     eprintln!("built {} in {:.3}s: banks={}, groups={}, stack_bytes={}, fallback_bytes={}, rejected_groups={}, overflow_groups={}",
         output.display(), start.elapsed().as_secs_f64(), manifest.banks.len(), manifest.banks.iter().map(|b| b.groups.len()).sum::<usize>(),
@@ -1478,8 +1376,8 @@ fn construct_group_at_slots(
             0
         }) as u64;
     // Release graph/union workspaces before retaining completed cells: bit-packed
-    // in a staged file (default), in RAM (--low-disk), or in the
-    // --disk-backed u64 cell cache.
+    // in a staged file (default), in RAM (--build-storage memory), or in the
+    // --build-storage cached u64 cell cache.
     drop(peeled);
     drop(values);
     drop(keys);
@@ -1490,7 +1388,7 @@ fn construct_group_at_slots(
         config: &BuildConfig,
     ) -> Result<CompletedCells> {
         Ok(match cache_stage {
-            Some(stage) if config.merge.disk_backed => {
+            Some(stage) if config.merge.cache_features() => {
                 let path =
                     stage
                         .join("cells")
@@ -1604,11 +1502,12 @@ fn promote_small_subindexes(
         &costs,
         super::memory::workspace_budget(&config.merge),
         false,
-        config.merge.build_memory_gib.is_some(),
+        config.merge.max_ram_gb.is_some(),
         super::memory::total_bytes(config.merge.max_ram_gb),
         |_, &(id, slots, group)| {
             let (keys, values) = union_input_features(group, inputs, colors, signatures, config)?;
-            let cache = (config.merge.disk_backed || !config.merge.low_disk).then_some(stage);
+            let cache =
+                (config.merge.cache_features() || !config.merge.in_memory()).then_some(stage);
             let (new, _) = construct_group(group, keys, values, cache, config, graph, Some(slots))?;
             Ok((id, new))
         },
@@ -1692,7 +1591,7 @@ fn partition_large_subindexes(
         &costs,
         super::memory::workspace_budget(&config.merge),
         false,
-        config.merge.build_memory_gib.is_some(),
+        config.merge.max_ram_gb.is_some(),
         super::memory::total_bytes(config.merge.max_ram_gb),
         |_, &(group, source_slots, local, partitions)| {
             let (keys, masks) = union_input_features(group, inputs, colors, signatures, config)?;
@@ -1714,7 +1613,7 @@ fn partition_large_subindexes(
                 let part_stage = stage
                     .join("partitions")
                     .join(format!("{source_slots}-{partition}"));
-                let cache = if config.merge.low_disk && !config.merge.disk_backed {
+                let cache = if config.merge.in_memory() && !config.merge.cache_features() {
                     None
                 } else {
                     fs::create_dir_all(part_stage.join("cells"))?;
@@ -2454,7 +2353,7 @@ impl Index {
                 crate::findere::indexed_length(manifest.k, features.findere_z)?;
             }
             IndexMode::Kmers | IndexMode::Modimizers => {
-                ensure!((1..=31).contains(&manifest.k), "invalid k")
+                ensure!(manifest.k > 0, "invalid k")
             }
             IndexMode::Minimizers => ensure!(
                 (1..=255).contains(&manifest.k)
@@ -4429,7 +4328,11 @@ mod tests {
             merge: super::super::MergeArgs {
                 disabled: true,
                 sketch_size: 64,
-                low_disk,
+                build_storage: if low_disk {
+                    super::super::BuildStorage::Memory
+                } else {
+                    super::super::BuildStorage::Disk
+                },
                 ..Default::default()
             },
         }
@@ -4451,7 +4354,7 @@ mod tests {
 
     #[test]
     fn default_two_pass_stages_packed_cells_and_abandoned_keys_during_construction() {
-        assert!(!super::super::MergeArgs::default().low_disk);
+        assert!(!super::super::MergeArgs::default().in_memory());
         two_pass_stages_only_packed_cells(false);
     }
 
@@ -4612,7 +4515,7 @@ mod tests {
                 assert_eq!(stages.len(), 1);
                 // Before final packing, the publication directory holds no
                 // features/, cache files or other construction artifacts: nothing
-                // at all with --low-disk, packed cells AND abandoned-key runs
+                // at all with --build-storage memory, packed cells AND abandoned-key runs
                 // of completed groups otherwise.
                 let entries: Vec<_> = fs::read_dir(&stages[0])
                     .unwrap()

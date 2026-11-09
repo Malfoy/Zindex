@@ -893,12 +893,14 @@ fn all_cell_storage_modes_build_identical_filters_and_queries() {
             let mut results = Vec::new();
             for (mode, storage) in [
                 (None, "two-pass-temporary-disk-packed-tiled-packing"),
-                (Some("--low-disk"), "two-pass-memory-packed-no-scratch"),
-                (Some("--disk-backed"), "temporary-disk-u64-tiled-packing"),
+                (Some("memory"), "two-pass-memory-packed-no-scratch"),
+                (Some("cached"), "temporary-disk-u64-tiled-packing"),
             ] {
                 let path = f.path(&format!("{planner}-{fp}-{storage}"));
                 let mut args = vec!["--fingerprint-bits", fp, "--merge-planner", planner];
-                args.extend(mode);
+                if let Some(value) = mode {
+                    args.extend(["--build-storage", value]);
+                }
                 build(&fof, &path, &args);
                 let mut json: serde_json::Value = serde_json::from_slice(
                     &fs::read(Path::new(&path).join("manifest.json")).unwrap(),
@@ -907,7 +909,7 @@ fn all_cell_storage_modes_build_identical_filters_and_queries() {
                 assert_eq!(json["construction_cell_storage"], storage);
                 assert_eq!(
                     json["construction_abandoned_storage"],
-                    if mode == Some("--low-disk") {
+                    if mode == Some("memory") {
                         "memory"
                     } else {
                         "temporary-disk-sorted-runs"
@@ -1002,10 +1004,10 @@ fn all_cell_storage_modes_preserve_all_feature_extractors() {
         let staged = f.path(&format!("{mode}-staged"));
         build(&fof, &staged, &settings);
         let one = ok(&["query", "--index", &staged, "--query", &query], "4");
-        for flag in ["--low-disk", "--disk-backed"] {
+        for flag in ["memory", "cached"] {
             let other = f.path(&format!("{mode}{flag}"));
             let mut other_settings = settings.clone();
-            other_settings.push(flag);
+            other_settings.extend(["--build-storage", flag]);
             build(&fof, &other, &other_settings);
             let two = ok(&["query", "--index", &other, "--query", &query], "1");
             assert_eq!(
@@ -1026,16 +1028,24 @@ fn all_cell_storage_modes_preserve_all_feature_extractors() {
             }
         }
     }
-    for flags in [["--low-disk", "--disk-backed"]] {
-        let invalid = f.path("invalid");
-        assert!(!call(
-            &["build", flags[0], flags[1], "--fof", &fof, "--output", &invalid, "--k", "31"],
-            "1"
-        )
-        .status
-        .success());
-        assert!(!Path::new(&invalid).exists());
-    }
+    let invalid = f.path("invalid");
+    assert!(!call(
+        &[
+            "build",
+            "--build-storage",
+            "unknown",
+            "--fof",
+            &fof,
+            "--output",
+            &invalid,
+            "--k",
+            "31"
+        ],
+        "1"
+    )
+    .status
+    .success());
+    assert!(!Path::new(&invalid).exists());
 }
 
 #[test]
@@ -1749,8 +1759,8 @@ fn partition_caps_validate_and_all_construction_storage_modes_agree() {
     let mut expected_directory = String::new();
     for (name, flags) in [
         ("default", vec![]),
-        ("ram", vec!["--low-disk"]),
-        ("disk", vec!["--disk-backed"]),
+        ("ram", vec!["--build-storage", "memory"]),
+        ("disk", vec!["--build-storage", "cached"]),
         ("dropped", vec!["--drop-abandoned"]),
     ] {
         let index = f.path(name);

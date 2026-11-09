@@ -305,9 +305,9 @@ fn merged_colored_filters_survive_promotion_across_all_widths_and_storage_modes(
     let fof = f.write("inputs.fof", fof);
     for bits in ["1", "2", "4", "8", "16"] {
         for (mode, storage) in [
-            ("ram", Some("--low-disk")),
+            ("ram", Some("memory")),
             ("packed-disk", None),
-            ("disk", Some("--disk-backed")),
+            ("disk", Some("cached")),
         ] {
             for (cap, minimum) in [("1", "1"), ("2", "4"), ("3", "128")] {
                 let index = f.path(&format!("promotion-{bits}-{mode}-{cap}-{minimum}"));
@@ -319,7 +319,9 @@ fn merged_colored_filters_survive_promotion_across_all_widths_and_storage_modes(
                     "--min-subindex-documents",
                     minimum,
                 ];
-                args.extend(storage);
+                if let Some(value) = storage {
+                    args.extend(["--build-storage", value]);
+                }
                 build(&fof, &index, &args);
                 let m = manifest(&index);
                 let banks = m["banks"].as_array().unwrap();
@@ -373,10 +375,12 @@ fn failed_builds_clean_staging_and_never_overwrite_existing_output() {
     let bad = f.write("corrupt.fa.zst", [0x28, 0xb5, 0x2f, 0xfd, 1, 2, 3]);
     for (id, input) in [&missing, &bad].into_iter().enumerate() {
         let fof = f.write("failed.fof", format!("good\t{good}\nbad\t{input}\n"));
-        for mode in [None, Some("--low-disk"), Some("--disk-backed")] {
+        for mode in [None, Some("memory"), Some("cached")] {
             let index = f.path(&format!("failed-{id}-{mode:?}"));
             let mut args = vec!["build", "--fof", &fof, "--output", &index, "--k", "31"];
-            args.extend(mode);
+            if let Some(value) = mode {
+                args.extend(["--build-storage", value]);
+            }
             assert!(!call(&args, "2").status.success());
             assert!(!Path::new(&index).exists());
             f.no_staging();
@@ -456,7 +460,7 @@ fn invalid_option_boundaries_fail_before_publishing_an_index() {
         vec!["--merge-plan-margin", "0.5"],
         vec!["--max-subindexes", "0"],
         vec!["--min-subindex-documents", "0"],
-        vec!["--build-memory-gib", "0"],
+        vec!["--max-ram-gb", "0"],
         vec!["--slot-scale", "NaN"],
         vec!["--slot-scale", "inf"],
         vec!["--tie-scan", "0"],
@@ -617,13 +621,15 @@ fn all_empty_feature_collections_and_empty_queries_are_consistent() {
     let fof = f.write("inputs.fof", format!("a\t{a}\nb\t{b}\n"));
     for bits in ["1", "2", "4", "8", "16"] {
         for (mode, flag) in [
-            ("ram", Some("--low-disk")),
+            ("ram", Some("memory")),
             ("packed-disk", None),
-            ("disk", Some("--disk-backed")),
+            ("disk", Some("cached")),
         ] {
             let index = f.path(&format!("empty-{bits}-{mode}"));
             let mut args = vec!["--fingerprint-bits", bits];
-            args.extend(flag);
+            if let Some(value) = flag {
+                args.extend(["--build-storage", value]);
+            }
             build(&fof, &index, &args);
             let m = manifest(&index);
             assert!(m["colors"]

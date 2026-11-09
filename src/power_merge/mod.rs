@@ -113,6 +113,17 @@ impl MergePlanner {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum BuildStorage {
+    /// Reread inputs and stage packed filters on disk.
+    #[default]
+    Disk,
+    /// Cache extracted seeds on disk to avoid rereading inputs.
+    Cached,
+    /// Reread inputs and keep completed filters in RAM, without scratch files.
+    Memory,
+}
+
 #[derive(Args, Clone, Debug)]
 pub struct MergeArgs {
     /// streaming (default), full, or naive (ordered placement without unions).
@@ -167,60 +178,28 @@ pub struct MergeArgs {
     /// recovery later requires rebuilding the index.
     #[arg(short = 'R', long)]
     pub drop_abandoned: bool,
-    /// Cache extracted seeds in temporary files.
-    ///
-    /// Use temporary feature/cell/abandoned-key files instead of the two-pass build.
-    /// The default two-pass build stages completed filters as bit-packed cell files.
-    #[arg(short = 'e', long)]
-    pub disk_backed: bool,
-    /// Keep completed filters and recovery data in RAM instead of scratch files.
-    ///
-    /// Keep completed filters (bit-packed) and abandoned-key records in RAM until bank
-    /// compression, writing no scratch files. Default false: both are staged on disk next to
-    /// the output (bit-packed cell files, sorted abandoned-key runs with a bounded merge),
-    /// so peak RSS does not include them.
-    #[arg(short = 'I', long, action = clap::ArgAction::Set, num_args = 0..=1,
-        require_equals = true, default_missing_value = "true", default_value_t = false,
-        conflicts_with = "disk_backed")]
-    pub low_disk: bool,
+    /// Construction storage: disk staging, cached seeds, or in-memory filters.
+    #[arg(short = 'e', long, value_enum, default_value = "disk")]
+    pub build_storage: BuildStorage,
 
-    /// Estimated concurrent workspace budget in GiB, default 80% of available RAM.
+    /// Total process memory limit in decimal GB. Default: 80% of available RAM.
     ///
-    /// Estimated concurrent build-workspace budget in GiB. Default: 80% of
-    /// available RAM (including visible cgroup limits). Oversized jobs run alone.
-    /// This is admission control, not an RSS cap. Retained filters/recovery and
-    /// a single oversized genome still need enough memory. Feature sorting stays in RAM.
-    #[arg(short = 'W', long)]
-    pub build_memory_gib: Option<f64>,
-
-    /// Sampled process-RSS guard in decimal GB, alternative to --build-memory-gib.
-    ///
-    /// Total process resident-memory ceiling in decimal GB (500 = 500000000000
-    /// bytes). Fixed admission budget, without automatic available-RAM discount.
-    /// Measured RSS is checked every 20 ms. This is not a virtual-address limit.
-    #[arg(short = 'g', long, conflicts_with = "build_memory_gib")]
+    /// The same limit controls workspace admission and sampled process RSS.
+    /// Every dataset must fit. Construction fails rather than excluding inputs.
+    #[arg(short = 'g', long)]
     pub max_ram_gb: Option<f64>,
-
-    /// Skip and report datasets exceeding the per-dataset workspace budget.
-    ///
-    /// Skip documents whose estimated extraction/graph workspace exceeds the
-    /// per-document budget. Default false: exceeding the budget fails the build.
-    /// Explicit skips are recorded and mark the collection incomplete.
-    #[arg(short = 'J', long, action = clap::ArgAction::Set, num_args = 0..=1,
-        require_equals = true, default_missing_value = "true", default_value_t = false)]
-    pub skip_oversized_documents: bool,
-
-    /// Estimated per-dataset workspace limit in GiB, default the build budget.
-    ///
-    /// Per-document workspace ceiling in GiB (merged builds). Defaults to the
-    /// build workspace budget, and cannot raise that budget. Estimates are
-    /// conservative, not a hard process RSS limit.
-    #[arg(short = 'Q', long)]
-    pub max_document_memory_gib: Option<f64>,
 
     /// Runtime-only frozen workspace limit shared with merge candidate checks.
     #[arg(skip)]
     pub planning_memory_budget_bytes: Option<u64>,
+}
+impl MergeArgs {
+    fn cache_features(&self) -> bool {
+        self.build_storage == BuildStorage::Cached
+    }
+    fn in_memory(&self) -> bool {
+        self.build_storage == BuildStorage::Memory
+    }
 }
 impl Default for MergeArgs {
     fn default() -> Self {
@@ -233,12 +212,8 @@ impl Default for MergeArgs {
             max_subindex_size: DEFAULT_MAX_SUBINDEX_SIZE,
             disabled: false,
             drop_abandoned: false,
-            disk_backed: false,
-            low_disk: false,
-            build_memory_gib: None,
+            build_storage: BuildStorage::Disk,
             max_ram_gb: None,
-            skip_oversized_documents: false,
-            max_document_memory_gib: None,
             planning_memory_budget_bytes: None,
         }
     }
@@ -280,22 +255,6 @@ impl BuildConfig {
             "--max-ram-gb must be a positive finite decimal GB value of at least one byte"
         );
         ensure!(
-            self.merge.max_ram_gb.is_none() || self.merge.build_memory_gib.is_none(),
-            "--max-ram-gb conflicts with --build-memory-gib"
-        );
-        ensure!(
-            self.merge
-                .max_document_memory_gib
-                .is_none_or(|v| v.is_finite() && v > 0.0 && v * 1073741824.0 < u64::MAX as f64),
-            "--max-document-memory-gib must be a positive finite GiB value"
-        );
-        ensure!(
-            self.merge
-                .build_memory_gib
-                .is_none_or(|v| v.is_finite() && v > 0.0 && v * 1073741824.0 < u64::MAX as f64),
-            "--build-memory-gib must be a positive finite GiB value"
-        );
-        ensure!(
             self.merge.max_subindexes != Some(0),
             "--max-subindexes must be positive"
         );
@@ -308,10 +267,9 @@ impl BuildConfig {
             "fingerprint bits must be 1, 2, 4, 8 or 16"
         );
         match self.feature_config.mode {
-            crate::IndexMode::Kmers | crate::IndexMode::Modimizers => ensure!(
-                (1..=31).contains(&self.k),
-                "k must be in 1..=31 for k-mers/modimizers"
-            ),
+            crate::IndexMode::Kmers | crate::IndexMode::Modimizers => {
+                ensure!(self.k > 0, "k must be positive")
+            }
             crate::IndexMode::Minimizers => ensure!(
                 (1..=255).contains(&self.k)
                     && self.k % 2 == 1

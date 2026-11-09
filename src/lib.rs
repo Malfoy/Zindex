@@ -646,10 +646,18 @@ pub fn scan_canonical_kmers<F>(seq: &[u8], k: usize, on_kmer: &mut F)
 where
     F: FnMut(u64),
 {
-    if seq.len() < k {
+    if k == 0 || seq.len() < k {
         return;
     }
-    let mask = (1u64 << (2 * k)) - 1;
+    if k > 32 {
+        scan_long_kmers(seq, k, on_kmer);
+        return;
+    }
+    let mask = if k == 32 {
+        u64::MAX
+    } else {
+        (1u64 << (2 * k)) - 1
+    };
     let rc_shift = 2 * (k - 1);
     let mut forward = 0u64;
     let mut reverse = 0u64;
@@ -668,6 +676,56 @@ where
         seen += 1;
         if seen >= k {
             on_kmer(forward.min(reverse));
+        }
+    }
+}
+
+// Polynomial hashes support any window length without storing or rehashing
+// each complete window. Both orientations roll in constant time per base.
+const KMER_HASH_BASE: u64 = 0x9e3779b185ebca87;
+
+fn scan_long_kmers(seq: &[u8], k: usize, emit: &mut impl FnMut(u64)) {
+    let mut inverse = KMER_HASH_BASE;
+    for _ in 0..6 {
+        inverse = inverse.wrapping_mul(2u64.wrapping_sub(KMER_HASH_BASE.wrapping_mul(inverse)));
+    }
+    let mut power = 1u64;
+    let mut base = KMER_HASH_BASE;
+    let mut exponent = k - 1;
+    while exponent != 0 {
+        if exponent & 1 != 0 {
+            power = power.wrapping_mul(base);
+        }
+        base = base.wrapping_mul(base);
+        exponent >>= 1;
+    }
+    let domain = splitmix64(k as u64 ^ 0x6b6d65722d763031);
+    let (mut forward, mut reverse, mut weight, mut seen) = (0u64, 0u64, 1u64, 0usize);
+    for (position, &letter) in seq.iter().enumerate() {
+        let Some(code) = encode_base(letter) else {
+            (forward, reverse, weight, seen) = (0, 0, 1, 0);
+            continue;
+        };
+        let value = code as u64 + 1;
+        let complement = 4 - code as u64;
+        if seen < k {
+            forward = forward.wrapping_mul(KMER_HASH_BASE).wrapping_add(value);
+            reverse = reverse.wrapping_add(complement.wrapping_mul(weight));
+            weight = weight.wrapping_mul(KMER_HASH_BASE);
+            seen += 1;
+        } else {
+            let outgoing = encode_base(seq[position - k]).unwrap() as u64;
+            forward = forward
+                .wrapping_sub((outgoing + 1).wrapping_mul(power))
+                .wrapping_mul(KMER_HASH_BASE)
+                .wrapping_add(value);
+            reverse = reverse
+                .wrapping_sub(4 - outgoing)
+                .wrapping_mul(inverse)
+                .wrapping_add(complement.wrapping_mul(power));
+        }
+        if seen == k {
+            emit(splitmix64(forward.min(reverse) ^ domain));
         }
     }
 }
@@ -760,10 +818,59 @@ mod tests {
         out
     }
 
+    #[test]
+    fn arbitrary_kmers_match_independent_window_hashes_and_reverse_complements() {
+        let mut sequence: Vec<u8> = (0..2400)
+            .map(|i| b"ACGT"[(splitmix64(i) & 3) as usize])
+            .collect();
+        sequence[80] = b'N';
+        sequence[900] = b'n';
+        for base in &mut sequence[300..360] {
+            *base = base.to_ascii_lowercase();
+        }
+        for k in [1, 31, 32, 33, 49, 64, 65, 127, 255, 256, 511, 1025] {
+            let expected: Vec<_> = sequence
+                .windows(k)
+                .filter_map(|window| {
+                    let codes: Option<Vec<_>> = window.iter().map(|&b| encode_base(b)).collect();
+                    let codes = codes?;
+                    if k <= 32 {
+                        let forward = codes.iter().fold(0u64, |h, &c| (h << 2) | c as u64);
+                        let reverse = codes
+                            .iter()
+                            .rev()
+                            .fold(0u64, |h, &c| (h << 2) | (c as u64 ^ 3));
+                        Some(forward.min(reverse))
+                    } else {
+                        let forward = codes.iter().fold(0u64, |h, &c| {
+                            h.wrapping_mul(KMER_HASH_BASE).wrapping_add(c as u64 + 1)
+                        });
+                        let reverse = codes.iter().rev().fold(0u64, |h, &c| {
+                            h.wrapping_mul(KMER_HASH_BASE).wrapping_add(4 - c as u64)
+                        });
+                        Some(splitmix64(
+                            forward.min(reverse) ^ splitmix64(k as u64 ^ 0x6b6d65722d763031),
+                        ))
+                    }
+                })
+                .collect();
+            let actual = collect_kmers(&sequence, k);
+            assert!(actual == expected, "window hashes differ at k={k}");
+            let mut reversed = collect_kmers(&reverse_complement(&sequence), k);
+            reversed.reverse();
+            assert!(
+                actual == reversed,
+                "reverse-complement hashes differ at k={k}"
+            );
+        }
+        assert!(collect_kmers(&sequence, 0).is_empty());
+        assert!(collect_kmers(&sequence, usize::MAX).is_empty());
+    }
+
     fn reverse_complement(seq: &[u8]) -> Vec<u8> {
         seq.iter()
             .rev()
-            .map(|base| match base {
+            .map(|base| match base.to_ascii_uppercase() {
                 b'A' => b'T',
                 b'C' => b'G',
                 b'G' => b'C',
