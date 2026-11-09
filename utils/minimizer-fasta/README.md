@@ -51,7 +51,7 @@ Supported seed lengths are1..64 for `simd`, 1..31 for `open-closed-mod`, and
 window counts1..65535. `--seed` defaults to69 and controls OCM's hash ordering.
 the legacy SIMD selector keeps its original hashing regardless of this setting.
 For example, utility `--k 31 --window 19 --minimizer-scheme open-closed-mod`
-matches Zindex `--index-mode minimizers --k 31 --window 19 --minimizer-scheme open-closed-mod`.
+matches Zindex `--index-mode minimizers --k 49 --minimizer-size 31 --minimizer-scheme open-closed-mod`.
 No seed is selected
 from an ACGT run shorter than the full window span. Upper/lowercase and sequence
 whitespace are normalized. Non-ACGT bases split runs. Record and ambiguity

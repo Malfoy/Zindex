@@ -63,16 +63,30 @@ fn named_rows_match_compact_counts_and_preserve_unmatched_queries_in_every_query
     );
     for (mode, settings) in [
         ("kmers", vec![]),
-        ("minimizers", vec!["-m", "minimizers", "-w", "19"]),
+        ("minimizers", vec!["-i", "minimizers", "-m", "31"]),
         ("strobes", vec!["--randstrobemers"]),
         (
             "sampled-strobes",
-            vec!["-m", "minimizers", "-w", "19", "--randstrobemers"],
+            vec!["-i", "minimizers", "-m", "31", "--randstrobemers"],
         ),
     ] {
         let index = f.path(mode);
         let mut args = vec![
-            "build", "-f", &fof, "-o", &index, "-k", "31", "-b", "16", "-D", "1",
+            "build",
+            "-f",
+            &fof,
+            "-o",
+            &index,
+            "-k",
+            if settings.contains(&"minimizers") {
+                "49"
+            } else {
+                "31"
+            },
+            "-b",
+            "16",
+            "-D",
+            "1",
         ];
         args.extend(settings);
         let result = ok(&args);

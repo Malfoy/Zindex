@@ -61,7 +61,21 @@ fn dna(n: usize, seed: u64) -> String {
 }
 fn build(fof: &str, output: &str, extra: &[&str]) {
     let mut args = vec![
-        "build", "-f", fof, "-o", output, "-k", "31", "-D", "1", "-S", "0.3",
+        "build",
+        "-f",
+        fof,
+        "-o",
+        output,
+        "-k",
+        if extra.windows(2).any(|pair| pair == ["-i", "minimizers"]) {
+            "49"
+        } else {
+            "31"
+        },
+        "-D",
+        "1",
+        "-S",
+        "0.3",
     ];
     args.extend_from_slice(extra);
     ok(&args);
@@ -112,13 +126,13 @@ fn fusion_preserves_every_query_mode_with_different_planners_and_partition_layou
         &[],
         &["-b", "1"],
         &["-b", "16"],
-        &["-m", "minimizers", "-w", "19"],
-        &["-m", "minimizers", "-w", "19", "-M", "simd"],
-        &["-m", "modimizers", "-d", "4"],
-        &["-m", "findere"],
+        &["-i", "minimizers", "-m", "31"],
+        &["-i", "minimizers", "-m", "31", "-M", "simd"],
+        &["-i", "modimizers", "-d", "4"],
+        &["-i", "findere"],
         &["-p", "##_#_####_#_#_###_#_#_####_#_##"],
         &["-r", "-l", "31", "-u", "93"],
-        &["-m", "minimizers", "-w", "19", "-r"],
+        &["-i", "minimizers", "-m", "31", "-r"],
         &["-c"],
     ];
     for mode in modes {
@@ -397,7 +411,7 @@ fn nway_fusion_matches_pairwise_tree_and_preserves_order_and_threads() {
         );
         let fof = f.write(&format!("{i}.fof"), format!("s{i}\t{sequence}\n"));
         let index = f.path(&format!("index{i}"));
-        build(&fof, &index, &["-m", "minimizers", "-w", "19", "-H", "8"]);
+        build(&fof, &index, &["-i", "minimizers", "-m", "31", "-H", "8"]);
         let source = manifest(&index);
         assert_eq!(
             source["column_order_method"],

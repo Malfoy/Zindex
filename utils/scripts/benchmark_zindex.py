@@ -103,8 +103,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True, help="New result directory; never reused")
     parser.add_argument("--binary", type=Path, default=Path("target/release/zorindex"))
     parser.add_argument("--threads", type=int, required=True)
-    parser.add_argument("--k", type=int, default=31, help="Seed length in bases")
-    parser.add_argument("--window", type=int, default=19, help="Consecutive k-mers per minimizer window")
+    parser.add_argument("--k", type=int, default=49, help="K-mer length or minimizer window length in bases")
+    parser.add_argument("--minimizer-size", type=int, default=31, help="Selected minimizer length in bases")
     parser.add_argument("--minimizer-scheme", choices=["open-closed-mod", "simd"], default="open-closed-mod")
     parser.add_argument("--index-mode", choices=["kmers", "minimizers", "modimizers", "findere"], default="minimizers")
     parser.add_argument("--hashes", type=int, default=4)
@@ -169,7 +169,7 @@ def main():
                  "--min-subindex-documents", str(args.min_subindex_documents),
                  "--max-subindex-size", args.max_subindex_size, "--skip-oversized-documents=false"]
         if args.index_mode == "minimizers":
-            build += ["--window", str(args.window)]
+            build += ["--minimizer-size", str(args.minimizer_size)]
         if args.max_subindexes is not None:
             build += ["--max-subindexes", str(args.max_subindexes)]
         result["stages"]["build"] = measured(root, "build", build)

@@ -133,11 +133,7 @@ fn persisted_schemes_and_homopolymer_setting_match_build_query() {
                     "--output",
                     &index,
                     "--k",
-                    if mode == IndexMode::Minimizers {
-                        "21"
-                    } else {
-                        "31"
-                    },
+                    "31",
                     "--index-mode",
                     mode.label(),
                     "--minimizer-scheme",
@@ -147,13 +143,13 @@ fn persisted_schemes_and_homopolymer_setting_match_build_query() {
                     bits,
                 ];
                 if mode == IndexMode::Minimizers {
-                    args.extend(["--window", "11"]);
+                    args.extend(["--minimizer-size", "21"]);
                 }
 
                 ok(&args, "4");
                 let info = ok(&["info", "--index", &index], "1");
                 if mode == IndexMode::Minimizers {
-                    for field in ["k\t21", "window\t11", "window_span\t31"] {
+                    for field in ["k\t31", "minimizer_size\t21"] {
                         assert!(info.lines().any(|line| line == field), "{info}");
                     }
                 }
@@ -199,9 +195,9 @@ fn default_is_open_closed_and_legacy_metadata_keeps_simd() {
             "--index-mode",
             "minimizers",
             "--k",
+            "49",
+            "--minimizer-size",
             "31",
-            "--window",
-            "19",
         ],
         "4",
     );
@@ -217,9 +213,9 @@ fn default_is_open_closed_and_legacy_metadata_keeps_simd() {
         "--index-mode",
         "minimizers",
         "--k",
+        "49",
+        "--minimizer-size",
         "31",
-        "--window",
-        "19",
         "--minimizer-scheme",
         "simd",
     ];
@@ -320,7 +316,11 @@ fn anchor_settings_roundtrip_queries_reverse_complements() {
                             "--output",
                             &index,
                             "--k",
-                            "9",
+                            if mode == IndexMode::Minimizers {
+                                "31"
+                            } else {
+                                "9"
+                            },
                             "--index-mode",
                             mode.label(),
                             "--minimizer-scheme",
@@ -329,7 +329,7 @@ fn anchor_settings_roundtrip_queries_reverse_complements() {
                             bits,
                         ];
                         if mode == IndexMode::Minimizers {
-                            args.extend(["--window", "23"]);
+                            args.extend(["--minimizer-size", "9"]);
                         }
                         if masked {
                             args.extend(["--seed-pattern", pattern]);
@@ -428,13 +428,13 @@ fn invalid_anchor_arguments_fail_before_construction() {
                 "--index-mode",
                 "minimizers",
                 "--k",
+                "31",
+                "--minimizer-size",
                 "9",
-                "--window",
-                "23",
                 "--seed-pattern",
                 "#_#",
             ],
-            "seed length k",
+            "minimizer size m",
         ),
         (&["--seed-pattern", "#x#"], "only '#' and '_'"),
         (&["--seed-pattern", "___"], "at least one '#'"),
@@ -601,13 +601,13 @@ fn randstrobe_distance_defaults_follow_strobe_length() {
             "--output",
             &index,
             "--k",
-            if mode == "minimizers" { "9" } else { "31" },
+            "31",
             "--index-mode",
             mode,
             "--randstrobemers",
         ];
         if mode == "minimizers" {
-            args.extend(["--window", "23"]);
+            args.extend(["--minimizer-size", "9"]);
         }
         ok(&args, "4");
         let expected = if mode == "kmers" {
@@ -683,11 +683,6 @@ fn real_collection_before_after_benchmark() {
     let binaries = [before.as_str(), env!("CARGO_BIN_EXE_zorindex")];
     let indexes = [f.path("before"), f.path("after")];
     for (binary, index) in binaries.into_iter().zip(&indexes) {
-        let help = Command::new(binary)
-            .args(["build", "--help"])
-            .output()
-            .unwrap();
-        let legacy_cli = String::from_utf8_lossy(&help.stdout).contains("--minimizer-size");
         let start = std::time::Instant::now();
         let output = Command::new(binary)
             .args([
@@ -699,13 +694,9 @@ fn real_collection_before_after_benchmark() {
                 "--output",
                 index,
                 "--k",
-                if legacy_cli { "49" } else { "31" },
-                if legacy_cli {
-                    "--minimizer-size"
-                } else {
-                    "--window"
-                },
-                if legacy_cli { "31" } else { "19" },
+                "49",
+                "--minimizer-size",
+                "31",
                 "--index-mode",
                 "minimizers",
                 "--fingerprint-bits",

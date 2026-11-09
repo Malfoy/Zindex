@@ -20,13 +20,19 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
     /// Worker threads. Defaults to available CPUs.
-    #[arg(short = 't', long, global = true)]
+    #[arg(
+        short = 't',
+        long,
+        global = true,
+        help_heading = "Important options",
+        display_order = 100
+    )]
     threads: Option<usize>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Build a merged index from a file-of-files.
+    /// Build an index from a file-of-files.
     Build(BuildArgs),
     /// Query FASTA/FASTQ using the index's stored seed settings.
     Query(QueryArgs),
@@ -53,12 +59,12 @@ struct BuildArgs {
     /// One FASTA/FASTQ path per line, optionally preceded by a name and a tab.
     #[arg(short = 'f', long)]
     fof: PathBuf,
-    /// Seed length in bases (1..=31), or reconstructed length for findere (up to 255).
+    /// K-mer length, or window span in bases for minimizers (up to 255).
     #[arg(short = 'k', long)]
     k: usize,
-    /// Consecutive k-mers per minimizer window, spanning k + window - 1 bases.
-    #[arg(short = 'w', long, required_if_eq("index_mode", "minimizers"))]
-    window: Option<usize>,
+    /// Selected minimizer length in bases (1..=31). Required for minimizers.
+    #[arg(short = 'm', long, required_if_eq("index_mode", "minimizers"))]
+    minimizer_size: Option<usize>,
     /// New output index directory.
     #[arg(short = 'o', long)]
     output: PathBuf,
@@ -81,7 +87,7 @@ struct BuildArgs {
     #[arg(short = 's', long, default_value_t = 69)]
     seed: u64,
     /// Feature extraction mode.
-    #[arg(short = 'm', long, value_enum, default_value = "kmers")]
+    #[arg(short = 'i', long, value_enum, default_value = "kmers")]
     index_mode: IndexMode,
     /// Index (k-z)-mers and require z+1 consecutive matches in findere mode.
     #[arg(short = 'z', long, default_value_t = zorindex::findere::DEFAULT_Z)]
@@ -92,16 +98,16 @@ struct BuildArgs {
     /// Collapse homopolymer runs before extracting seeds.
     #[arg(short = 'c', long)]
     homopolymer_compression: bool,
-    /// Symmetric #/_ pattern of width k, applied after minimizer selection.
+    /// Symmetric #/_ pattern of width k, or m in minimizer mode.
     #[arg(short = 'p', long)]
     seed_pattern: Option<SpacedSeed>,
     /// Link two k-mers or selected minimizers into canonical randstrobemers.
     #[arg(short = 'r', long)]
     randstrobemers: bool,
-    /// Minimum distance between strobe starts, in bases (default: k).
+    /// Minimum strobe-start distance. Defaults to the strobe length (k or m).
     #[arg(short = 'l', long, requires = "randstrobemers")]
     strobe_min: Option<usize>,
-    /// Maximum distance between strobe starts, in bases (default: 3*k).
+    /// Maximum strobe-start distance. Defaults to three times the strobe length.
     #[arg(short = 'u', long, requires = "randstrobemers")]
     strobe_max: Option<usize>,
     /// Keep roughly one in N canonical k-mers in modimizer mode.
@@ -157,7 +163,7 @@ enum CycleBreakHeuristic {
 
 #[derive(Args, Debug)]
 struct QueryArgs {
-    /// Merged index directory.
+    /// Index directory.
     #[arg(short = 'i', long)]
     index: PathBuf,
     /// Query FASTA/FASTQ path.
@@ -192,25 +198,40 @@ struct QueryArgs {
 
 #[derive(Args, Debug)]
 struct IndexArg {
-    /// Merged index directory.
+    /// Index directory.
     #[arg(short = 'i', long)]
     index: PathBuf,
 }
 
 const ADVANCED_BUILD_OPTIONS: &[&str] = &[
+    "max_ram_gb",
+    "build_memory_gib",
+    "max_document_memory_gib",
+    "skip_oversized_documents",
+    "max_subindex_size",
+    "planner",
+    "disk_backed",
+    "low_disk",
+    "min_subindex_documents",
+    "max_subindexes",
+    "sketch_size",
+    "plan_margin",
+    "disabled",
     "seed",
     "slot_scale",
     "segment_length",
+    "drop_abandoned",
+    "seed_pattern",
+    "randstrobemers",
+    "strobe_min",
+    "strobe_max",
+    "homopolymer_compression",
+    "modimizer_sampling",
+    "findere_z",
     "cycle_break",
     "tie_scan",
-    "sketch_size",
-    "plan_margin",
-    "min_subindex_documents",
-    "max_subindexes",
-    "disabled",
-    "drop_abandoned",
 ];
-const ADVANCED_QUERY_OPTIONS: &[&str] = &["record_batch_size"];
+const ADVANCED_QUERY_OPTIONS: &[&str] = &["query_memory", "record_batch_size", "output_format"];
 const ADVANCED_HELP_HINT: &str = "-ah, --advanced-help  Show regular and advanced options.";
 
 fn cli_command(advanced: bool) -> clap::Command {
@@ -228,9 +249,40 @@ fn cli_command(advanced: bool) -> clap::Command {
             _ => &[],
         };
         let mut configured = subcommand.clone().after_help(ADVANCED_HELP_HINT);
-        for &id in advanced_options {
+        let mandatory: &[&str] = match subcommand.get_name() {
+            "build" => &["fof", "output", "k"],
+            "query" => &["index", "query"],
+            "info" => &["index"],
+            "fusion" => &["index", "output"],
+            _ => &[],
+        };
+        for (order, &id) in mandatory.iter().enumerate() {
             configured = configured.mut_arg(id, |arg| {
-                arg.hide(!advanced).help_heading("Advanced options")
+                arg.help_heading("Mandatory options").display_order(order)
+            });
+        }
+        let important: &[&str] = match subcommand.get_name() {
+            "build" => &[
+                "hashes",
+                "fingerprint_bits",
+                "index_mode",
+                "minimizer_size",
+                "minimizer_scheme",
+            ],
+            "query" => &["min_ratio", "records"],
+            _ => &[],
+        };
+        for (order, &id) in important.iter().enumerate() {
+            configured = configured.mut_arg(id, |arg| {
+                arg.help_heading("Important options")
+                    .display_order(order + 101)
+            });
+        }
+        for (order, &id) in advanced_options.iter().enumerate() {
+            configured = configured.mut_arg(id, |arg| {
+                arg.hide(!advanced)
+                    .help_heading("Advanced options")
+                    .display_order(order + 1000)
             });
         }
         *subcommand = configured;
@@ -365,32 +417,27 @@ fn query_command(args: QueryArgs) -> Result<()> {
 
 fn extraction_span_from_args(args: &BuildArgs) -> Result<usize> {
     if args.index_mode == IndexMode::Minimizers {
-        let window = args.window.context("minimizer indexes require --window")?;
-        ensure!(window > 0, "--window must be greater than zero");
-        let span = args
-            .k
-            .checked_add(window - 1)
-            .context("k + window - 1 overflows")?;
-        ensure!(span <= 255, "k + window - 1 must be at most 255 bases");
+        args.minimizer_size
+            .context("minimizer indexes require --minimizer-size")?;
         ensure!(
-            span % 2 == 1,
-            "canonical minimizers require an odd k + window - 1 span"
+            args.k % 2 == 1,
+            "canonical minimizers require an odd --k window span"
         );
-        Ok(span)
     } else {
         ensure!(
-            args.window.is_none(),
-            "--window requires --index-mode minimizers"
+            args.minimizer_size.is_none(),
+            "--minimizer-size requires --index-mode minimizers"
         );
-        Ok(args.k)
     }
+    Ok(args.k)
 }
 
 fn feature_config_from_args(args: &BuildArgs) -> FeatureConfig {
-    let minimizer_size = if args.index_mode == IndexMode::Minimizers {
-        args.k
+    let minimizer_size = args.minimizer_size.unwrap_or(DEFAULT_MINIMIZER_SIZE);
+    let strobe_length = if args.index_mode == IndexMode::Minimizers {
+        minimizer_size
     } else {
-        DEFAULT_MINIMIZER_SIZE
+        args.k
     };
     FeatureConfig::new(args.index_mode, minimizer_size, args.modimizer_sampling)
         .with_findere_z(args.findere_z)
@@ -398,8 +445,8 @@ fn feature_config_from_args(args: &BuildArgs) -> FeatureConfig {
         .with_homopolymer_compression(args.homopolymer_compression)
         .with_seed_pattern(args.seed_pattern)
         .with_randstrobemers(args.randstrobemers.then_some(RandstrobeConfig {
-            min_distance: args.strobe_min.unwrap_or(args.k),
-            max_distance: args.strobe_max.unwrap_or(args.k.saturating_mul(3)),
+            min_distance: args.strobe_min.unwrap_or(strobe_length),
+            max_distance: args.strobe_max.unwrap_or(strobe_length.saturating_mul(3)),
         }))
 }
 
@@ -436,7 +483,7 @@ fn validate_feature_config(k: usize, config: FeatureConfig) -> Result<()> {
     config.validate_anchors(k)?;
     ensure!(
         (1..=31).contains(&config.minimizer_size),
-        "minimizer seed length (--k) must be in 1..=31"
+        "--minimizer-size must be in 1..=31"
     );
     ensure!(
         config.modimizer_sampling > 0,
@@ -1140,8 +1187,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn minimizer_cli_uses_seed_length_and_kmer_window_count() {
-        for (k, window, span) in [(31, 19, 49), (30, 20, 49), (31, 1, 31), (1, 255, 255)] {
+    fn minimizer_cli_uses_window_span_and_minimizer_size() {
+        for (span, size) in [(49, 31), (49, 30), (31, 31), (255, 1)] {
             let Command::Build(args) = Cli::try_parse_from([
                 "zorindex",
                 "build",
@@ -1152,9 +1199,9 @@ mod tests {
                 "--index-mode",
                 "minimizers",
                 "-k",
-                &k.to_string(),
-                "-w",
-                &window.to_string(),
+                &span.to_string(),
+                "-m",
+                &size.to_string(),
             ])
             .unwrap()
             .command
@@ -1163,7 +1210,7 @@ mod tests {
             };
             validate_build_args(&args).unwrap();
             assert_eq!(extraction_span_from_args(&args).unwrap(), span);
-            assert_eq!(feature_config_from_args(&args).minimizer_size, k);
+            assert_eq!(feature_config_from_args(&args).minimizer_size, size);
         }
     }
 
@@ -1182,22 +1229,43 @@ mod tests {
         assert!(
             Cli::try_parse_from(base.into_iter().chain(["--index-mode", "minimizers"])).is_err()
         );
-        assert!(Cli::try_parse_from(base.into_iter().chain(["--minimizer-size", "21"])).is_err());
+        assert!(Cli::try_parse_from(base.into_iter().chain(["--window", "19"])).is_err());
         for extra in [
-            vec!["--window", "19"],
-            vec!["--index-mode", "minimizers", "--window", "0"],
-            vec!["--index-mode", "minimizers", "--window", "2"],
-            vec!["--index-mode", "minimizers", "--window", "227"],
+            vec!["--minimizer-size", "21"],
+            vec!["--index-mode", "minimizers", "--minimizer-size", "0"],
+            vec!["--index-mode", "minimizers", "--minimizer-size", "32"],
             vec![
                 "--index-mode",
                 "minimizers",
-                "--window",
+                "--minimizer-size",
                 "18446744073709551615",
             ],
         ] {
             let Command::Build(args) = Cli::try_parse_from(base.into_iter().chain(extra))
                 .unwrap()
                 .command
+            else {
+                panic!()
+            };
+            assert!(validate_build_args(&args).is_err());
+        }
+        for (span, size) in [(0, 1), (256, 31), (48, 31), (21, 23)] {
+            let Command::Build(args) = Cli::try_parse_from([
+                "zorindex",
+                "build",
+                "-f",
+                "missing.fof",
+                "-o",
+                "index",
+                "-i",
+                "minimizers",
+                "-k",
+                &span.to_string(),
+                "-m",
+                &size.to_string(),
+            ])
+            .unwrap()
+            .command
             else {
                 panic!()
             };
@@ -1288,8 +1356,8 @@ mod tests {
                     .find(|arg| arg.get_id() == id)
                     .unwrap();
                 assert!(
-                    arg.get_long_help().is_some(),
-                    "missing detailed advanced help for {id}"
+                    arg.get_help().is_some() || arg.get_long_help().is_some(),
+                    "missing advanced help for {id}"
                 );
             }
         }
@@ -1299,7 +1367,13 @@ mod tests {
             let help = error.to_string();
             assert!(help.contains("--fingerprint-bits"));
             assert!(help.contains("--hashes"));
-            assert!(help.contains("--build-memory-gib"));
+            assert!(help.contains("--minimizer-size"));
+            assert!(help.contains("Mandatory options"));
+            assert!(help.contains("Important options"));
+            assert!(
+                help.find("Mandatory options").unwrap() < help.find("Important options").unwrap()
+            );
+            assert!(!help.contains("--build-memory-gib"));
             assert!(!help.contains("--cycle-break"));
             assert!(!help.contains("--tie-scan"));
             assert!(!help.contains("--slot-scale"));
@@ -1309,6 +1383,12 @@ mod tests {
             let error = parse_cli_from(["zorindex", "build", flag]).unwrap_err();
             assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
             let help = error.to_string();
+            assert!(
+                help.find("Mandatory options").unwrap() < help.find("Important options").unwrap()
+            );
+            assert!(
+                help.find("Important options").unwrap() < help.find("Advanced options").unwrap()
+            );
             for expected in [
                 "--cycle-break",
                 "--tie-scan",

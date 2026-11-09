@@ -74,7 +74,8 @@ fn compressed_build_and_query_preserve_memberships() {
                     "8".into(),
                 ];
                 if mode == "minimizers" {
-                    build.extend(["--window".into(), "19".into()]);
+                    build[6] = "49".into();
+                    build.extend(["--minimizer-size".into(), "31".into()]);
                 }
                 if mode == "findere" {
                     build.extend(["--findere-z".into(), "2".into()]);

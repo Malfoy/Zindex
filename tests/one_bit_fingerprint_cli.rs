@@ -135,7 +135,7 @@ fn packed_minimizer_and_findere_queries_keep_present_features() {
                 "--output",
                 &index,
                 "--k",
-                if mode == "minimizers" { "21" } else { "49" },
+                "49",
                 "--fingerprint-bits",
                 bits,
                 "--index-mode",
@@ -144,7 +144,7 @@ fn packed_minimizer_and_findere_queries_keep_present_features() {
             if mode == "findere" {
                 args.extend(["--findere-z", "20"]);
             } else {
-                args.extend(["--window", "29"]);
+                args.extend(["--minimizer-size", "21"]);
             }
 
             ok(&args, "4");

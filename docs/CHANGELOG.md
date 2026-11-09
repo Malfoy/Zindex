@@ -38,9 +38,10 @@
   commands and the unpruned streaming CLI mode. Each remaining option has
   one long name and one short flag.
 
-- Make `--k` consistently denote seed length and add `--window` (`-w`) for
-  the minimizer window in consecutive k-mers. Minimizer builds now require
-  `--window`. Existing index files remain readable.
+- Use `--k` for the window span in minimizer mode and `--minimizer-size`
+  (`-m`) for the selected sequence length. Use `-i` for `--index-mode`.
+  Group help into mandatory, important and advanced options. Simplify the README
+  and show the interleaved Bloom versus ZOR figure. Existing indexes are readable.
 
 This section describes development changes on main that are not part of a
 tagged release. Existing published release tags have not been moved.
