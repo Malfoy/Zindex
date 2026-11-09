@@ -1,4 +1,4 @@
-//! Ordered FASTA reporting with persistent worker state. Only encoded result
+//! Ordered FASTA/FASTQ reporting with persistent worker state. Only encoded result
 //! bytes cross back to the writer, never a dense document vector per record.
 use anyhow::{ensure, Context, Result};
 use deko::read::AnyDecoder;
@@ -154,10 +154,11 @@ fn read_batches(
     recycle: Receiver<Batch>,
 ) -> Result<usize> {
     let mut batch = Vec::with_capacity(batch_size);
-    let mut spare_records = Vec::new();
+    let mut spare_records: Vec<Record> = Vec::new();
     let mut current: Option<(Vec<u8>, Vec<u8>)> = None;
     let mut line = Vec::new();
     let mut records = 0usize;
+    let mut fastq = None;
     loop {
         line.clear();
         if reader.read_until(b'\n', &mut line)? == 0 {
@@ -169,6 +170,65 @@ fn read_batches(
         if line.is_empty() {
             continue;
         }
+        if fastq == Some(true) || (fastq.is_none() && line[0] == b'@') {
+            fastq = Some(true);
+            ensure!(line[0] == b'@', "expected FASTQ identifier");
+            let id = line[1..]
+                .split(|b| b.is_ascii_whitespace())
+                .next()
+                .unwrap_or_default();
+            ensure!(!id.is_empty(), "empty FASTQ identifier");
+            std::str::from_utf8(id).context("invalid FASTQ identifier")?;
+            let (mut name, mut seq) = spare_records.pop().unwrap_or_default();
+            name.clear();
+            name.extend_from_slice(id);
+            seq.clear();
+            loop {
+                line.clear();
+                ensure!(
+                    reader.read_until(b'\n', &mut line)? != 0,
+                    "truncated FASTQ sequence"
+                );
+                while matches!(line.last(), Some(b'\n' | b'\r')) {
+                    line.pop();
+                }
+                if line.first() == Some(&b'+') {
+                    break;
+                }
+                ensure!(
+                    !line.iter().any(|b| b.is_ascii_whitespace()),
+                    "whitespace inside FASTQ sequence"
+                );
+                seq.extend_from_slice(&line);
+            }
+            let mut qualities = 0;
+            while qualities < seq.len() {
+                line.clear();
+                ensure!(
+                    reader.read_until(b'\n', &mut line)? != 0,
+                    "truncated FASTQ quality"
+                );
+                while matches!(line.last(), Some(b'\n' | b'\r')) {
+                    line.pop();
+                }
+                qualities += line.len();
+                ensure!(
+                    qualities <= seq.len(),
+                    "FASTQ sequence and quality lengths differ"
+                );
+            }
+            batch.push((name, seq));
+            records += 1;
+            if batch.len() == batch_size {
+                if send.send(batch).is_err() {
+                    return Ok(records);
+                }
+                spare_records = recycle.try_recv().unwrap_or_default();
+                batch = Vec::with_capacity(batch_size);
+            }
+            continue;
+        }
+        fastq = Some(false);
         if line[0] == b'>' {
             if let Some(record) = current.take() {
                 batch.push(record);
@@ -193,7 +253,9 @@ fn read_batches(
             seq.clear();
             current = Some((name, seq));
         } else {
-            let record = current.as_mut().context("--records requires FASTA")?;
+            let record = current
+                .as_mut()
+                .context("--records requires FASTA or FASTQ")?;
             ensure!(
                 !line.iter().any(|b| b.is_ascii_whitespace()),
                 "whitespace inside FASTA sequence"
@@ -205,7 +267,7 @@ fn read_batches(
         batch.push(record);
         records += 1;
     }
-    ensure!(records > 0, "no FASTA records");
+    ensure!(records > 0, "no FASTA/FASTQ records");
     if !batch.is_empty() {
         let _ = send.send(batch);
     }
@@ -318,6 +380,33 @@ mod tests {
                         assert_eq!(output, expected);
                     }
                 });
+        }
+    }
+
+    #[test]
+    fn multiline_fastq_records_preserve_order_and_validate_quality_lengths() {
+        let input = b"@a description\r\nAC\r\nGT\r\n+\r\nII\r\nII\r\n@b\nT\n+\n@\n";
+        for batch in [1, 2, 8] {
+            let mut output = Vec::new();
+            query_reader(
+                &input[..],
+                &mut output,
+                batch,
+                || (),
+                |_, seq, out| {
+                    writeln!(out, "{}\t", seq.len())?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(output, b"query_id\tvalid_kmers\thits\na\t4\t\nb\t1\t\n");
+        }
+        for bad in [
+            &b"@a\nACGT\n+\nIII\n"[..],
+            &b"@a\nACGT\n+\nIIIII\n"[..],
+            &b"@a\nACGT\n"[..],
+        ] {
+            assert!(query_reader(bad, &mut Vec::new(), 2, || (), |_, _, _| Ok(())).is_err());
         }
     }
 

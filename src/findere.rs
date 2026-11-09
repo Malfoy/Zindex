@@ -16,14 +16,9 @@ const TASK_KMERS: usize = 16_384;
 const BATCH_BASES: usize = 1_048_576;
 
 pub fn indexed_length(k: usize, z: usize) -> Result<usize> {
-    ensure!((1..=255).contains(&k), "findere query k must be in 1..=255");
+    ensure!(k > 0, "findere query k must be positive");
     ensure!(z < k, "--findere-z must be smaller than query k");
-    let s = k - z;
-    ensure!(
-        (1..=31).contains(&s),
-        "findere indexed length k-z must be in 1..=31"
-    );
-    Ok(s)
+    Ok(k - z)
 }
 
 #[derive(Debug)]
@@ -65,6 +60,15 @@ impl Scorer {
                 scores: vec![0; colors],
             },
         })
+    }
+
+    /// Reuse positional scratch and score storage for the next record.
+    pub fn reset(&mut self) {
+        self.result.stats = FastxStats::default();
+        self.result.total_kmers = 0;
+        self.result.smer_queries = 0;
+        self.result.backend_queries = 0;
+        self.result.scores.fill(0);
     }
 
     pub fn sequence(&mut self, seq: &[u8], lookup: &mut impl FnMut(u64, &mut [u64])) {
@@ -460,14 +464,8 @@ mod tests {
         assert_eq!(indexed_length(31, DEFAULT_Z).unwrap(), 21);
         assert_eq!(indexed_length(41, 10).unwrap(), 31);
         assert_eq!(indexed_length(1, 0).unwrap(), 1);
-        for (k, z) in [
-            (0, 0),
-            (10, 10),
-            (31, 32),
-            (42, 10),
-            (256, 225),
-            (31, usize::MAX),
-        ] {
+        assert_eq!(indexed_length(1025, 10).unwrap(), 1015);
+        for (k, z) in [(0, 0), (10, 10), (31, 32), (31, usize::MAX)] {
             assert!(indexed_length(k, z).is_err());
         }
     }

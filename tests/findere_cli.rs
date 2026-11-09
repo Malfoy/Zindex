@@ -191,13 +191,7 @@ fn rejects_invalid_parameters_and_supports_short_z() {
     let fof = f.write("r.fof", format!("r\t{reference}\n"));
     let index = f.path("r.idx");
     for bin in binaries() {
-        for (k, z) in [
-            ("0", "0"),
-            ("10", "10"),
-            ("9", "10"),
-            ("42", "10"),
-            ("256", "225"),
-        ] {
+        for (k, z) in [("0", "0"), ("10", "10"), ("9", "10")] {
             let output = call(
                 bin,
                 &[
@@ -321,6 +315,149 @@ fn query_results_and_probe_counts_match_across_thread_counts() {
                         &normalized,
                         "thread-dependent output: {bin}, z={z}, threads={threads}"
                     );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn long_findere_records_match_aggregate_counts_across_memory_modes_and_formats() {
+    use std::collections::HashSet;
+    let f = Fixture::new();
+    let a = dna(1500, 111);
+    let b = dna(1450, 222);
+    let pa = f.write("a.fa", format!(">a\n{a}\n"));
+    let pb = f.write("b.fa", format!(">b\n{b}\n"));
+    let fof = f.write("input.fof", format!("a\t{pa}\nb\t{pb}\n"));
+    let mut mutated = a.as_bytes().to_vec();
+    mutated[650] = if mutated[650] == b'A' { b'C' } else { b'A' };
+    let queries = vec![
+        ("forward", a.clone()),
+        ("reverse", rc(&a)),
+        ("mutated", String::from_utf8(mutated).unwrap()),
+        ("other", b.clone()),
+        ("broken", format!("{}N{}", &a[..700], &a[701..])),
+        ("short", "ACGT".into()),
+    ];
+    let fasta = queries
+        .iter()
+        .map(|(id, seq)| format!(">{id}\n{seq}\n"))
+        .collect::<String>();
+    let fastq = queries
+        .iter()
+        .map(|(id, seq)| format!("@{id}\n{seq}\n+\n{}\n", "I".repeat(seq.len())))
+        .collect::<String>();
+    let fa = f.write("queries.fa", fasta);
+    let fq = f.write(
+        "queries.fq.zst",
+        zstd::bulk::compress(fastq.as_bytes(), 1).unwrap(),
+    );
+    let bin = binaries()[0];
+    for (k, z) in [
+        (31, 10),
+        (42, 10),
+        (65, 10),
+        (256, 225),
+        (300, 10),
+        (1025, 10),
+    ] {
+        let index = f.path(&format!("findere-{k}-{z}"));
+        ok(
+            bin,
+            &[
+                "build",
+                "-f",
+                &fof,
+                "-o",
+                &index,
+                "-i",
+                "findere",
+                "-k",
+                &k.to_string(),
+                "-z",
+                &z.to_string(),
+                "-X",
+                "8KiB",
+                "-b",
+                "32",
+                "--slot-scale",
+                "8",
+            ],
+        );
+        let reference_sets: Vec<HashSet<u64>> = [&a, &b]
+            .into_iter()
+            .map(|seq| {
+                let mut keys = HashSet::new();
+                zorindex::scan_canonical_kmers(seq.as_bytes(), k - z, &mut |key| {
+                    keys.insert(key);
+                });
+                keys
+            })
+            .collect();
+        let expected: Vec<Vec<u64>> = queries
+            .iter()
+            .map(|(_, seq)| {
+                reference_sets
+                    .iter()
+                    .map(|keys| {
+                        seq.as_bytes()
+                            .split(|&base| zorindex::encode_base(base).is_none())
+                            .filter(|run| run.len() >= k)
+                            .flat_map(|run| run.windows(k))
+                            .filter(|window| {
+                                let mut present = true;
+                                zorindex::scan_canonical_kmers(window, k - z, &mut |key| {
+                                    present &= keys.contains(&key)
+                                });
+                                present
+                            })
+                            .count() as u64
+                    })
+                    .collect()
+            })
+            .collect();
+        for memory in ["subindex", "all"] {
+            let aggregate = ok(bin, &["query", "-i", &index, "-q", &fa, "-M", memory]);
+            for (id, name) in ["a", "b"].into_iter().enumerate() {
+                assert_eq!(
+                    matches(&aggregate, name),
+                    expected.iter().map(|scores| scores[id]).sum::<u64>()
+                );
+            }
+            for query in [&fa, &fq] {
+                for format in ["tsv", "compact"] {
+                    let result = ok(
+                        bin,
+                        &[
+                            "query", "-i", &index, "-q", query, "-M", memory, "-r", "-F", format,
+                            "-B", "2",
+                        ],
+                    );
+                    let lines: Vec<_> = result.lines().collect();
+                    if format == "tsv" {
+                        for (row, (name, _)) in queries.iter().enumerate() {
+                            for id in 0..2 {
+                                let fields: Vec<_> = lines[1 + row * 2 + id].split('\t').collect();
+                                assert_eq!(fields[0], *name);
+                                assert_eq!(
+                                    fields[3].parse::<u64>().unwrap(),
+                                    expected[row][id],
+                                    "{memory} k={k} row={row} dataset={id}"
+                                );
+                            }
+                        }
+                    } else {
+                        for (row, (name, _)) in queries.iter().enumerate() {
+                            let fields: Vec<_> = lines[1 + row].split('\t').collect();
+                            assert_eq!(fields[0], *name);
+                            let counts: Vec<u64> = fields[2]
+                                .split(',')
+                                .map(|hit| hit.split_once(':').unwrap().1.parse().unwrap())
+                                .collect();
+                            assert_eq!(counts, expected[row]);
+                        }
+                    }
                 }
             }
         }

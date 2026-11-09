@@ -60,7 +60,7 @@ struct BuildArgs {
     #[arg(short = 'f', long)]
     fof: PathBuf,
     /// Positive k-mer length, or window span in bases for minimizers.
-    #[arg(short = 'k', long)]
+    #[arg(short = 'k', long, default_value_t = 31)]
     k: usize,
     /// Selected minimizer length in bases (1..=31). Required for minimizers.
     #[arg(short = 'm', long, required_if_eq("index_mode", "minimizers"))]
@@ -73,7 +73,7 @@ struct BuildArgs {
     /// More hash functions can make the index smaller, but slow queries.
     #[arg(short = 'H', long, default_value_t = 4)]
     hashes: usize,
-    /// Fingerprint width in bits: 1, 2, 4, 8 or 16.
+    /// Fingerprint width in bits: 1, 2, 4, 8, 16 or 32.
     #[arg(short = 'b', long, default_value_t = 8)]
     fingerprint_bits: u8,
     /// Shared hash seed, stored for querying.
@@ -172,7 +172,6 @@ struct QueryArgs {
     /// Score each FASTA sequence or FASTQ read separately.
     ///
     /// Without this flag, counts are combined across the whole query file.
-    /// Findere currently supports only combined file counts.
     #[arg(short = 'r', long)]
     records: bool,
     /// Per-record output: named TSV rows (default) or compact dataset_id:count hits.
@@ -223,6 +222,7 @@ const ADVANCED_BUILD_OPTIONS: &[&str] = &[
     "homopolymer_compression",
     "modimizer_sampling",
     "findere_z",
+    "minimizer_scheme",
     "cycle_break",
     "tie_scan",
 ];
@@ -245,7 +245,7 @@ fn cli_command(advanced: bool) -> clap::Command {
         };
         let mut configured = subcommand.clone().after_help(ADVANCED_HELP_HINT);
         let mandatory: &[&str] = match subcommand.get_name() {
-            "build" => &["fof", "k"],
+            "build" => &["fof"],
             "query" => &["index", "query"],
             "info" => &["index"],
             "fusion" => &["index"],
@@ -259,11 +259,11 @@ fn cli_command(advanced: bool) -> clap::Command {
         let important: &[&str] = match subcommand.get_name() {
             "build" => &[
                 "output",
+                "k",
                 "hashes",
                 "fingerprint_bits",
                 "index_mode",
                 "minimizer_size",
-                "minimizer_scheme",
                 "max_subindex_size",
             ],
             "query" => &["min_ratio", "records"],
@@ -495,7 +495,7 @@ fn validate_build_args(args: &BuildArgs) -> Result<()> {
         feature_config_from_args(args),
     )?;
     fingerprint_bytes(args.fingerprint_bits)
-        .with_context(|| "--fingerprint-bits must be 1, 2, 4, 8 or 16")?;
+        .with_context(|| "--fingerprint-bits must be 1, 2, 4, 8, 16 or 32")?;
     ensure!(
         args.slot_scale.is_finite() && args.slot_scale > 0.0,
         "--slot-scale must be finite and > 0"
@@ -550,6 +550,7 @@ fn fingerprint_bytes(fingerprint_bits: u8) -> Result<usize> {
         1 | 2 | 4 => Ok(0),
         8 => Ok(1),
         16 => Ok(2),
+        32 => Ok(4),
         _ => anyhow::bail!("unsupported fingerprint width {}", fingerprint_bits),
     }
 }
@@ -1403,6 +1404,7 @@ mod tests {
             assert!(!help.contains("--cycle-break"));
             assert!(!help.contains("--tie-scan"));
             assert!(!help.contains("--slot-scale"));
+            assert!(!help.contains("--minimizer-scheme"));
             assert!(help.contains("-ah, --advanced-help"));
         }
         for flag in ["-ah", "--advanced-help"] {

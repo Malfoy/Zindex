@@ -2,7 +2,12 @@ name: CI
 
 on:
   push:
+    branches: ['**']
   pull_request:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -23,24 +28,15 @@ jobs:
         with:
           toolchain: "1.97.0"
           components: rustfmt
-      - name: Format
-        run: cargo fmt --all --check
-      - name: Offline example-download tests
-        run: python3 -m unittest discover -s tests -p 'test_bacteria_example.py'
-      - name: Test
-        run: cargo test --workspace --release --locked
-      - name: Build command-line tools
-        run: cargo build --workspace --release --locked --bins
-      - name: Checked demonstration
-        run: bash utils/scripts/demo.sh "$RUNNER_TEMP/zindex-demo-${{ matrix.cpu }}"
-      - name: README usage examples
-        run: python3 utils/scripts/check_readme.py
+      - name: Validate
+        run: bash utils/scripts/validate.sh '${{ matrix.cpu }}'
       - name: Check benchmark recorder
         run: >-
           python3 utils/scripts/benchmark_zindex.py
           --fof tests/data/bacteria/samples.fof
           --positive tests/data/bacteria/positive.fa --negative tests/data/bacteria/negative.fa
           --threads 2 --hash-inputs --hash-index
+          --binary target/validation/${{ matrix.cpu }}/release/zorindex
           --output "$RUNNER_TEMP/zindex-recorder-${{ matrix.cpu }}"
       - name: Preserve failed example logs
         if: failure()
@@ -48,6 +44,6 @@ jobs:
         with:
           name: example-logs-${{ matrix.cpu }}
           path: |
-            ${{ runner.temp }}/zindex-demo-${{ matrix.cpu }}/
+            ${{ runner.temp }}/zindex-validation-${{ matrix.cpu }}.*/
             ${{ runner.temp }}/zindex-recorder-${{ matrix.cpu }}/
             !${{ runner.temp }}/zindex-recorder-${{ matrix.cpu }}/*.binary

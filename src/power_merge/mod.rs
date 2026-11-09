@@ -159,7 +159,11 @@ pub struct MergeArgs {
     /// partitions are outside this count. The naive planner ignores it.
     #[arg(short = 'N', long)]
     pub max_subindexes: Option<usize>,
-    /// Maximum uncompressed merged-subindex payload. Hash-partition larger size classes.
+    /// Maximum resident filter payload during default subindex-at-a-time queries.
+    ///
+    /// Larger size classes are hash-partitioned to this uncompressed payload cap.
+    /// Query features, scores, recovery data and decompression buffers need additional RAM.
+    /// The all-subindexes query mode loads the complete filter payload instead.
     /// A power of two, in bytes or with KiB/MiB/GiB suffix (default: 8 GiB).
     #[arg(short = 'X', long, default_value = "8GiB", value_parser = parse_subindex_size)]
     pub max_subindex_size: u64,
@@ -263,8 +267,8 @@ impl BuildConfig {
             "--min-subindex-documents must be positive"
         );
         ensure!(
-            [1, 2, 4, 8, 16].contains(&self.fingerprint_bits),
-            "fingerprint bits must be 1, 2, 4, 8 or 16"
+            [1, 2, 4, 8, 16, 32].contains(&self.fingerprint_bits),
+            "fingerprint bits must be 1, 2, 4, 8, 16 or 32"
         );
         match self.feature_config.mode {
             crate::IndexMode::Kmers | crate::IndexMode::Modimizers => {

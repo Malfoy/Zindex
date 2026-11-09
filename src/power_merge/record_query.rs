@@ -892,7 +892,7 @@ mod tests {
 
     #[test]
     fn pruning_and_cached_weighted_hits_match_full_lookup_for_all_layouts() {
-        for bits in [1, 2, 4, 8, 16] {
+        for bits in [1, 2, 4, 8, 16, 32] {
             for planes in [false, true] {
                 let mut index = random_index(bits, planes);
                 for recovery in [true, false] {
@@ -929,7 +929,7 @@ mod tests {
 
     #[test]
     fn partial_query_bounds_preserve_counts_across_partition_orders() {
-        for bits in [1, 2, 4, 8, 16] {
+        for bits in [1, 2, 4, 8, 16, 32] {
             for planes in [false, true] {
                 let index = random_index(bits, planes);
                 for common in [0, 20, 60, 70] {

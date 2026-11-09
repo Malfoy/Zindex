@@ -972,10 +972,6 @@ pub(super) fn query_records(
             load_seconds,
         );
     }
-    ensure!(
-        f.mode != IndexMode::Findere,
-        "--records does not support findere indexes"
-    );
     let reads = super::super::records::prepare_file(query, batch_size, |(name, seq)| {
         PreparedRead::new(name, seq, &index.manifest, f)
     })?;

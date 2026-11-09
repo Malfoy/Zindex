@@ -1,6 +1,6 @@
 # Zindex
 
-Zindex is a resource-efficient approximate index for searching sequence
+[Zindex](https://www.biorxiv.org/content/10.64898/2026.11.05.764633v1) is a resource-efficient approximate index for searching sequence
 collections, in the same family as [Raptor](https://github.com/seqan/raptor),
 [COBS](https://github.com/bingmann/cobs) and
 [kmindex](https://github.com/tlemane/kmindex). It reports the number of query
@@ -16,7 +16,9 @@ by Ragnar Groot Koerkamp et al. FASTA/FASTQ parsing uses
 
 ![Interleaved Bloom filters (left) and interleaved ZOR filters (right)](figures/interleaved-filters.svg)
 
-Comparative benchmarks: [KmerIndexBenchmark](https://github.com/Malfoy/KmerIndexBenchmark).
+[KmerIndexBenchmark](https://github.com/Malfoy/KmerIndexBenchmark) provides the
+dataset accessions used in the [paper](https://www.biorxiv.org/content/10.64898/2026.11.05.764633v1)
+and a benchmark suite for comparing sequence collection indexes.
 
 ## Install and test
 
@@ -37,11 +39,11 @@ bash utils/scripts/demo.sh
 [Ten bacterial genomes](tests/data/bacteria/), compressed as FASTA.gz, are
 bundled with queries. Run these examples from the repository root.
 
-Index every 31-mer:
+Index every 31-mer (the default):
 
 ```bash
 ./target/release/zorindex build --fof tests/data/bacteria/samples.fof \
-  --output bacteria.zindex --k 31 --threads 4
+  --output bacteria.zindex --threads 4
 ```
 
 Query a 1-kbp fragment from the first genome:
@@ -71,7 +73,6 @@ indexed seeds in each dataset.
 | Short | Option | Default | Meaning |
 |---|---|---|---|
 | `-f` | `--fof` | Required | File listing one FASTA/FASTQ path per dataset, optionally preceded by a name and a tab |
-| `-k` | `--k` | Required | K-mer length, or window length in bases when indexing minimizers |
 
 Relative input paths use the working directory. Gzip, zstd, xz and bzip2 inputs
 are supported. Dense k-mers accept any positive `k`.
@@ -80,14 +81,18 @@ are supported. Dense k-mers accept any positive `k`.
 
 | Short | Option | Default | Meaning |
 |---|---|---|---|
+| `-k` | `--k` | `31` | K-mer length, or window length in bases when indexing minimizers |
 | `-o` | `--output` | `myindex-DATE-TIME` | New index directory, automatically named with a UTC timestamp |
 | `-t` | `--threads` | Available CPU threads | Worker count for construction, queries and fusion |
 | `-H` | `--hashes` | `4` | Number of cell locations read and XORed per filter, from 2 to 32 |
-| `-b` | `--fingerprint-bits` | `8` | Fingerprint width, one of 1, 2, 4, 8 or 16 bits |
+| `-b` | `--fingerprint-bits` | `8` | Fingerprint width, one of 1, 2, 4, 8, 16 or 32 bits |
 | `-i` | `--index-mode` | `kmers` | `kmers`, `minimizers`, `modimizers` or `findere` |
 | `-m` | `--minimizer-size` | Required in minimizer mode | Length of each selected minimizer, from 1 to 31 bases |
-| `-M` | `--minimizer-scheme` | `open-closed-mod` | `open-closed-mod` or standard SIMD hash minimizers (`simd`) |
-| `-X` | `--max-subindex-size` | `8GiB` | Maximum uncompressed subindex size, a power of two in bytes or KiB/MiB/GiB |
+| `-X` | `--max-subindex-size` | `8GiB` | Maximum resident filter payload during default queries, a power of two in bytes or KiB/MiB/GiB |
+
+By default, queries load one subindex at a time, so `--max-subindex-size` bounds
+resident filter data. Query features, results, recovery data and decompression
+buffers require additional RAM. `--query-memory all` loads all subindexes together.
 
 More hash functions can make the index smaller, but slow queries.
 Wider fingerprints reduce accidental matches at a space cost, with fingerprint
@@ -151,8 +156,7 @@ less specific to its full window.
 | `-r` | `--records` | `false` | Score each FASTA sequence or FASTQ read separately |
 
 Without `--records`, counts are combined across the whole query file. With
-`--records`, each sequence or read has its own results. Findere currently
-supports only combined counts for the whole file.
+`--records`, each sequence or read has its own results. Both modes support findere.
 
 Report datasets matching at least 80% of each query's seeds:
 
@@ -210,9 +214,11 @@ tail -n 5 tests/data/bacteria/samples.fof > second.fof
 | `-o` | `--output` | `myindex-DATE-TIME` | New fused directory outside all inputs |
 | `-t` | `--threads` | Available CPU threads | Fusion workers |
 
-Inputs must use identical seed extraction and hash settings. Fusion preserves
-all datasets in input order, including duplicate names. A fused index can be
-fused again.
+Inputs must use identical seed extraction, hashing, fingerprint widths, segment
+lengths and recovery settings. Their layout algorithms, capacities and partition
+sizes may differ. Fusion preserves all datasets in input order, including duplicate
+names, and a fused index can be fused again. It copies the existing filters, so
+its size and query cost can differ from rebuilding the combined collection.
 
 ## Spaced seeds
 
@@ -287,6 +293,7 @@ The naive planner ignores size-class promotion settings.
 
 | Short | Option | Default | Meaning |
 |---|---|---|---|
+| `-M` | `--minimizer-scheme` | `open-closed-mod` | `open-closed-mod` or standard SIMD hash minimizers (`simd`) |
 | `-p` | `--seed-pattern` | Unset | Symmetric `#`/`_` mask of width k, or m for minimizers, with at least one retained base |
 | `-r` | `--randstrobemers` | `false` | Link two seeds, available for dense k-mers and minimizers |
 | `-l` | `--strobe-min` | Strobe length | Positive minimum start distance, requires randstrobemers |
@@ -295,8 +302,8 @@ The naive planner ignores size-class promotion settings.
 | `-d` | `--modimizer-sampling` | `16` | Positive hash-sampling denominator for `--index-mode modimizers` |
 | `-z` | `--findere-z` | `10` | In findere mode, index `(k-z)`-mers and require consecutive hits to reconstruct k-mer matches |
 
-Masks are supported for dense k-mers and minimizers. Findere requires
-`0 <= z < k <= 255` and `1 <= k-z <= 31`, and uses aggregate queries.
+Masks are supported for dense k-mers and minimizers. Findere accepts any positive
+`k`, with `--findere-z` smaller than `k`.
 Modimizers accept any positive `k` and retain roughly one in `--modimizer-sampling`
 canonical k-mers.
 
@@ -312,15 +319,6 @@ Compact output contains `query_id`, `valid_kmers` and comma-separated
 `dataset_id:matches` hits. `valid_kmers` is the selected seed count, and an empty
 `hits` field means no match. TSV names containing delimiters or quotes use CSV
 quoting. At threshold zero, all datasets are reported, including zero counts.
-
-### Fusion
-
-Input indexes must match in k, minimizer size and selector, seed patterns,
-randstrobemer settings, homopolymer compression, modimizer sampling, findere
-settings, hash counts and seeds, fingerprint widths, segment lengths and recovery
-settings. Layout algorithms, capacities and partition sizes may differ.
-Fusion copies the stored filters, so its size and query cost can differ from
-construction over the combined source collection.
 
 ### Help and version
 

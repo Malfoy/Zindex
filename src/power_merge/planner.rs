@@ -1126,7 +1126,7 @@ mod tests {
             .build()
             .unwrap();
         pool.install(|| {
-            for fingerprint_bits in [1, 2, 4, 8, 16] {
+            for fingerprint_bits in [1, 2, 4, 8, 16, 32] {
                 for minimum_slots in [None, Some(256)] {
                     let mut c = config(Backend::Zor);
                     c.fingerprint_bits = fingerprint_bits;

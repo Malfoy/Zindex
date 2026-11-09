@@ -1731,7 +1731,7 @@ fn pack_ram_rows(
         let CompletedCells::Packed { data, width, .. } = &group.cells else {
             unreachable!()
         };
-        if *width == fp_bits && matches!(fp_bits, 8 | 16) {
+        if *width == fp_bits && matches!(fp_bits, 8 | 16 | 32) {
             let bytes = fp_bits / 8;
             let offset = index * bytes;
             for (row, cell) in output
@@ -2321,7 +2321,7 @@ impl Index {
             "invalid/missing segment length for index version"
         );
         ensure!(
-            [1, 2, 4, 8, 16].contains(&manifest.fingerprint_bits),
+            [1, 2, 4, 8, 16, 32].contains(&manifest.fingerprint_bits),
             "invalid fingerprint width"
         );
         ensure!(
@@ -3293,10 +3293,11 @@ fn fingerprint_matches_rows_scalar(
     for byte in (byte_start..rows[0].len()).step_by(width) {
         let mut value = 0u64;
         for row in rows {
-            value ^= if bits == 8 {
-                row[byte] as u64
-            } else {
-                u16::from_le_bytes([row[byte], row[byte + 1]]) as u64
+            value ^= match bits {
+                8 => row[byte] as u64,
+                16 => u16::from_le_bytes(row[byte..byte + 2].try_into().unwrap()) as u64,
+                32 => u32::from_le_bytes(row[byte..byte + 4].try_into().unwrap()) as u64,
+                _ => unreachable!("validated fingerprint width"),
             };
         }
         if value == fp {
@@ -3314,10 +3315,11 @@ unsafe fn fingerprint_matches_rows_avx2(
     hit: &mut impl FnMut(usize),
 ) {
     use std::arch::x86_64::*;
-    let target = if bits == 8 {
-        _mm256_set1_epi8(fp as i8)
-    } else {
-        _mm256_set1_epi16(fp as i16)
+    let target = match bits {
+        8 => _mm256_set1_epi8(fp as i8),
+        16 => _mm256_set1_epi16(fp as i16),
+        32 => _mm256_set1_epi32(fp as i32),
+        _ => unreachable!("validated fingerprint width"),
     };
     let end = rows[0].len() / 32 * 32;
     for byte in (0..end).step_by(32) {
@@ -3326,15 +3328,19 @@ unsafe fn fingerprint_matches_rows_avx2(
             let next = unsafe { _mm256_loadu_si256(row.as_ptr().add(byte).cast()) };
             value = _mm256_xor_si256(value, next);
         }
-        let equal = if bits == 8 {
-            _mm256_cmpeq_epi8(value, target)
-        } else {
-            _mm256_cmpeq_epi16(value, target)
+        let equal = match bits {
+            8 => _mm256_cmpeq_epi8(value, target),
+            16 => _mm256_cmpeq_epi16(value, target),
+            32 => _mm256_cmpeq_epi32(value, target),
+            _ => unreachable!("validated fingerprint width"),
         };
         let mut mask = _mm256_movemask_epi8(equal) as u32;
-        if bits == 16 {
-            mask &= 0x5555_5555;
-        }
+        mask &= match bits {
+            8 => u32::MAX,
+            16 => 0x5555_5555,
+            32 => 0x1111_1111,
+            _ => unreachable!(),
+        };
         while mask != 0 {
             hit((byte + mask.trailing_zeros() as usize) / (bits / 8));
             mask &= mask - 1;
@@ -3390,10 +3396,11 @@ fn fingerprint_matches_scalar(
     hit: &mut impl FnMut(usize),
 ) {
     for (i, value) in row.chunks_exact(bits / 8).enumerate() {
-        let value = if bits == 8 {
-            value[0] as u64
-        } else {
-            u16::from_le_bytes(value.try_into().unwrap()) as u64
+        let value = match bits {
+            8 => value[0] as u64,
+            16 => u16::from_le_bytes(value.try_into().unwrap()) as u64,
+            32 => u32::from_le_bytes(value.try_into().unwrap()) as u64,
+            _ => unreachable!("validated fingerprint width"),
         };
         if value == fp {
             hit(base + i);
@@ -3405,23 +3412,28 @@ fn fingerprint_matches_scalar(
 #[target_feature(enable = "avx2")]
 unsafe fn fingerprint_matches_avx2(row: &[u8], bits: usize, fp: u64, hit: &mut impl FnMut(usize)) {
     use std::arch::x86_64::*;
-    let target = if bits == 8 {
-        _mm256_set1_epi8(fp as i8)
-    } else {
-        _mm256_set1_epi16(fp as i16)
+    let target = match bits {
+        8 => _mm256_set1_epi8(fp as i8),
+        16 => _mm256_set1_epi16(fp as i16),
+        32 => _mm256_set1_epi32(fp as i32),
+        _ => unreachable!("validated fingerprint width"),
     };
     let mut chunks = row.chunks_exact(32);
     for (chunk, bytes) in chunks.by_ref().enumerate() {
         let value = unsafe { _mm256_loadu_si256(bytes.as_ptr().cast()) };
-        let equal = if bits == 8 {
-            _mm256_cmpeq_epi8(value, target)
-        } else {
-            _mm256_cmpeq_epi16(value, target)
+        let equal = match bits {
+            8 => _mm256_cmpeq_epi8(value, target),
+            16 => _mm256_cmpeq_epi16(value, target),
+            32 => _mm256_cmpeq_epi32(value, target),
+            _ => unreachable!("validated fingerprint width"),
         };
         let mut mask = _mm256_movemask_epi8(equal) as u32;
-        if bits == 16 {
-            mask &= 0x5555_5555;
-        }
+        mask &= match bits {
+            8 => u32::MAX,
+            16 => 0x5555_5555,
+            32 => 0x1111_1111,
+            _ => unreachable!(),
+        };
         while mask != 0 {
             hit((chunk * 32 + mask.trailing_zeros() as usize) / (bits / 8));
             mask &= mask - 1;
@@ -3635,11 +3647,61 @@ pub fn query_records_command_with_memory(
         .with_context(|| format!("loading {}", directory.display()))?;
     let load_seconds = load_start.elapsed().as_secs_f64();
     let features = index.manifest.features()?;
-    ensure!(
-        features.mode != IndexMode::Findere,
-        "--records does not support findere indexes"
-    );
     let query_start = Instant::now();
+    if features.mode == IndexMode::Findere {
+        super::records::query_file(
+            query,
+            batch_size,
+            format.header(),
+            || {
+                (
+                    crate::findere::Scorer::new(
+                        index.manifest.k,
+                        features.findere_z,
+                        index.manifest.colors.len(),
+                    )
+                    .expect("validated findere lengths"),
+                    Vec::new(),
+                )
+            },
+            |(scorer, scratch), records, out| {
+                for (name, sequence) in records {
+                    scorer.reset();
+                    let compressed;
+                    let sequence = if features.homopolymer_compression {
+                        compressed = crate::homopolymer_compress(sequence);
+                        compressed.as_slice()
+                    } else {
+                        sequence
+                    };
+                    scorer.sequence(sequence, &mut |key, hits| index.lookup(key, hits, scratch));
+                    let total = scorer.result.total_kmers;
+                    format.write_record(
+                        out,
+                        name,
+                        total,
+                        scorer
+                            .result
+                            .scores
+                            .iter()
+                            .copied()
+                            .enumerate()
+                            .filter(|&(_, count)| {
+                                min_ratio == 0.0
+                                    || (total != 0 && count as f64 / total as f64 >= min_ratio)
+                            }),
+                        &index.manifest.colors,
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
+        eprintln!(
+            "query_timings\tload_s={load_seconds:.6}\tquery_s={:.6}",
+            query_start.elapsed().as_secs_f64()
+        );
+        return Ok(());
+    }
     super::records::query_file(
         query,
         batch_size,
@@ -4692,7 +4754,7 @@ mod tests {
 
     #[test]
     fn fused_screening_matches_materialized_rows_for_all_widths_and_hash_counts() {
-        for bits in [1usize, 2, 4, 8, 16] {
+        for bits in [1usize, 2, 4, 8, 16, 32] {
             for count in [1usize, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 257] {
                 for hashes in [2, 3, 4, 8, MAX_HASHES] {
                     let storage: Vec<Vec<u8>> = (0..hashes)
@@ -4887,7 +4949,7 @@ mod tests {
 
     #[test]
     fn simd_screening_matches_scalar_including_zero_and_tails() {
-        for bits in [8, 16] {
+        for bits in [8, 16, 32] {
             for count in [1, 15, 16, 17, 31, 32, 33, 257] {
                 let row: Vec<_> = (0..count * bits / 8)
                     .map(|i| splitmix64(i as u64) as u8)
@@ -5021,7 +5083,7 @@ mod tests {
 
     #[test]
     fn tiled_planes_preserve_every_payload_across_banks() {
-        for fp_bits in [1, 2, 4, 8, 16] {
+        for fp_bits in [1, 2, 4, 8, 16, 32] {
             let stage = temporary_stage();
             let mut groups = Vec::new();
             for (id, count) in [1, 2, 3, 64 - fp_bits].into_iter().enumerate() {
@@ -5279,7 +5341,7 @@ mod tests {
 
     #[test]
     fn fingerprint_planes_preserve_legacy_lookup_and_abandoned_union() {
-        for bits in [1usize, 2, 4, 8, 16] {
+        for bits in [1usize, 2, 4, 8, 16, 32] {
             check_fingerprint_planes(bits);
         }
     }
@@ -5409,7 +5471,7 @@ mod tests {
     #[test]
     fn parallel_packed_ram_transpose_matches_disk_tiles_byte_for_byte() {
         let stage = temporary_stage();
-        for fp in [1usize, 2, 4, 8, 16] {
+        for fp in [1usize, 2, 4, 8, 16, 32] {
             let make = |ram, prefix| {
                 (0..256)
                     .map(|id| {

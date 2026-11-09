@@ -450,7 +450,7 @@ fn invalid_option_boundaries_fail_before_publishing_an_index() {
     for (id, extra) in [
         vec!["--fingerprint-bits", "0"],
         vec!["--fingerprint-bits", "3"],
-        vec!["--fingerprint-bits", "32"],
+        vec!["--fingerprint-bits", "64"],
         vec!["--hashes", "1"],
         vec!["--hashes", "33"],
         vec!["--segment-length", "0"],

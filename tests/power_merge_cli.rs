@@ -1982,3 +1982,74 @@ fn legacy_manifest_without_planner_fields_still_loads() {
     let query = ok(&["query", "--index", &index, "--query", &reference], "4");
     assert_eq!(matches(&query, "a"), 670);
 }
+
+#[test]
+fn thirty_two_bit_fingerprints_preserve_full_width_merged_masks_and_default_k() {
+    let f = Fixture::new();
+    let seq = dna(1100, 889);
+    let reference = f.write("reference.fa", format!(">r\n{seq}\n"));
+    let fof = f.write(
+        "inputs.fof",
+        (0..40)
+            .map(|i| format!("d{i}\t{reference}\n"))
+            .collect::<String>(),
+    );
+    let query = f.write(
+        "queries.fa",
+        format!(
+            ">forward\n{seq}\n>reverse\n{}\n",
+            String::from_utf8(zorindex::reverse_complement(seq.as_bytes())).unwrap()
+        ),
+    );
+    for storage in ["disk", "cached", "memory"] {
+        let index = f.path(storage);
+        ok(
+            &[
+                "build",
+                "-f",
+                &fof,
+                "-o",
+                &index,
+                "-b",
+                "32",
+                "-X",
+                "8KiB",
+                "--build-storage",
+                storage,
+            ],
+            "2",
+        );
+        let info = ok(&["info", "-i", &index], "1");
+        assert!(info.contains("k\t31\n"));
+        assert!(info.contains("fingerprint_bits\t32\n"));
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(Path::new(&index).join("manifest.json")).unwrap())
+                .unwrap();
+        let groups: Vec<_> = manifest["banks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|bank| bank["groups"].as_array().unwrap())
+            .collect();
+        assert!(groups
+            .iter()
+            .any(|group| group["members"].as_array().unwrap().len() == 32));
+        assert!(groups
+            .iter()
+            .all(|group| group["members"].as_array().unwrap().len() <= 32));
+        for memory in ["subindex", "all"] {
+            let result = ok(
+                &[
+                    "query", "-i", &index, "-q", &query, "-M", memory, "-r", "-a", "1",
+                ],
+                "2",
+            );
+            for line in result.lines().skip(1) {
+                let fields: Vec<_> = line.split('\t').collect();
+                let hits: Vec<_> = fields[2].split(',').collect();
+                assert_eq!(hits.len(), 40);
+                assert!(hits.iter().all(|hit| hit.ends_with(":1070")));
+            }
+        }
+    }
+}
