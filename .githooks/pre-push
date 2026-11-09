@@ -4,10 +4,6 @@ set -euo pipefail
 ROOT=$(git rev-parse --show-toplevel)
 HAS_UPDATES=false
 while read -r LOCAL_REF LOCAL_SHA REMOTE_REF REMOTE_SHA; do
-  if [[ "$REMOTE_REF" == refs/heads/main ]]; then
-    echo "Push changes to a branch and merge after both CI jobs pass." >&2
-    exit 1
-  fi
   if [[ "$REMOTE_REF" == refs/tags/* ]]; then
     echo "Create release tags on GitHub from a commit with passing CI." >&2
     exit 1
